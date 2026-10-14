@@ -141,7 +141,12 @@ class Scheduler:
         travel_count = 0
         daily_chat_count = 0
 
+        # 与手动路径对齐：面板里禁用（enabled=False）的账号不参与自动巡检。
+        # 此前这里是裸遍历，导致「手动跳过、自动不跳过」——用户以为关掉了账号，
+        # 排程照样拿它去刷 token / 签到 / 打卡。
         for acc in list(self.pool.accounts):
+            if not acc.enabled:
+                continue
             uid8 = acc.uid[:8] if acc.uid else "?"
             # 1. 检查 Token 剩余寿命 (小于 2 小时自动刷新保活)
             exp = acc.expires_at or 0

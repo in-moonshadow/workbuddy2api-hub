@@ -1279,8 +1279,42 @@ class Account(object):
         today_str = time.strftime("%Y-%m-%d")
         return not str(self.last_checkin).startswith(today_str)
 
+    def daily_chat_granted_today(self):
+        """积分快照里是否已出现**今天**的每日活跃奖励包。
+
+        `self.credits` 是 `fetch_credits()` 刷新的本地快照，读它不发上游请求
+        （与 `can_daily_chat()` 作为纯判断函数的定位相符）。判定口径与看板
+        `/accounts/credits/grants` 摊平出来的行一致：包名含 bonus、面额
+        30/50、grant_reason 为空、发放时间是今天。快照缺失或结构异常一律
+        当作「没有」，由调用方回落到本地记录。
+        """
+        credits = self.credits if isinstance(self.credits, dict) else {}
+        packages = credits.get("packages")
+        if not isinstance(packages, (list, tuple)):
+            return False
+        today_str = time.strftime("%Y-%m-%d")
+        for pkg in packages:
+            if not isinstance(pkg, dict):
+                continue
+            if "bonus" not in str(pkg.get("name") or "").lower():
+                continue
+            try:
+                if float(pkg.get("size") or 0) not in (30.0, 50.0):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if str(pkg.get("grant_reason") or "").strip():
+                continue
+            if str(pkg.get("create_time") or "").startswith(today_str):
+                return True
+        return False
+
     def can_daily_chat(self):
         if self.realm != "intl":
+            return False
+        # 服务端快照优先：积分包已证明今天发过活跃奖励，就别再跑一次
+        # （跑一次要真起一个 agent 会话、消耗该账号少量积分）。
+        if self.daily_chat_granted_today():
             return False
         if not self.last_daily_chat:
             return True
