@@ -20,3 +20,20 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+---
+
+Above is the original workbuddy2api-hub copyright notice. This distribution is
+a fork of https://github.com/ardeyouxipianyi/workbuddy2api-hub and additionally
+incorporates or derives from the following MIT-licensed upstream projects, whose
+copyright notices are retained here as required by their license terms. The
+project relationships and per-project contributions are documented in
+README.md, section "七、致谢与引用声明 (Credits & References)".
+
+Copyright (c) 2026 Sliverkiss (original project: https://github.com/Sliverkiss/workbuddy2api)
+Copyright (c) 2026 Sliverkiss (via https://github.com/ardeyouxipianyi/workbuddy2api)
+Copyright (c) 2026 Sliverkiss (via https://github.com/linguo2625469/workbuddy2api-panel)
+Copyright (c) 2026 linguo2625469 (https://github.com/linguo2625469/workbuddy2api-panel)
+Copyright (c) 2026 lovingfish (https://github.com/lovingfish/workbuddy-cliproxy)
+Copyright (c) 2026 mmqz (https://github.com/mmqz/cpa-multi-plugins)
+Copyright (c) 2026 aodianjun (https://github.com/aodianjun/workbuddy2api-hub)
+
