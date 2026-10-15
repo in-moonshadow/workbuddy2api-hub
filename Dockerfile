@@ -1,13 +1,21 @@
 # WorkBuddy Multi-Account Reverse Proxy Gateway
 FROM python:3.11-alpine
 
-# Set environment
+# === Build-time proxy (construction only; no daemon-level / runtime effect) ===
+# 仅在构建期（拉取 Alpine 包等 build 阶段）允许走代理；运行时容器网络保持不代理。
+# 用法：docker build --build-arg HTTP_PROXY=$HTTP_PROXY --build-arg HTTPS_PROXY=$HTTPS_PROXY .
+# 不传则留空 == 不走代理，行为与老版本一致；切勿把代理写进 runtime env / daemon.json。
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG NO_PROXY="localhost,127.0.0.1"
+
+# Runtime env does NOT include any proxy variables — proxy only for build stage below.
 ENV PYTHONUNBUFFERED=1     HOST=0.0.0.0     PORT=8788     API_KEY=     TZ=Asia/Shanghai
 
 WORKDIR /app
 
-# Alpine timezone & certs
-RUN apk add --no-cache tzdata ca-certificates &&     cp /usr/share/zoneinfo/${TZ} /etc/localtime &&     echo "${TZ}" > /etc/timezone
+# Alpine timezone & certs (build-time proxy only)
+RUN HTTP_PROXY="${HTTP_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}" NO_PROXY="${NO_PROXY}"       apk add --no-cache tzdata ca-certificates &&     cp /usr/share/zoneinfo/${TZ} /etc/localtime &&     echo "${TZ}" > /etc/timezone
 
 # Copy application files (Zero external pip dependencies needed)
 COPY wb_*.py dashboard.html ./

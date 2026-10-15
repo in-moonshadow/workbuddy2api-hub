@@ -1,8 +1,17 @@
 # 本地源码构建（开发者 / 修改代码测试用）：
 #   docker compose -f docker-compose.build.yml up -d --build
+#
+# 构建期代理（可选）：在 shell 里 export HTTP_PROXY / HTTPS_PROXY 后构建，
+# compose 会把它们作为 build-arg 传入；运行时容器网络不受影响。
+# 例：HTTP_PROXY=http://127.0.0.1:7897 docker compose -f docker-compose.build.yml up -d --build
 services:
   wb-proxy:
-    build: .
+    build:
+      context: .
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
     image: wb-proxy:local
     container_name: wb-proxy
     restart: unless-stopped
