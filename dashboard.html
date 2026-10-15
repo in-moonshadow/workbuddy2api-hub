@@ -127,6 +127,7 @@ th.sortable:hover .sort-arrow.idle{opacity:1}
   #cards .card .v{font-size:18px}
   .toolbar{gap:6px}
   .toolbar button{padding:5px 10px;font-size:11px}
+  .export-select{background:var(--surface);border:1px solid var(--border);color:inherit;border-radius:4px;padding:4px 6px;font-size:11px}
 }
 /* 账号区折叠。chevron 的指向跟着 aria-expanded 走，正文用
    grid-template-rows 收放：0fr 本身就是收起，所以没有动画也正确，也不必给
@@ -3018,7 +3019,13 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <!-- 活动记录入口：只读 GET /activity/history，账号区自己的控件，不另开页面。 -->
     <button class="sec" onclick="openActivityHistory()">签到记录</button>
     <button class="sec" onclick="openImport()">导入</button>
-    <button class="sec" onclick="exportAccounts(this)">导出</button>
+    <!-- 导出选项：完整=保留积分/限流等运行时状态（本机备份用）；仅账号=只含可
+         导入字段（换机器/发给别人导入用）。导出按钮按当前选项执行。 -->
+    <select id="exportMode" class="sec export-select" title="导出内容选项">
+      <option value="full">完整</option>
+      <option value="lean">仅账号</option>
+    </select>
+    <button class="sec" onclick="exportAccounts(this)" title="按上方选项导出：完整=备份用，仅账号=换机器导入用">导出</button>
     <span class="toolbar-sep" aria-hidden="true"></span>
     <button class="sec" onclick="fetchCredits(this)">一键刷新积分</button>
     <button class="sec" onclick="refreshAccounts(this)" title="逐个刷新所有账号的上游访问凭证（相当于对每个账号点一次「刷新凭证」）">一键刷新凭证</button>
@@ -6719,8 +6726,10 @@ async function downloadExport(query, fallbackLabel){
 async function exportAccounts(btn){
   if(btn){ btn.disabled = true; btn.textContent = '导出中...'; }
   try{
-    const r = await downloadExport('?lean=1', '');
-    toast('已导出 ' + r.count + ' 个账号 → ' + r.name);
+    const mode = document.getElementById('exportMode').value;
+    const lean = mode === 'lean' ? '?lean=1' : '';
+    const r = await downloadExport(lean, '');
+    toast((mode === 'lean' ? '已导出 ' + r.count + ' 个账号（仅账号）→ ' : '已导出 ' + r.count + ' 个账号 → ') + r.name);
   }catch(e){
     toast('导出失败: ' + e.message, 'err');
   }finally{
@@ -6732,7 +6741,7 @@ async function exportOne(uid){
   // Same document format as the bulk export, just narrowed to one account, so
   // the file can be re-imported on another instance without editing.
   try{
-    const r = await downloadExport('?uid=' + encodeURIComponent(uid) + '&lean=1', uid.slice(0,8) + '-');
+    const r = await downloadExport('?uid=' + encodeURIComponent(uid), uid.slice(0,8) + '-');
     toast('已导出 1 个账号 → ' + r.name);
   }catch(e){
     toast('导出失败: ' + e.message, 'err');
