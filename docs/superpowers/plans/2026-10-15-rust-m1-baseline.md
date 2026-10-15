@@ -6,7 +6,7 @@
 
 **Architecture:** `wb-proxy-rs/` 独立 Cargo workspace，与 Python 并存（不同进程/端口，只读同一份 legacy JSON）。M1 只落 `storage`（只读解析账号目录）与 `api`（axum）两个 crate。
 
-**Tech Stack:** Rust stable（MSRV 1.75）、axum 0.7、tokio 1、serde_json 1；dev：tower 0.4(util)、http-body-util 0.1、tempfile 3。前端继续用现有 `dashboard.html`。
+**Tech Stack:** Rust stable（MSRV 1.85）、axum 0.7、tokio 1、serde_json 1；dev：tower 0.5(util)、http-body-util 0.1、tempfile 3。前端继续用现有 `dashboard.html`。
 
 ## Global Constraints
 
@@ -18,6 +18,7 @@
 - 新文件只放 `wb-proxy-rs/`；不得改 `wb_*.py`、`dashboard.html`、Dockerfile、compose。
 - 每个任务提交前必须 `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test` 全绿。
   - **例外（Task 1，用户 2026-10-15 裁定）**：Task 1 只交付骨架，验收为 `cargo metadata` 通过 + `cargo build -p wb-storage` 成功；fmt/clippy/test 从 Task 2 起强制全绿（`wb-api` 的 `config`/`routes` 在 Task 3 才存在）。
+- MSRV 为 1.85（2026-10-15 用户裁定，因 hyper-util 0.1.21 要求 ≥1.85）；ACCOUNTS_DIR 优先于 WB_ACCOUNTS_DIR。
 
 ---
 
@@ -55,7 +56,7 @@ members = ["crates/storage", "crates/api"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 
 [workspace.dependencies]
 serde_json = "1"
@@ -144,7 +145,7 @@ wb-storage = { path = "../storage" }
 
 [dev-dependencies]
 http-body-util = "0.1"
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 ```
 
@@ -168,10 +169,30 @@ use wb_api::{app, Config};
 
 #[tokio::main]
 async fn main() {
-    let accounts_dir = PathBuf::from(std::env::var("WB_ACCOUNTS_DIR").unwrap_or_else(|_| "accounts".into()));
+    // 与 Python 侧一致：优先 ACCOUNTS_DIR，兼容旧名 WB_ACCOUNTS_DIR。
+    let accounts_dir = PathBuf::from(
+        std::env::var("ACCOUNTS_DIR")
+            .or_else(|_| std::env::var("WB_ACCOUNTS_DIR"))
+            .unwrap_or_else(|_| "accounts".into()),
+    );
     let dashboard = PathBuf::from(std::env::var("WB_DASHBOARD").unwrap_or_else(|_| "../dashboard.html".into()));
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8789);
+    // PORT 未设置时用默认端口；显式设置却无法解析（非整数或超出 u16）时必须快速失败，
+    // 避免静默回落到 8789 而掩盖配置错误。
+    let port: u16 = match std::env::var("PORT") {
+        Ok(raw) => match raw.parse::<u16>() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[wb-api] invalid PORT={raw:?}: {e} (expected integer 0-65535)");
+                std::process::exit(2);
+            }
+        },
+        Err(std::env::VarError::NotPresent) => 8789,
+        Err(e) => {
+            eprintln!("[wb-api] invalid PORT: {e} (must be valid UTF-8)");
+            std::process::exit(2);
+        }
+    };
     let cfg = Config {
         accounts_dir,
         dashboard,
