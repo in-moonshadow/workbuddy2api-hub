@@ -1,0 +1,16 @@
+[package]
+name = "wb-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
+serde_json.workspace = true
+wb-storage = { path = "../storage" }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }
+tempfile = "3"
