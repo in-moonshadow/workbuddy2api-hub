@@ -17,6 +17,7 @@
 - 不引入运行时代理环境变量；不新增本计划未列出的生产依赖。
 - 新文件只放 `wb-proxy-rs/`；不得改 `wb_*.py`、`dashboard.html`、Dockerfile、compose。
 - 每个任务提交前必须 `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test` 全绿。
+  - **例外（Task 1，用户 2026-10-15 裁定）**：Task 1 只交付骨架，验收为 `cargo metadata` 通过 + `cargo build -p wb-storage` 成功；fmt/clippy/test 从 Task 2 起强制全绿（`wb-api` 的 `config`/`routes` 在 Task 3 才存在）。
 
 ---
 
