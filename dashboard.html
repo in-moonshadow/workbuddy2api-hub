@@ -6719,7 +6719,7 @@ async function downloadExport(query, fallbackLabel){
 async function exportAccounts(btn){
   if(btn){ btn.disabled = true; btn.textContent = '导出中...'; }
   try{
-    const r = await downloadExport('', '');
+    const r = await downloadExport('?lean=1', '');
     toast('已导出 ' + r.count + ' 个账号 → ' + r.name);
   }catch(e){
     toast('导出失败: ' + e.message, 'err');
@@ -6732,7 +6732,7 @@ async function exportOne(uid){
   // Same document format as the bulk export, just narrowed to one account, so
   // the file can be re-imported on another instance without editing.
   try{
-    const r = await downloadExport('?uid=' + encodeURIComponent(uid), uid.slice(0,8) + '-');
+    const r = await downloadExport('?uid=' + encodeURIComponent(uid) + '&lean=1', uid.slice(0,8) + '-');
     toast('已导出 1 个账号 → ' + r.name);
   }catch(e){
     toast('导出失败: ' + e.message, 'err');

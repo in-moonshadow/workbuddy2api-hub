@@ -15963,6 +15963,9 @@ class Handler(BaseHTTPRequestHandler):
         if realm not in ("intl", "cn"):
             realm = None
         include_secrets = (query.get("secrets") or ["1"])[0] not in ("0", "false", "no")
+        portable = (query.get("portable") or query.get("lean") or
+                    query.get("minimal") or query.get("account_only") or
+                    ["0"])[0] in ("1", "true", "yes")
         uids = []
         for raw in query.get("uid") or []:
             uids.extend(part.strip() for part in str(raw).split(",") if part.strip())
@@ -15977,6 +15980,7 @@ class Handler(BaseHTTPRequestHandler):
             realm=realm,
             include_secrets=include_secrets,
             uids=uids or None,
+            portable=portable,
         )
         if (query.get("download") or ["0"])[0] in ("1", "true", "yes"):
             stamp = time.strftime("%Y%m%d-%H%M%S")

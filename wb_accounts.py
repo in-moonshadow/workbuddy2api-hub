@@ -3472,22 +3472,38 @@ EXPORT_VERSION = 1
 VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin",
                    "lastDailyChat", "lastActivityReport", "modelCaps")
 
+# Fields that describe the reusable credential itself, rather than live state,
+# proxy assignment, or diagnostics. A portable/account-only export keeps only
+# these so the file can be handed to another instance (or imported elsewhere)
+# without carrying state that would be wrong or misleading on the target.
+PORTABLE_EXPORT_FIELDS = ("uid", "nickname", "domain", "realm", "platform",
+                         "product", "enterpriseId", "accessToken",
+                         "refreshToken", "expiresAt", "addedAt", "source",
+                         "enabled", "weight", "note")
+
 # The subset of VOLATILE_FIELDS that must not round-trip through the local
 # credential file at all: they are not trusted on load and not written by save(),
 # exactly like model_cooldowns. An export still carries them (see to_dict()).
 RUNTIME_ONLY_FIELDS = ("lastError", "cooldownUntil")
 
 
-def account_to_export(account):
-    """Serialise one account for an export document."""
+def account_to_export(account, portable=False):
+    """Serialise one account for an export document.
+
+    By default everything is kept so the manager can inspect live state. With
+    portable=True only PORTABLE_EXPORT_FIELDS are emitted, giving a small
+    account-only document that is safe to import on another machine."""
     data = account.to_dict()
     # Keep the credential and identity; drop nothing, but mark the file source
     # so a re-import on the same machine does not look like a desktop import.
     data.pop("path", None)
+    if portable:
+        data = {k: data.get(k) for k in PORTABLE_EXPORT_FIELDS if k in data}
     return data
 
 
-def build_export_document(accounts, realm=None, include_secrets=True, uids=None):
+def build_export_document(accounts, realm=None, include_secrets=True, uids=None,
+                              portable=False):
     """Wrap accounts in a self-describing export document.
 
     `uids` narrows the export to specific accounts (a single uid gives a
@@ -3504,7 +3520,7 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
             continue
         if wanted is not None and account.uid not in wanted:
             continue
-        row = account_to_export(account)
+        row = account_to_export(account, portable=portable)
         if not include_secrets:
             row.pop("accessToken", None)
             row.pop("refreshToken", None)
