@@ -17094,6 +17094,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_tasks_run(payload)
         if path == "/tasks/travel":
             return self._route_tasks_travel(payload)
+        if path == "/tasks/claim-all":
+            return self._route_tasks_claim_all(payload)
         if path == "/tasks/streak-bonus":
             return self._route_tasks_streak_bonus(payload)
         if path == "/scheduler/trigger":
@@ -17296,6 +17298,98 @@ class Handler(BaseHTTPRequestHandler):
             if i < len(targets) - 1:
                 time.sleep(1.0)
         return self._json(200, {"ok": True, "msg": chr(10).join(results)})
+
+    def _route_tasks_claim_all(self, payload):
+        """一键领取全账号所有能跑的积分腿（CN: 签到/reportActivity/成长任务/
+        连登管家/猫猫旅行；Intl: 每日活跃会话 desktop+web）。"""
+        if not POOL:
+            return self._json(200, {"ok": False, "msg": "账号池不可用"})
+        invalidate_tasks_cache()
+        uid = (payload.get("uid") or "").strip()
+        cn_targets = [a for a in POOL.accounts
+                     if a.realm == "cn" and a.enabled and (uid in ("", "all") or a.uid == uid)]
+        intl_targets = [a for a in POOL.accounts
+                       if a.realm == "intl" and a.enabled and (uid in ("", "all") or a.uid == uid)]
+        if uid and uid not in ("all", "all") and not cn_targets and not intl_targets:
+            return self._json(200, {"ok": False, "msg": "未找到指定账号"})
+        if not cn_targets and not intl_targets:
+            return self._json(200, {"ok": False, "msg": "未找到已启用的账号"})
+        from wb_tasks import run_growth_tasks, run_streak_bonus, do_cat_travel
+
+        logs = []
+        credit = 0
+        lines = []
+        ordered = list(intl_targets) + list(cn_targets)
+        for i, acc in enumerate(ordered):
+            nick = acc.nickname or (acc.uid[:8] if acc.uid else "?")
+            uid8 = acc.uid[:8] if acc.uid else "?"
+            steps = []
+            lines.append("====== [claim-all] %s (%s) realm=%s ======" % (nick, uid8, acc.realm))
+            try:
+                if acc.realm == "intl":
+                    if acc.can_daily_chat():
+                        res = acc.daily_chat(trigger="claim-all")
+                        steps.append(("daily_chat", bool(res.get("ok")), res.get("msg") or res.get("error")))
+                        if res.get("ok"):
+                            logs.append("  [%s] 每日活跃 %s" % (nick, res.get("msg")))
+                        else:
+                            logs.append("  [%s] 每日活跃失败 %s" % (nick, res.get("error")))
+                    else:
+                        steps.append(("daily_chat", False, "今日已做或不可做"))
+                        logs.append("  [%s] 每日活跃跳过（今日已完成）" % nick)
+                else:
+                    if acc.can_checkin():
+                        res = acc.checkin(trigger="claim-all")
+                        steps.append(("checkin", bool(res.get("ok")), res.get("msg") or res.get("error")))
+                        logs.append("  [%s] 签到 %s" % (nick, res.get("msg") or res.get("error")))
+                        try:
+                            acc.credit_refresh() if hasattr(acc, "credit_refresh") else None
+                        except Exception:
+                            pass
+                        time.sleep(0.8)
+                    else:
+                        steps.append(("checkin", False, "今日已签到"))
+                        logs.append("  [%s] 签到跳过（今日已完成）" % nick)
+                    if acc.can_report_activity():
+                        res = acc.report_activity()
+                        steps.append(("report_activity", bool(res.get("ok")), res.get("msg") or res.get("error")))
+                        logs.append("  [%s] 活跃上报 %s" % (nick, res.get("msg") or res.get("error")))
+                        time.sleep(0.5)
+                    r = run_growth_tasks(acc, gap=1.0)
+                    earned = int(r.get("earned_credit") or 0)
+                    credit += earned
+                    steps.append(("growth_tasks", bool(r.get("ok", True)), "+%d" % earned))
+                    for l in (r.get("logs") or []):
+                        logs.append("  %s" % l)
+                    time.sleep(1.0)
+                    r2 = run_streak_bonus(acc)
+                    steps.append(("streak_bonus", bool(r2.get("ok")), r2.get("msg")))
+                    logs.append("  [%s] 连登管家 %s" % (nick, r2.get("msg")))
+                    time.sleep(0.8)
+                    tr = do_cat_travel(acc)
+                    steps.append(("cat_travel", True, tr.get("msg")))
+                    logs.append("  [%s] 猫猫日常 %s" % (nick, tr.get("msg")))
+                    time.sleep(1.0)
+            except Exception as exc:
+                steps.append(("error", False, str(exc)))
+                logs.append("  [%s] ERROR %s" % (nick, exc))
+            lines.append("  steps=%s" % steps)
+            try:
+                acc.save(os.path.dirname(acc.path)) if acc.path else None
+            except Exception:
+                pass
+            if i < len(ordered) - 1:
+                time.sleep(1.2)
+
+        lines.append("====== claim-all 完成，成长任务累计积分 +%d，共 %d 个账号 ======" % (credit, len(ordered)))
+        logs.append(lines[-1])
+        add_log_entry("[claim-all] 全量积分领取完成，共 %d 账号，成长积分 +%d" % (len(ordered), credit), tag="tasks")
+        return self._json(200, {
+            "ok": True,
+            "credit_added": credit,
+            "accounts_count": len(ordered),
+            "logs": logs,
+        })
 
     def _route_tasks_travel(self, payload):
         if not POOL:

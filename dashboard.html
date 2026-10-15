@@ -3129,6 +3129,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <button class="primary" id="btnPageCheckin" onclick="triggerBuddyCheckin(this)">Buddy 加油站签到</button>
         <button class="primary" id="btnRunTasks" onclick="runGrowthTasks(this)">一键做任务领积分</button>
         <button id="btnCatTravel" onclick="triggerCatTravel(this)">猫猫旅行</button>
+        <button class="primary" id="btnClaimAll" onclick="runClaimAll(this)" title="跨 CN & Intl：签到/活跃/成长任务/连登管家/猫猫旅行/国际日活 全跑一遍">一键领取全部积分</button>
         <button id="btnRunStreakBonus" onclick="triggerStreakBonus(this)">连登管家与抽奖</button>
       </div>
     </div>
@@ -4768,6 +4769,40 @@ async function runGrowthTasks(btn){
   }catch(e){
     if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">执行出错: ' + esc(e.message) + '</div>';
     alert("任务执行失败: " + e.message);
+  }finally{
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+async function runClaimAll(btn){
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = '领取中...';
+  const logBox = document.getElementById("taskLogBox");
+  if(logBox){
+    logBox.style.display = 'block';
+    logBox.innerHTML = '<div style="color:var(--accent)">[claim-all] 正在依次执行账号全 legs（签到/活跃/成长任务/连登/猫猫/国际日活）...</div>';
+  }
+  try{
+    const payload = {};
+    // 若 growth 面板选择了某个账号，按 realm 应用；否则 'all'
+    if(CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
+      payload.uid = CURRENT_GROWTH_UID;
+    }
+    const r = await postJSON("/tasks/claim-all", payload);
+    const logs = r.logs || [];
+    if(logBox){
+      logBox.innerHTML = logs.map(l => '<div>' + esc(l) + '</div>').join('');
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+    await loadAccounts();
+    await loadGrowthTasks();
+    const sumC = r.credit_added != null ? ('，累计成长积分 +' + r.credit_added) : '';
+    toast("一键领取全部积分完成：共 " + (r.accounts_count||0) + " 个账号" + sumC + "！", r.ok ? "ok" : "warn");
+  }catch(e){
+    if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">执行出错: ' + esc(e.message) + '</div>';
+    alert("一键领取全部积分失败: " + e.message);
   }finally{
     btn.disabled = false;
     btn.textContent = oldText;
