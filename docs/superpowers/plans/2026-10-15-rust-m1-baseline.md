@@ -633,7 +633,7 @@ Expected: `health_reports_pool_shape` PASS。
 - [ ] **Step 5: 手动对照 Python**
 
 ```bash
-cd wb-proxy-rs && WB_ACCOUNTS_DIR=../accounts PORT=8789 cargo run -p wb-api &
+cd wb-proxy-rs && ACCOUNTS_DIR=../accounts PORT=8789 cargo run -p wb-api &
 sleep 3
 curl -s http://127.0.0.1:8789/health; echo
 curl -s http://127.0.0.1:8788/health; echo
@@ -810,7 +810,7 @@ Expected: health + dashboard 两个测试文件全 PASS。
 - [ ] **Step 5: 手动验证真实面板**
 
 ```bash
-cd wb-proxy-rs && WB_ACCOUNTS_DIR=../accounts WB_DASHBOARD=../dashboard.html PORT=8789 cargo run -p wb-api &
+cd wb-proxy-rs && ACCOUNTS_DIR=../accounts WB_DASHBOARD=../dashboard.html PORT=8789 cargo run -p wb-api &
 sleep 3
 curl -s -o /dev/null -w 'status=%{http_code} type=%{content_type}\n' http://127.0.0.1:8789/
 kill %1
