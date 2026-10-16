@@ -154,8 +154,41 @@ pub fn load_snapshot(
     let now = unix_secs();
     let mut accounts = 0usize;
     let mut accounts_ready = 0usize;
+    for (_, doc) in account_entries(accounts_dir)? {
+        accounts += 1;
+        if is_ready(&doc, now) {
+            accounts_ready += 1;
+        }
+    }
+    let api_key_required = api_key_configured(accounts_dir, api_key_env, lan);
+    Ok(Snapshot {
+        realm,
+        accounts,
+        accounts_ready,
+        api_key_required,
+    })
+}
+
+/// 代表账号的视图（对齐 Python `Account.public()` 的身份子集）。
+///
+/// M2 阶段只暴露 /health 授权时需要的字段；完整 public() 视图（proxy/
+/// credits/modelCooldowns 等）随 gateway 里程碑补齐。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Account {
+    pub uid: String,
+    pub domain: String,
+    pub realm: String,
+    pub access_token: String,
+    pub expires_at: i64,
+    pub credential_file: String,
+}
+
+/// 遍历账号目录，返回 (文件名, JSON 文档) 列表；按文件枚举顺序（对齐 Python
+/// `AccountPool._load` 的加载顺序，representative 依赖它取「第一个」）。
+fn account_entries(accounts_dir: &Path) -> Result<Vec<(String, serde_json::Value)>, StorageError> {
     let entries = fs::read_dir(accounts_dir)
         .map_err(|err| StorageError::Io(accounts_dir.to_path_buf(), err))?;
+    let mut out = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| StorageError::Io(accounts_dir.to_path_buf(), err))?;
         let path = entry.path();
@@ -174,18 +207,52 @@ pub fn load_snapshot(
             Some(doc) if doc.is_object() => doc,
             _ => continue,
         };
-        accounts += 1;
-        if is_ready(&doc, now) {
-            accounts_ready += 1;
+        out.push((name, doc));
+    }
+    Ok(out)
+}
+
+/// 代表账号：第一个有 access_token 的账号，否则第一个，池空则 None
+/// （对齐 Python `AccountPool.representative()` :3154-3159，供 /health
+/// 授权身份字段使用）。
+pub fn representative(accounts_dir: &Path, realm: &str) -> Option<Account> {
+    let entries = account_entries(accounts_dir).ok()?;
+    let mut first_with_token: Option<Account> = None;
+    let mut first: Option<Account> = None;
+    for (name, doc) in entries {
+        let account_realm = doc.get("realm").and_then(|v| v.as_str()).unwrap_or("");
+        if !realm.is_empty() && account_realm != realm {
+            continue;
+        }
+        let view = Account {
+            uid: doc
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            domain: doc
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            realm: account_realm.to_string(),
+            access_token: doc
+                .get("accessToken")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            expires_at: doc.get("expiresAt").and_then(|v| v.as_i64()).unwrap_or(0),
+            credential_file: name,
+        };
+        if first.is_none() {
+            first = Some(view.clone());
+        }
+        if !view.access_token.is_empty() {
+            first_with_token = Some(view);
+            break;
         }
     }
-    let api_key_required = api_key_configured(accounts_dir, api_key_env, lan);
-    Ok(Snapshot {
-        realm,
-        accounts,
-        accounts_ready,
-        api_key_required,
-    })
+    first_with_token.or(first)
 }
 
 #[cfg(test)]
