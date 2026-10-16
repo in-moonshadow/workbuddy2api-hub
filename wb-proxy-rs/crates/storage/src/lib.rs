@@ -126,7 +126,19 @@ fn api_key_configured(accounts_dir: &Path, api_key_env: Option<&str>, lan: bool)
             return true;
         }
     }
-    doc.get("api_key")
+    if doc
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .map(|k| !k.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // launcher mode 会生成一个 key 持久化进 settings.json 的 launcher_key，并
+    // 在启动时灌入 Python 的全局 API_KEY —— auth_required() 正是靠 bool(API_KEY)
+    // 判定「需要 key」。影子只读同一份 settings.json，所以 launcher_key 非空 ⇔
+    // 真实实例此刻要求 key。漏掉它会把「要求 key」的实例误报为「不要求」。
+    doc.get("launcher_key")
         .and_then(|v| v.as_str())
         .map(|k| !k.is_empty())
         .unwrap_or(false)
@@ -244,5 +256,36 @@ mod tests {
     fn language_reads_valid_value() {
         let dir = fixture();
         assert_eq!(ui_language(dir.path()), "en");
+    }
+
+    #[test]
+    fn launcher_key_requires_a_key() {
+        // 复刻真实 LAN 实例：settings.json 只有 launcher_key，没有 api_keys/
+        // api_key。Python 的 auth_required() 靠启动时灌入的全局 API_KEY 判为
+        // true，影子读同一份文件也必须为 true，否则会把「要求 key」误报为
+        // 「不要求」。
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("active_realm.json"), r#"{"realm":"intl"}"#).unwrap();
+        fs::write(
+            dir.path().join("settings.json"),
+            r#"{"launcher_key":"wb-REDACTED_SAMPLE"}"#,
+        )
+        .unwrap();
+        let snap = load_snapshot(dir.path(), None, false).unwrap();
+        assert!(snap.api_key_required);
+    }
+
+    #[test]
+    fn auth_disabled_wins_over_launcher_key() {
+        // auth_disabled:true 时无论 launcher_key 是否存在都不要求 key，与 Python
+        // auth_required() 先判 auth_disabled 的顺序一致。
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("settings.json"),
+            r#"{"auth_disabled":true,"launcher_key":"wb-REDACTED_SAMPLE"}"#,
+        )
+        .unwrap();
+        let snap = load_snapshot(dir.path(), None, false).unwrap();
+        assert!(!snap.api_key_required);
     }
 }
