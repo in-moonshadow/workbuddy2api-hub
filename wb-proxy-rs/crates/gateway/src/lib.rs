@@ -7,6 +7,7 @@
 pub mod body;
 pub mod egress;
 pub mod endpoints;
+pub mod forward;
 pub mod headers;
 pub mod leaked;
 pub mod notes;
