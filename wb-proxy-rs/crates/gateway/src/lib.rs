@@ -11,3 +11,4 @@ pub mod notes;
 pub mod pool;
 pub mod prompt;
 pub mod sanitize;
+pub mod upstream;
