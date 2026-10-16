@@ -1,0 +1,10 @@
+[package]
+name = "wb-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+md-5.workspace = true
+getrandom = "0.2"
