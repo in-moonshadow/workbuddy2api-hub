@@ -75,12 +75,15 @@ pub fn note_success(account: &mut AccountState, model: Option<&str>) {
     account.last_error_detail = String::new();
 }
 
-/// note_soft_rate（wb_accounts.py:438-440, 414-415）：账号级 429。
-/// soft_streak+=1；cooldown_until = max(旧, now + soft_backoff(streak))。
-pub fn note_soft_rate(account: &mut AccountState, now: f64) {
+/// note_soft_rate（wb_accounts.py:2062-2069）：账号级 429。
+/// soft_streak+=1；last_error=message；cooldown_until = max(旧, now + soft_backoff(streak))；
+/// **返回本次退避秒数**（Python 原样 `return wait`，调用方用作 retry_after）。
+pub fn note_soft_rate(account: &mut AccountState, message: &str, now: f64) -> f64 {
     account.soft_streak += 1;
-    let until = now + soft_backoff(account.soft_streak);
-    account.cooldown_until = account.cooldown_until.max(until);
+    account.last_error = message.into();
+    let wait = soft_backoff(account.soft_streak);
+    account.cooldown_until = account.cooldown_until.max(now + wait);
+    wait
 }
 
 /// note_unscoped_rate（wb_accounts.py:443-450）：无作用域 429。
@@ -91,9 +94,10 @@ pub fn note_unscoped_rate(account: &mut AccountState) -> f64 {
     unverified_soft_backoff(account.unscoped_streak)
 }
 
-/// note_error（wb_accounts.py:2017-2021）：通用冷却入口（429 模型级 / 403 风控 /
+/// note_error（wb_accounts.py:2017-2024）：通用冷却入口（429 模型级 / 403 风控 /
 /// 401 / 未知异常）。model 非空 → 记 model_cooldowns[model]：
 /// wait = max(1.0, until-now) 否则 (3.0 if single_account else cooldown)；
+/// model 空 → 账号级 cooldown_until = now + (3.0 if single_account else cooldown)。
 /// until 由上游 reset_at 给出（无则 None）。同步写 last_error*。
 ///
 /// 参数即 Python `note_error(self, msg, model, until, cooldown, single_account, now)`
@@ -122,10 +126,14 @@ pub fn note_error(
                 }
             }
         };
-        let next = account.model_cooldowns.get(m).copied().unwrap_or(0.0);
-        account
-            .model_cooldowns
-            .insert(m.into(), next.max(now + wait));
+        // Python `self.model_cooldowns[model] = time.time() + wait`：直接覆盖，
+        // 不做 max——后到的冷却以自身窗口为准（对齐 :2021）
+        account.model_cooldowns.insert(m.into(), now + wait);
+    } else {
+        // 账号级冷却（Python :2023-2024）：single_account 打折到 3s，否则用
+        // cooldown。无 max（Python 直接赋值 `cooldown_until = now + actual`）。
+        let actual = if single_account { 3.0 } else { cooldown };
+        account.cooldown_until = now + actual;
     }
 }
 
@@ -179,6 +187,56 @@ pub fn note_unknown_failure(account: &mut AccountState, msg: &str, now: f64) {
     if account.fails >= 3 {
         let until = now + breaker_backoff(account.fails);
         account.breaker_until = account.breaker_until.max(until);
+    }
+}
+
+/// cap_until（wb_accounts.py:961-970）：模型处于「上游判定额度用满」状态的
+/// 截止时刻（model_caps 有该模型且 reset > now）；不在其中 → 0。
+pub fn cap_until(account: &AccountState, model: &str, now: f64) -> f64 {
+    match account.model_caps.get(model) {
+        Some(cap) if cap.reset > now => cap.reset,
+        _ => 0.0,
+    }
+}
+
+/// clear_error（wb_accounts.py:2137-2158）：清限流状态。三态：
+/// - model Some：只删该模型冷却；keep_caps 且该模型仍处 cap 恢复期 → 保留。
+/// - model None + keep_caps：保留仍在恢复期的 cap 对应冷却，删其余。
+/// - model None + !keep_caps：清全部模型冷却。
+///
+/// 末尾若任一项非零（last_error/cooldown_until/last_error_detail/balance_until）
+/// 则整组归零（Python `or` 判定，任一非空即清空整组）。
+pub fn clear_error(account: &mut AccountState, model: Option<&str>, keep_caps: bool, now: f64) {
+    match model {
+        Some(m) => {
+            let protected = keep_caps && cap_until(account, m, now) > 0.0;
+            if !protected {
+                account.model_cooldowns.remove(m);
+            }
+        }
+        None => {
+            if keep_caps {
+                let protected: Vec<String> = account
+                    .model_cooldowns
+                    .keys()
+                    .filter(|m| cap_until(account, m, now) > 0.0)
+                    .cloned()
+                    .collect();
+                account.model_cooldowns.retain(|m, _| protected.contains(m));
+            } else {
+                account.model_cooldowns.clear();
+            }
+        }
+    }
+    if !account.last_error.is_empty()
+        || account.cooldown_until != 0.0
+        || !account.last_error_detail.is_empty()
+        || account.balance_until != 0.0
+    {
+        account.last_error.clear();
+        account.last_error_detail.clear();
+        account.cooldown_until = 0.0;
+        account.balance_until = 0.0;
     }
 }
 
@@ -291,15 +349,15 @@ mod tests {
     #[test]
     fn note_soft_rate_streak_and_cooldown() {
         let mut a = acc("u1");
-        note_soft_rate(&mut a, NOW);
+        note_soft_rate(&mut a, "HTTP 429 (account soft rate)", NOW);
         assert_eq!(a.soft_streak, 1);
         assert_eq!(a.cooldown_until, NOW + 600.0);
-        note_soft_rate(&mut a, NOW);
+        note_soft_rate(&mut a, "HTTP 429 (account soft rate)", NOW);
         assert_eq!(a.soft_streak, 2);
         assert_eq!(a.cooldown_until, NOW + 1200.0);
         // 连续第 5 次顶到 7200
         for _ in 0..3 {
-            note_soft_rate(&mut a, NOW);
+            note_soft_rate(&mut a, "HTTP 429 (account soft rate)", NOW);
         }
         assert_eq!(a.cooldown_until, NOW + 7200.0);
     }
@@ -330,7 +388,7 @@ mod tests {
             NOW,
         );
         assert_eq!(a.model_cooldowns.get("m"), Some(&(NOW + 50.0)));
-        // 二次调用 max 保持
+        // 二次调用直接覆盖（Python `= time.time() + wait`，无 max）
         note_error(
             &mut a,
             "429 model",
@@ -341,7 +399,7 @@ mod tests {
             "d",
             NOW,
         );
-        assert_eq!(a.model_cooldowns.get("m"), Some(&(NOW + 50.0)));
+        assert_eq!(a.model_cooldowns.get("m"), Some(&(NOW + 30.0)));
         // until 早于 now → wait 地板 1s
         note_error(
             &mut a,
@@ -438,5 +496,88 @@ mod tests {
         assert!(a.model_caps.is_empty());
         assert!(a.free_models.is_empty());
         assert_eq!(a.last_error, "");
+    }
+
+    // ---- T4d：cap_until / clear_error（wb_accounts.py:961-970, 2137-2158）----
+
+    #[test]
+    fn cap_until_reports_active_window_only() {
+        let mut a = acc("u1");
+        assert_eq!(cap_until(&a, "gpt-5", NOW), 0.0);
+        a.model_caps.insert(
+            "gpt-5".into(),
+            crate::pool::ModelCap {
+                at: NOW,
+                reset: NOW + 900.0,
+            },
+        );
+        assert_eq!(cap_until(&a, "gpt-5", NOW), NOW + 900.0);
+        // 恢复期已过 → 0
+        assert_eq!(cap_until(&a, "gpt-5", NOW + 901.0), 0.0);
+        // 其它模型不在表中 → 0
+        assert_eq!(cap_until(&a, "gpt-4", NOW), 0.0);
+    }
+
+    #[test]
+    fn clear_error_model_scoped_respects_cap() {
+        let mut a = acc("u1");
+        a.model_cooldowns.insert("gpt-5".into(), NOW + 900.0);
+        a.model_cooldowns.insert("gpt-4".into(), NOW + 600.0);
+        a.model_caps.insert(
+            "gpt-5".into(),
+            crate::pool::ModelCap {
+                at: NOW,
+                reset: NOW + 900.0,
+            },
+        );
+        // keep_caps 且 gpt-5 在恢复期 → 删 gpt-4，保留 gpt-5
+        clear_error(&mut a, Some("gpt-5"), true, NOW);
+        assert!(a.model_cooldowns.contains_key("gpt-5"));
+        assert!(a.model_cooldowns.contains_key("gpt-4"));
+        clear_error(&mut a, Some("gpt-4"), true, NOW);
+        assert!(!a.model_cooldowns.contains_key("gpt-4"));
+        assert!(a.model_cooldowns.contains_key("gpt-5"));
+        // keep_caps=false 时 cap 也不保护
+        clear_error(&mut a, Some("gpt-5"), false, NOW);
+        assert!(!a.model_cooldowns.contains_key("gpt-5"));
+    }
+
+    #[test]
+    fn clear_error_account_wide_keep_caps() {
+        let mut a = acc("u1");
+        a.model_cooldowns.insert("gpt-5".into(), NOW + 900.0);
+        a.model_cooldowns.insert("gpt-4".into(), NOW + 600.0);
+        a.model_caps.insert(
+            "gpt-5".into(),
+            crate::pool::ModelCap {
+                at: NOW,
+                reset: NOW + 900.0,
+            },
+        );
+        clear_error(&mut a, None, true, NOW);
+        assert!(a.model_cooldowns.contains_key("gpt-5"));
+        assert!(!a.model_cooldowns.contains_key("gpt-4"));
+        // 无 keep_caps → 全清
+        a.model_cooldowns.insert("gpt-4".into(), NOW + 600.0);
+        clear_error(&mut a, None, false, NOW);
+        assert!(a.model_cooldowns.is_empty());
+    }
+
+    #[test]
+    fn clear_error_resets_account_level_punishments() {
+        let mut a = acc("u1");
+        a.last_error = "HTTP 429 (model throttled)".into();
+        a.last_error_detail = r#"{"code":14003}"#.into();
+        a.cooldown_until = NOW + 60.0;
+        a.balance_until = NOW + 7200.0;
+        clear_error(&mut a, None, false, NOW);
+        assert_eq!(a.last_error, "");
+        assert_eq!(a.last_error_detail, "");
+        assert_eq!(a.cooldown_until, 0.0);
+        assert_eq!(a.balance_until, 0.0);
+        // 全零 → 保持零（不写多余）
+        clear_error(&mut a, None, false, NOW);
+        assert_eq!(a.last_error, "");
+        assert_eq!(a.cooldown_until, 0.0);
     }
 }

@@ -104,6 +104,44 @@ pub fn apply_prompt_mode(messages: &mut Vec<Value>, cfg: &PromptConfig, degraded
     }
 }
 
+/// next_midnight_cst（wb_prompt.py:96-105）：下一个「次日 00:00 UTC+8」。
+/// **硬编码 +8h**（Python 原样）——与 notes::next_local_4am 的显式偏移参数
+/// 不同，这是进程级降级窗口的专用口径，不随面板时区设置变化。
+pub fn next_midnight_cst(now: f64) -> f64 {
+    let offset = 8.0 * 3600.0;
+    let day = ((now + offset) / 86400.0).floor() as i64;
+    (day + 1) as f64 * 86400.0 - offset
+}
+
+/// DegradeGate（wb_prompt.py:107-128）：进程级 403 降级窗口，触发后到
+/// 次日 00:00 CST 为止（不续期；重复 trigger 在窗口内不延后）。
+/// M3 单线程路径，未加锁（Python 用锁防并发 trigger 竞态）。
+pub struct DegradeGate {
+    until: f64,
+}
+
+impl Default for DegradeGate {
+    fn default() -> Self {
+        Self { until: 0.0 }
+    }
+}
+
+impl DegradeGate {
+    pub fn active(&self, now: f64) -> bool {
+        now < self.until
+    }
+
+    pub fn trigger(&mut self, now: f64) {
+        if now >= self.until {
+            self.until = next_midnight_cst(now);
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.until = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +233,38 @@ mod tests {
         };
         apply_prompt_mode(&mut m, &cfg, false);
         assert_eq!(m.len(), 1);
+    }
+
+    // ---- T4d：DegradeGate / next_midnight_cst（wb_prompt.py:96-128）----
+
+    #[test]
+    fn next_midnight_cst_lands_on_0000_utc8() {
+        // 2026-10-16 00:00 UTC = 1_792_108_800（由 fetch_upstream_refs 参照值
+        // 1791528299 = 2026-10-09 06:44:59 UTC 反推）。代数取整，不手打午刻。
+        let midnight = 1_792_108_800.0; // 2026-10-16 00:00 UTC
+        let noon_utc = midnight + 43_200.0; // 12:00 UTC = 20:00 +08
+                                            // +08 纬度下 now 属 10-16（+8h 仍在同日），次日 00:00 +08 = 10-16 16:00 UTC
+        let expect = midnight + 57_600.0;
+        assert_eq!(next_midnight_cst(noon_utc), expect);
+        // 恰好 00:00 +08 的时刻触发 → 下一个 00:00 +08（不是当前时刻）
+        assert_eq!(next_midnight_cst(expect), expect + 86_400.0);
+    }
+
+    #[test]
+    fn degrade_gate_activates_and_does_not_extend() {
+        let mut g = DegradeGate::default();
+        let now = 1_766_980_800.0;
+        assert!(!g.active(now));
+        g.trigger(now);
+        assert!(g.active(now));
+        // 窗口内重复 trigger 不延后
+        let until = g.until;
+        g.trigger(now + 3600.0);
+        assert_eq!(g.until, until);
+        // 窗口过后可再触发
+        g.trigger(until + 1.0);
+        assert!(g.until > until);
+        g.reset();
+        assert!(!g.active(until + 1.0));
     }
 }

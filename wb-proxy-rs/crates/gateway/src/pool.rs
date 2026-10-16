@@ -48,8 +48,12 @@ pub struct AccountState {
     pub enabled: bool,
     /// 是否存在 access_token（空串视为无）。
     pub has_token: bool,
+    /// 出站 Bearer token（M3 测试注入脱敏值；重试循环构造 Authorization 头用）。
+    pub access_token: String,
     /// 手动权重，夹到 [1,100]，0/None → 1。
     pub weight: i64,
+    /// 出站身分（endpoints::normalize_product 规范值；auto_switch 旋转）。
+    pub product: String,
     /// 账号级软限流直到时刻。
     pub cooldown_until: f64,
     /// 402 余额停用直到下一个本地 04:00（**本地时区，非 UTC**）。
@@ -90,7 +94,9 @@ impl AccountState {
             realm: realm.into(),
             enabled: true,
             has_token: true,
+            access_token: String::new(),
             weight: 1,
+            product: crate::endpoints::PRODUCT_DESKTOP.into(),
             cooldown_until: 0.0,
             balance_until: 0.0,
             breaker_until: 0.0,
@@ -123,6 +129,20 @@ impl AccountState {
             }
         }
         wait.max(0.0)
+    }
+
+    /// set_product（wb_accounts.py:1200-1214）：切换出站身分。normalize 后与
+    /// 现值相同 → False；不同 → 改字段 + clear_error(keep_caps=True)（保留仍
+    /// 在恢复期的 6004 cap，跨身分成立，真机实测不能顺手清掉）。M3 纯内存，
+    /// 凭证档持久化属 M5。
+    pub fn set_product(&mut self, value: &str, now: f64) -> bool {
+        let new = crate::endpoints::normalize_product(value);
+        if new == self.product {
+            return false;
+        }
+        self.product = new.into();
+        crate::notes::clear_error(self, None, true, now);
+        true
     }
 
     /// ready(model) 近似判定（wb_accounts.py:1079-1112，第一步子集）：
@@ -345,12 +365,28 @@ impl AccountPool {
         self.accounts.get(index)
     }
 
+    /// 可变账号访问（retry 循环记账用）。锁纪律：accounts 不可变表，
+    /// note_* 修改的是 AccountState 自身（内部无锁，M3 单线程路径 OK）。
+    pub fn account_mut(&mut self, index: usize) -> Option<&mut AccountState> {
+        self.accounts.get_mut(index)
+    }
+
+    /// 池级 demote（retry 循环降级热号用）：转发到 affinity.demote。
+    pub fn demote(&mut self, session_key: &str, uid: Option<&str>) {
+        self.state.lock().unwrap().affinity.demote(session_key, uid);
+    }
+
     pub fn len(&self) -> usize {
         self.accounts.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
+    }
+
+    /// 只读遍历（retry 兜底统计用）。
+    pub fn iter_accounts(&self) -> std::slice::Iter<'_, AccountState> {
+        self.accounts.iter()
     }
 
     fn find_ready(&self, uid: &str, realm: &str, model: Option<&str>, now: f64) -> Option<usize> {
@@ -1086,5 +1122,46 @@ mod tests {
         let _keep = (p1, p2); // 保持占用，不释放
         let err = gate.acquire().await.expect_err("cap stays 2");
         assert_eq!(err.in_flight, 2);
+    }
+
+    // ---- T4d：set_product（wb_accounts.py:1200-1214）----
+
+    #[test]
+    fn set_product_normalizes_and_rejects_same() {
+        let mut a = intl(1);
+        assert_eq!(a.product, crate::endpoints::PRODUCT_DESKTOP);
+        // 相同（desktop/workbuddy 同值）→ False
+        assert!(!a.set_product("workbuddy", 1_000.0));
+        assert_eq!(a.product, crate::endpoints::PRODUCT_DESKTOP);
+        // 切换 vscode → True
+        assert!(a.set_product("vscode", 1_000.0));
+        assert_eq!(a.product, crate::endpoints::PRODUCT_VSCODE);
+        // 再切回 cli
+        assert!(a.set_product("CLI", 1_000.0));
+        assert_eq!(a.product, crate::endpoints::PRODUCT_CLI);
+    }
+
+    #[test]
+    fn set_product_keeps_active_caps() {
+        let mut a = intl(1);
+        let now = 1_000.0;
+        a.model_cooldowns.insert("gpt-5".into(), now + 900.0);
+        a.model_cooldowns.insert("gpt-4".into(), now + 600.0);
+        a.model_caps.insert(
+            "gpt-5".into(),
+            ModelCap {
+                at: now,
+                reset: now + 900.0,
+            },
+        );
+        a.last_error = "some old error".into();
+        a.cooldown_until = now + 50.0;
+        assert!(a.set_product("vscode", now));
+        // 6004 恢复期内的 gpt-5 冷却保留；非 cap 的 gpt-4 冷却被清
+        assert!(a.model_cooldowns.contains_key("gpt-5"));
+        assert!(!a.model_cooldowns.contains_key("gpt-4"));
+        // 账号级惩罚归零
+        assert_eq!(a.last_error, "");
+        assert_eq!(a.cooldown_until, 0.0);
     }
 }
