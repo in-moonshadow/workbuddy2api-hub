@@ -11,7 +11,12 @@ use wb_api::{app, Config};
 fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("active_realm.json"), r#"{"realm":"cn"}"#).unwrap();
-    fs::write(dir.path().join("settings.json"), r#"{"ui_language":"zh"}"#).unwrap();
+    // launcher_key 使实例「要求 key」，未授权请求 → 未授权响应（5 基础字段）。
+    fs::write(
+        dir.path().join("settings.json"),
+        r#"{"ui_language":"zh","launcher_key":"wb-test-key"}"#,
+    )
+    .unwrap();
     let account = |uid: &str, enabled: bool| {
         serde_json::json!({
             "uid": uid, "realm": "cn", "enabled": enabled,
@@ -51,7 +56,7 @@ async fn health_reports_pool_shape() {
         value,
         serde_json::json!({
             "ok": true, "realm": "cn", "accounts": 2,
-            "accounts_ready": 1, "api_key_required": false
+            "accounts_ready": 1, "api_key_required": true
         })
     );
 }

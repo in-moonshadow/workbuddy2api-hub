@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "realm": "s",
+  "accounts": 0,
+  "accounts_ready": 0,
+  "api_key_required": true,
+  "uid": "s",
+  "domain": "s",
+  "issuer": "s",
+  "credential_file": "f.json",
+  "expires_at": 0
+}

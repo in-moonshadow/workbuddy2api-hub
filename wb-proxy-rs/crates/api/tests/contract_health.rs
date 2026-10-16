@@ -16,7 +16,13 @@ use wb_api::{app, Config};
 fn fixture_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("active_realm.json"), r#"{"realm":"intl"}"#).unwrap();
-    fs::write(dir.path().join("settings.json"), r#"{"ui_language":"zh"}"#).unwrap();
+    // launcher_key 使实例「要求 key」（对齐 Python 真实实例启动后 API_KEY 非空），
+    // 未授权请求因此走未授权路径，匹配 Python fixture 的 5 字段形状。
+    fs::write(
+        dir.path().join("settings.json"),
+        r#"{"ui_language":"zh","launcher_key":"wb-test-key"}"#,
+    )
+    .unwrap();
     let account = serde_json::json!({
         "uid": "a", "realm": "intl", "enabled": true,
         "accessToken": "h.p.s", "cooldownUntil": 0.0, "lastError": ""

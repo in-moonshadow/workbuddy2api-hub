@@ -103,7 +103,14 @@ fn is_ready(account: &serde_json::Value, now: f64) -> bool {
     enabled && !token.is_empty() && cooldown <= now && last_error.is_empty()
 }
 
-fn api_key_configured(accounts_dir: &Path, api_key_env: Option<&str>, lan: bool) -> bool {
+/// 是否需要 API key（对齐 Python wb_proxy.auth_required :420-426）。
+///
+/// Python 的 `auth_disabled` 优先，其次面板 api_keys[] 有 enabled 项，最后
+/// `bool(API_KEY)`。launcher 模式会把生成 key 持久化进 settings.json 的
+/// launcher_key 并在启动时灌入全局 API_KEY —— 影子只读同一份 settings.json，
+/// 所以 launcher_key 非空 ⇔ 真实实例此刻要求 key；漏掉它会把「要求 key」的
+/// 实例误报为「不要求」。
+pub fn auth_required(accounts_dir: &Path, api_key_env: Option<&str>, lan: bool) -> bool {
     if lan || api_key_env.map(|k| !k.is_empty()).unwrap_or(false) {
         return true;
     }
@@ -134,10 +141,6 @@ fn api_key_configured(accounts_dir: &Path, api_key_env: Option<&str>, lan: bool)
     {
         return true;
     }
-    // launcher mode 会生成一个 key 持久化进 settings.json 的 launcher_key，并
-    // 在启动时灌入 Python 的全局 API_KEY —— auth_required() 正是靠 bool(API_KEY)
-    // 判定「需要 key」。影子只读同一份 settings.json，所以 launcher_key 非空 ⇔
-    // 真实实例此刻要求 key。漏掉它会把「要求 key」的实例误报为「不要求」。
     doc.get("launcher_key")
         .and_then(|v| v.as_str())
         .map(|k| !k.is_empty())
@@ -160,7 +163,7 @@ pub fn load_snapshot(
             accounts_ready += 1;
         }
     }
-    let api_key_required = api_key_configured(accounts_dir, api_key_env, lan);
+    let api_key_required = auth_required(accounts_dir, api_key_env, lan);
     Ok(Snapshot {
         realm,
         accounts,
@@ -253,6 +256,199 @@ pub fn representative(accounts_dir: &Path, realm: &str) -> Option<Account> {
         }
     }
     first_with_token.or(first)
+}
+
+/// 生效的 API key（对齐 Python wb_proxy.py:18722-18737 的三来源优先级）：
+/// ① 环境变量 API_KEY（对应 --api-key）
+/// ② 面板保存的 settings.json api_key_set+api_key（胜出于 launcher key）
+/// ③ LAN 模式生成的 settings.json launcher_key
+///
+/// 面板声明了管理权（api_key_set=true）但 api_key 为空时，视为未配置、不回落
+/// 到 launcher key（Python 用空串覆盖 API_KEY 的等价语义）。
+pub fn effective_api_key(accounts_dir: &Path, env_api_key: Option<&str>) -> Option<String> {
+    let env = env_api_key.map(str::trim).unwrap_or("");
+    if !env.is_empty() {
+        return Some(env.to_string());
+    }
+    let doc = match read_json(&accounts_dir.join("settings.json")) {
+        Ok(Some(doc)) => doc,
+        _ => return None,
+    };
+    if doc
+        .get("api_key_set")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let saved = doc
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        return if saved.is_empty() {
+            None
+        } else {
+            Some(saved.to_string())
+        };
+    }
+    let launcher = doc
+        .get("launcher_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if launcher.is_empty() {
+        None
+    } else {
+        Some(launcher.to_string())
+    }
+}
+
+/// 一个 API key 条目（对齐 Python wb_settings._clean_key_entry 的返回 dict）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyEntry {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+    pub realm: String,
+    pub models: Vec<String>,
+    pub enabled: bool,
+    /// 非空表示已删除（面板保留条目供 UI 展示，匹配端跳过）。
+    pub deleted_at: String,
+    /// panel：settings.json api_keys[]（含 legacy 合成条目）；launcher：extra_keys。
+    pub source: String,
+}
+
+/// 常数时间字符串比较，等价 Python `hmac.compare_digest` 的 ASCII 行为：长度
+/// 不同立即 False（不保证常数时间，与 CPython 一致），长度相同则逐字节异或
+/// 防御时序侧信道。M2-a 影子实例威胁面低，不引入 subtle 依赖。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() || a.is_empty() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// 读 settings.json 的 api_keys[]，兼容旧格式 api_key_set+api_key（合成一个
+/// legacy 条目）。对齐 wb_settings.api_keys（:381-424）+ _clean_key_entry
+/// （:326-340）：非对象条目跳过；无 key 且无 deleted_at 的条目跳过。
+pub fn api_keys(accounts_dir: &Path) -> Vec<KeyEntry> {
+    let doc = match read_json(&accounts_dir.join("settings.json")) {
+        Ok(Some(doc)) => doc,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let legacy_configured = doc
+        .get("api_key_set")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if legacy_configured {
+        if let Some(key) = doc.get("api_key").and_then(|v| v.as_str()) {
+            out.push(KeyEntry {
+                id: "legacy".to_string(),
+                name: "Legacy Key".to_string(),
+                key: key.to_string(),
+                realm: String::new(),
+                models: Vec::new(),
+                enabled: true,
+                deleted_at: String::new(),
+                source: "panel".to_string(),
+            });
+        }
+    }
+    if let Some(keys) = doc.get("api_keys").and_then(|v| v.as_array()) {
+        for entry in keys {
+            let Some(obj) = entry.as_object() else {
+                continue;
+            };
+            let key = obj
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let deleted_at = obj.get("deleted_at").and_then(|v| v.as_str()).unwrap_or("");
+            if key.is_empty() && deleted_at.is_empty() {
+                continue;
+            }
+            let models = obj
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(KeyEntry {
+                id: obj
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                key,
+                realm: obj
+                    .get("realm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                models,
+                enabled: obj.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                deleted_at: deleted_at.to_string(),
+                source: "panel".to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// 用提供的 key 在面板 key 表与 extra_keys 中做常数时间匹配。
+///
+/// 对齐 wb_settings.match_api_key（:526-554）：
+/// - supplied 空/纯空白 → None
+/// - 面板 api_keys[]：enabled 且未删除且 compare_digest 命中 → source="panel"
+/// - extra_keys（配置面板 key 前的 API_KEY 等价物）：compare_digest 命中 →
+///   source="launcher" 的合成条目
+pub fn match_api_key(
+    accounts_dir: &Path,
+    supplied_key: &str,
+    extra_keys: &[&str],
+) -> Option<KeyEntry> {
+    let supplied = supplied_key.trim();
+    if supplied.is_empty() {
+        return None;
+    }
+    for entry in api_keys(accounts_dir) {
+        if !entry.enabled || !entry.deleted_at.is_empty() {
+            continue;
+        }
+        if constant_time_eq(supplied, &entry.key) {
+            return Some(entry);
+        }
+    }
+    for key in extra_keys {
+        if key.is_empty() {
+            continue;
+        }
+        if constant_time_eq(supplied, key) {
+            return Some(KeyEntry {
+                id: "launcher".to_string(),
+                name: "Launcher Key".to_string(),
+                key: (*key).to_string(),
+                realm: String::new(),
+                models: Vec::new(),
+                enabled: true,
+                deleted_at: String::new(),
+                source: "launcher".to_string(),
+            });
+        }
+    }
+    None
 }
 
 #[cfg(test)]

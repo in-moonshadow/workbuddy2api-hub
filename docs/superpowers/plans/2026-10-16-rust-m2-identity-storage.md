@@ -91,3 +91,18 @@ spec：docs/superpowers/specs/2026-10-15-rust-refactor-design.md（:75「M2 iden
 - 不触碰 wb_proxy.py、dashboard.html、运行中 8788
 - 凭据明文不落地/不日志
 - OAuth（M2-b）不在本次实施
+
+## 进度状态（2026-10-16 15:05 北京时间）
+
+| Task | 状态 | 产出物 |
+|---|---|---|
+| 1 identity 骨架（jwt + realm） | ✅ 完成 | `cargo test -p wb-identity` 全绿（jwt/realm 用例） |
+| 2 identity 导入导出 | ✅ 完成 | import/export 纯函数两件套 + 测试；**写池部分超出 M2-a 只读范围，登记留给 M2-b/M5** |
+| 3 storage 扩展 | ✅ 完成 | `cargo test -p wb-storage` 全绿（7 unit + 5 active_realm + 13 api_keys = 25） |
+| 4 api /health 授权身份字段 | ✅ 完成 | 授权契约 3 测试全绿；授权后 fixture（`health_python_auth.json`）形状一致；**key 三来源 `effective_api_key`（env > 面板 > launcher）接线 main.rs + 测试 config()**，修复 launcher 集成缝隙 |
+| 5 ledger + CI 确认 | ✅ 完成 | `cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 全绿 |
+
+全 workspace 汇总：**77 用例、18 套件全绿零警告**（wb-identity 28 + wb-storage 25 + wb-api 24）。
+CI：`.github/workflows/rust.yml` paths 已覆盖 `wb-proxy-rs/**`，新 crate（identity/storage）变更自动触发；CI 的 clippy `-D warnings` 与 fmt 检查已本地复现通过。
+
+M2-b（OAuth 写路径：start_login/poll_login/cancel_login/import_desktop_credential + save() 落盘）保持推迟，理由不变：网络写路径 + 真实凭据落盘 + realm=cn 自动 checkin 副作用，与「不扰动运行中 8788」冲突，验证需隔离环境。

@@ -37,10 +37,15 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // 生效 key 对齐 Python 三来源（wb_proxy.py:18722-18737）：env API_KEY >
+    // 面板 api_key_set > LAN launcher_key。影子实例以 LAN 模式启动时 launcher_key
+    // 是唯一 key 来源，只读 env 会漏掉它，导致 /health 误判为未授权。
+    let api_key =
+        wb_storage::effective_api_key(&accounts_dir, std::env::var("API_KEY").ok().as_deref());
     let cfg = Config {
         accounts_dir,
         dashboard,
-        api_key: std::env::var("API_KEY").ok().filter(|k| !k.is_empty()),
+        api_key,
         lan: std::env::var("WB_LAN")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),

@@ -8,9 +8,13 @@ rust-version.workspace = true
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
 serde_json.workspace = true
+base64.workspace = true
+getrandom = "0.2"
 wb-storage = { path = "../storage" }
+wb-identity = { path = "../identity" }
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+wb-storage = { path = "../storage" }
