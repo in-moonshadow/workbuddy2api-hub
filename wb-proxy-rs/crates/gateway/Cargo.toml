@@ -12,6 +12,10 @@ chrono.workspace = true
 getrandom = "0.2"
 # 并发闸 acquire 超时（tokio::time）与 Semaphore——网关 async 运行时基础设施
 tokio = { version = "1", features = ["sync", "time"] }
+# 出站 HTTP（M3 Task 4 授权）：rustls 免系统 OpenSSL 依赖；stream 供 SSE 读
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# 契约测试用 mock 上游（M3 授权），绝不向真实上游发请求
+wiremock = "0.6"

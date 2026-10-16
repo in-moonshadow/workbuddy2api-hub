@@ -196,6 +196,28 @@ pub fn parse_rate_limit_reset(detail: &str) -> Option<f64> {
     Some(base - offset as f64)
 }
 
+/// OpenAI 错误信封（wb_proxy.py:15425-15436）：`{"error":{message,type,code}}`。
+/// 透传上游状态码；`upstream NNN: <前600字节>` 的 message 拼接由调用方（重试
+/// 循环）完成，本函数只包 JSON。err_type 默认 server_error（调用方可覆盖，
+/// 如 403 → permission_error）。
+pub fn openai_error(status: u16, message: &str, err_type: &str) -> (u16, Value) {
+    let mut error = serde_json::Map::new();
+    error.insert("message".into(), Value::String(message.into()));
+    error.insert("type".into(), Value::String(err_type.into()));
+    error.insert("code".into(), Value::Number(status.into()));
+    (status, serde_json::json!({ "error": Value::Object(error) }))
+}
+
+/// 429 信封（wb_proxy.py:15464-15471）：`retry_after` 让客户端退避而非硬灌。
+pub fn openai_rate_limited(message: &str, wait: i64) -> (u16, Value) {
+    let mut error = serde_json::Map::new();
+    error.insert("message".into(), Value::String(message.into()));
+    error.insert("type".into(), Value::String("rate_limit_error".into()));
+    error.insert("code".into(), Value::Number(429.into()));
+    error.insert("retry_after".into(), Value::Number(wait.into()));
+    (429, serde_json::json!({ "error": Value::Object(error) }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +337,26 @@ mod tests {
         ));
         assert!(!restriction_is_account_level("content policy violation"));
         assert!(!restriction_is_account_level(""));
+    }
+
+    #[test]
+    fn openai_error_envelope_shape() {
+        let (status, body) = openai_error(502, "upstream 502: nginx", "server_error");
+        assert_eq!(status, 502);
+        assert_eq!(body["error"]["message"], "upstream 502: nginx");
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["code"], 502);
+    }
+
+    #[test]
+    fn openai_rate_limited_envelope_carries_retry_after() {
+        let (status, body) = openai_rate_limited(
+            "upstream rate limit reached for this model; retry in 120s",
+            120,
+        );
+        assert_eq!(status, 429);
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], 429);
+        assert_eq!(body["error"]["retry_after"], 120);
     }
 }
