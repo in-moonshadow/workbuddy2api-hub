@@ -40,6 +40,8 @@ fn config(dir: &Path) -> Config {
         // （面板 key 表为空时的第三条路径）。
         api_key: wb_storage::effective_api_key(dir, None),
         lan: false,
+        upstream_base_url: None,
+        realm: "intl".into(),
     }
 }
 

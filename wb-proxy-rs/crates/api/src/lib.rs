@@ -1,5 +1,6 @@
-//! HTTP 层：M1 只有 /health 与静态面板 /。
+//! HTTP 层：M1 只有 /health 与静态面板 /；M3 关卡 5.4 接入 10 条 chat 路由。
 pub mod auth;
+pub mod chat;
 pub mod config;
 pub mod routes;
 

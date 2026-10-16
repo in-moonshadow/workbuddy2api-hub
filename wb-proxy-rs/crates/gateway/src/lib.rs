@@ -15,6 +15,7 @@ pub mod notes;
 pub mod outbound;
 pub mod pool;
 pub mod prompt;
+pub mod responses;
 pub mod retry;
 pub mod sanitize;
 pub mod stream;

@@ -43,6 +43,8 @@ fn config(accounts_dir: &Path, api_key: Option<&str>, lan: bool) -> Arc<Config> 
         dashboard: Path::new("/nonexistent").to_path_buf(),
         api_key: api_key.map(str::to_string),
         lan,
+        upstream_base_url: None,
+        realm: "intl".into(),
     })
 }
 

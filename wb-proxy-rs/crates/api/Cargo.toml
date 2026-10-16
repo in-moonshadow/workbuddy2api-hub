@@ -6,15 +6,24 @@ rust-version.workspace = true
 
 [dependencies]
 axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
+# sync：ConcurrencyGate 的 Semaphore 与 AccountPool 的进程级 Mutex 在 rx
+# 任务内跨 await 持有；time：ConcurrencyGate::acquire 的槽位等待超时。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "time"] }
 serde_json.workspace = true
 base64.workspace = true
 getrandom = "0.2"
+# 非流式路径要读上游 SSE body 再聚合（对齐 Python _chat_nonstream_response）：
+# Outcome::Served 带的是 reqwest::Response，api 层需能具名其类型。
+reqwest = { version = "0.12", default-features = false }
 wb-storage = { path = "../storage" }
 wb-identity = { path = "../identity" }
+wb-gateway = { path = "../gateway" }
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 wb-storage = { path = "../storage" }
+# 契约测试用 wiremock 起假上游，经 Config.upstream_base_url 注入；
+# 绝不向真实上游发请求。
+wiremock = "0.6"

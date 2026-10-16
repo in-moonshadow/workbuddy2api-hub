@@ -73,6 +73,90 @@ fn read_realm(accounts_dir: &Path) -> Result<String, StorageError> {
     })
 }
 
+/// 落盘的 realm 原值，供 `/realm` GET 展示（Python `persisted_realm()`）。
+///
+/// 与 `read_realm` 的区别：这里**不套默认值**，文件缺失/值非法时返回 `None`，
+/// 让调用方能区分「用户显式选过 intl」与「从未选过」。
+pub fn read_active_realm(accounts_dir: &Path) -> Option<String> {
+    read_json(&accounts_dir.join("active_realm.json"))
+        .ok()
+        .flatten()
+        .and_then(|doc| {
+            doc.get("realm")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .filter(|realm| realm == "cn" || realm == "intl")
+}
+
+/// 池装载所需的账号视图（比 `Account` 多 `product` 与 `has_token`）。
+///
+/// 只在进程内传递 `access_token`，**不得写入日志**。`has_token` 与
+/// `load_snapshot` 的 `is_ready` 判定一致（`accessToken` 非空）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolAccount {
+    pub uid: String,
+    pub realm: String,
+    /// 账号所属产品线（Python `Account.product`；缺省为空串）。
+    pub product: String,
+    pub has_token: bool,
+    pub access_token: String,
+}
+
+/// 枚举可装载进池的账号（对齐 Python `AccountPool._load` 的账号清单）。
+///
+/// **不做 enabled/cooldown 过滤**：那些是池运行期状态（`AccountState` 自己
+/// 持有 enabled/cooldown_until），Python 也是全部载入后由 `ready()` 判。
+pub fn pool_accounts(accounts_dir: &Path) -> Result<Vec<PoolAccount>, StorageError> {
+    let mut out = Vec::new();
+    for (_, doc) in account_entries(accounts_dir)? {
+        let access_token = doc
+            .get("accessToken")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(PoolAccount {
+            uid: doc
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            realm: doc
+                .get("realm")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            product: doc
+                .get("product")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            has_token: !access_token.is_empty(),
+            access_token,
+        });
+    }
+    Ok(out)
+}
+
+/// 把上游出口选择落盘到 `<accounts_dir>/active_realm.json`（对齐 Python
+/// `save_persisted_realm` :5684-5690，写 `{"realm": <值>}`）。
+///
+/// 只接受 "cn" / "intl"：其他值一律忽略（Python 的 `_route_realm` 也是
+/// `if new_realm in ("intl", "cn")` 才落盘，返回值恒为 200 + persisted=true）。
+/// 与 `read_realm` 共用同一个键名，保证往返一致。
+///
+/// 注意：本函数只写文件，**不改变进程内的 CURRENT_REALM** —— 那与 Python
+/// 行为一致（realm 变更需重启进程才生效）。
+pub fn save_realm(accounts_dir: &Path, realm: &str) -> Result<bool, StorageError> {
+    if realm != "cn" && realm != "intl" {
+        return Ok(false);
+    }
+    let path = accounts_dir.join("active_realm.json");
+    let text = serde_json::json!({ "realm": realm }).to_string();
+    fs::write(&path, text).map_err(|err| StorageError::Io(path, err))?;
+    Ok(true)
+}
+
 fn unix_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

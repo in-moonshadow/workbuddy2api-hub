@@ -1551,12 +1551,15 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.17",
  "http-body-util",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
  "tower",
+ "wb-gateway",
  "wb-identity",
  "wb-storage",
+ "wiremock",
 ]
 
 [[package]]

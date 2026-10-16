@@ -28,6 +28,8 @@ fn config(dir: &std::path::Path) -> Config {
         dashboard: dir.join("dashboard.html"),
         api_key: None,
         lan: false,
+        upstream_base_url: None,
+        realm: "cn".into(),
     }
 }
 
