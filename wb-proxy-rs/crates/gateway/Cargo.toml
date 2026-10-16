@@ -9,6 +9,9 @@ serde_json.workspace = true
 md-5.workspace = true
 regex.workspace = true
 chrono.workspace = true
+# 池装载的 JWT 派生（jwt_uid/jwt_exp/detect_realm_from_token）——spec :50 依赖链
+# identity → gateway，gateway 在 M3 Task 5 首次用到 identity
+wb-identity = { path = "../identity" }
 getrandom = "0.2"
 # 并发闸 acquire 超时（tokio::time）与 Semaphore——网关 async 运行时基础设施
 tokio = { version = "1", features = ["sync", "time"] }
@@ -19,3 +22,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 # 契约测试用 mock 上游（M3 授权），绝不向真实上游发请求
 wiremock = "0.6"
+# 池装载/路由测试的临时账号目录（storage crate 同款）
+tempfile = "3"
+# 测试里构造最小签名 JWT 的 base64url 编码
+base64.workspace = true

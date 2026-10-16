@@ -77,7 +77,8 @@ pub fn normalize_usage_cache_aliases(usage: &mut Value) {
 }
 
 /// _best_cached_tokens→整数化（wb_proxy.py:635-660）：按序取首个正命中值。
-fn best_cached_tokens(usage: &Value) -> i64 {
+/// pub：Anthropic 翻译层（anthropic.rs `_anthropic_usage` 缓存别名）复用。
+pub fn best_cached_tokens(usage: &Value) -> i64 {
     let pick = |o: &Value, key: &str| -> Option<i64> {
         let v = o.get(key)?;
         let n = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))?;

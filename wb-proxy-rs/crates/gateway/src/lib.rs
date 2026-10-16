@@ -4,6 +4,7 @@
 //! 依赖链 identity → gateway → api（spec :50）。Task 1 端点表/出站头（纯函数）、
 //! Task 2 body 变形管线（纯函数）；池/槽位/转发随 Task 3/4 补齐。
 
+pub mod anthropic;
 pub mod body;
 pub mod egress;
 pub mod endpoints;

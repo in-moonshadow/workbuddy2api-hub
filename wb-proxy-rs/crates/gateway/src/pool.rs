@@ -228,6 +228,110 @@ impl AccountState {
     }
 }
 
+/// 账号目录里被当配置文件跳过的名字（与 wb-storage 的 NON_ACCOUNT_FILES
+/// 保持同步；storage 是 api 层的兄弟 crate，gateway 不能反向依赖它）。
+const NON_ACCOUNT_FILES: [&str; 3] = ["settings.json", "model.json", "active_realm.json"];
+
+/// 从账号目录装载池（对齐 Python `AccountPool.load()` :2417-2466 的逐字段
+/// 映射）。只读、不落盘：跳过非账号 JSON、读不到或 uid 为空的行跳过，
+/// 其余按文件名排序进入 Vec（对齐 Python `sorted(os.listdir)`）。
+///
+/// 字段映射（wb_accounts.py:465-538 `Account.__init__` 的调度相关子集）：
+/// - uid：`data.uid`，为空回退 `jwt_uid(token)`，仍为空则整行丢弃
+/// - realm：`data.realm`，为空回退 `detect_realm_from_token(token, domain)`
+/// - domain：`data.domain`，为空回退区域规范域名
+/// - product：`normalize_product(data.product)`（未知回退 workbuddy）
+/// - expires_at：`normalize_epoch(data.expiresAt)`，为空回退 `jwt_exp(token)`
+/// - enabled / weight：面板持久化字段原样读入（夹到 [1,100]）
+///
+/// 运行期状态（cooldown/breaker/soft_streak 等）一律按 `AccountState::new()`
+/// 的默认值起算——Python 的 last_error/model_cooldowns 也是 RUNTIME_ONLY，
+/// 不随凭据档恢复（wb_accounts.py:518-536, 2417-2466）。
+pub fn load_account_pool(accounts_dir: &std::path::Path) -> Vec<AccountState> {
+    let mut accounts = Vec::new();
+    let Ok(read_dir) = std::fs::read_dir(accounts_dir) else {
+        return accounts;
+    };
+    let mut files: Vec<std::path::PathBuf> = read_dir
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    for path in files {
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if NON_ACCOUNT_FILES.contains(&name) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if !doc.is_object() {
+            continue;
+        }
+        let token = doc
+            .get("accessToken")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let uid_raw = doc.get("uid").and_then(|v| v.as_str()).unwrap_or("");
+        let uid = if uid_raw.is_empty() {
+            wb_identity::jwt::jwt_uid(token)
+        } else {
+            uid_raw.to_string()
+        };
+        if uid.is_empty() {
+            continue;
+        }
+        let domain_raw = doc.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+        let realm = doc
+            .get("realm")
+            .and_then(|v| v.as_str())
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                wb_identity::realm::detect_realm_from_token(token, Some(domain_raw)).to_string()
+            });
+        // 注：Account 的 domain 字段在 Rust 侧不驻留池——出站头由
+        // headers::chat_request_headers(realm, product) 经 domain_for_realm 现算。
+        let product = crate::endpoints::normalize_product(
+            doc.get("product").and_then(|v| v.as_str()).unwrap_or(""),
+        )
+        .to_string();
+        let expires_at = doc
+            .get("expiresAt")
+            .and_then(|v| v.as_f64())
+            .map(wb_identity::jwt::normalize_epoch)
+            .filter(|e| *e > 0)
+            .or_else(|| {
+                let exp = wb_identity::jwt::jwt_exp(token);
+                (exp > 0).then_some(exp)
+            })
+            .map(|e| e as f64);
+        let enabled = doc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let weight = doc
+            .get("weight")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1)
+            .clamp(1, 100);
+        accounts.push(AccountState {
+            uid: uid.clone(),
+            realm: realm.clone(),
+            enabled,
+            has_token: !token.is_empty(),
+            access_token: token.to_string(),
+            weight,
+            product,
+            expires_at,
+            ..AccountState::new(&uid, &realm)
+        });
+    }
+    accounts
+}
+
 /// 会话亲和（wb_accounts.py:2172-2256）：`bindings[session_key]` 是
 /// `[(uid, 绝对epoch过期), ...]`，队首最新。ttl=7200s、history=3、max=5000。
 ///
@@ -1163,5 +1267,104 @@ mod tests {
         // 账号级惩罚归零
         assert_eq!(a.last_error, "");
         assert_eq!(a.cooldown_until, 0.0);
+    }
+
+    // ---- load_account_pool（wb_accounts.py Account.__init__ 逐字段映射）----
+
+    /// 最小可签发 JWT（payload 段 base64url；jwt.rs 只解码不验签）。
+    fn fake_jwt(payload: &serde_json::Value) -> String {
+        use base64::Engine as _;
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(payload).unwrap());
+        format!("header.{enc}.sig")
+    }
+
+    fn write_account(dir: &tempfile::TempDir, name: &str, doc: serde_json::Value) {
+        std::fs::write(dir.path().join(name), serde_json::to_vec(&doc).unwrap()).unwrap();
+    }
+
+    fn load(dir: &tempfile::TempDir) -> Vec<AccountState> {
+        load_account_pool(dir.path())
+    }
+
+    #[test]
+    fn load_maps_uid_realm_product_and_token_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        write_account(
+            &dir,
+            "a.json",
+            serde_json::json!({
+                "uid": "u-1", "realm": "intl", "product": "vscode",
+                "accessToken": "tok-1", "expiresAt": 1_800_000.0,
+                "enabled": true, "weight": 7,
+            }),
+        );
+        let accounts = load(&dir);
+        assert_eq!(accounts.len(), 1);
+        let a = &accounts[0];
+        assert_eq!(a.uid, "u-1");
+        assert_eq!(a.realm, "intl");
+        assert_eq!(a.product, crate::endpoints::PRODUCT_VSCODE);
+        assert_eq!(a.access_token, "tok-1");
+        assert!(a.has_token);
+        assert!(a.enabled);
+        assert_eq!(a.weight, 7);
+        assert_eq!(a.expires_at, Some(1_800_000.0));
+        // 运行期状态一律从默认值起算（不随凭据档恢复）
+        assert_eq!(a.cooldown_until, 0.0);
+        assert_eq!(a.soft_streak, 0);
+    }
+
+    #[test]
+    fn load_falls_back_to_jwt_uid_and_token_realm() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = fake_jwt(&serde_json::json!({
+            "sub": "jwt-sub", "iss": "https://open.workbuddy.ai",
+            "exp": 2_000_000,
+        }));
+        // 无 uid 字段 → jwt_uid 兜底；无 realm 字段 → token issuer 判定 intl
+        write_account(&dir, "a.json", serde_json::json!({"accessToken": token}));
+        let a = &load(&dir)[0];
+        assert_eq!(a.uid, "jwt-sub");
+        assert_eq!(a.realm, "intl");
+        assert_eq!(a.expires_at, Some(2_000_000.0));
+    }
+
+    #[test]
+    fn load_skips_non_account_files_bad_json_and_empty_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        write_account(
+            &dir,
+            "settings.json",
+            serde_json::json!({"apiKeySet": true}),
+        );
+        write_account(&dir, "bad.json", serde_json::json!([])); // 非对象
+        std::fs::write(dir.path().join("broken.json"), "{ not json").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "not an account").unwrap();
+        // 空 uid + 空 token → jwt_uid 也空 → 整行丢弃
+        write_account(&dir, "empty.json", serde_json::json!({"accessToken": ""}));
+        assert_eq!(load(&dir).len(), 0);
+    }
+
+    #[test]
+    fn load_sorts_by_filename_and_clamps_weight() {
+        let dir = tempfile::tempdir().unwrap();
+        write_account(
+            &dir,
+            "b.json",
+            serde_json::json!({"uid": "u-b", "realm": "cn", "weight": 999, "enabled": false}),
+        );
+        write_account(
+            &dir,
+            "a.json",
+            serde_json::json!({"uid": "u-a", "realm": "cn", "weight": 0}),
+        );
+        let accounts = load(&dir);
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].uid, "u-a"); // sorted(os.listdir)
+        assert_eq!(accounts[0].weight, 1); // clamp 下限
+        assert_eq!(accounts[1].uid, "u-b");
+        assert_eq!(accounts[1].weight, 100); // clamp 上限
+        assert!(!accounts[1].enabled);
     }
 }
