@@ -1,0 +1,50 @@
+name: rust
+
+# Rust 只在 wb-proxy-rs/ 下活动，所以本 workflow 只在该子树或自身变更时触发。
+# 与 tests.yml（Python 矩阵）互不重叠：那边不碰 Rust，这边不碰 Python。
+on:
+  push:
+    paths:
+      - "wb-proxy-rs/**"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "wb-proxy-rs/**"
+      - ".github/workflows/rust.yml"
+
+# 同一分支连推时，前一次运行已无意义：取消而非并行付两份钱。
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wb-proxy-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      # wb-proxy-rs/Cargo.lock 是 format v4，需要 cargo >= 1.83；MSRV 声明为
+      # 1.85，CI 用 stable 满足两者。rust-toolchain.toml 也写 stable，
+      # 这里显式指定是为了让 action 装上 rustfmt/clippy 组件。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wb-proxy-rs
+
+      # 三步分开写而不是 && 串联：串联只会报告最后一个非零退出码，
+      # 看不出是格式、lint 还是测试挂的。
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
