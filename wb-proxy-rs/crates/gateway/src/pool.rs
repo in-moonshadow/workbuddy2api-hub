@@ -31,6 +31,13 @@ pub fn py_round(x: f64) -> f64 {
     }
 }
 
+/// code 6004「额度用满」的免费模型窗口禁用：`{模型名: {at: 首次撞时刻, reset: 重置时刻}}`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCap {
+    pub at: f64,
+    pub reset: f64,
+}
+
 /// 账号调度状态位（wb_accounts.py:464-638 的调度相关子集）。
 /// 所有 `*_until` 都是**绝对 epoch**（f64 秒），判定用 `until > now`。
 #[derive(Debug, Clone)]
@@ -64,6 +71,16 @@ pub struct AccountState {
     /// 临期积分窗口内最近到期天数。M3 由调用方注入（credits 包解析属 M5）；
     /// None = 不在窗口。
     pub expiring_days: Option<f64>,
+    /// 无作用域 429 连击计数（note_unscoped_rate 用，M3 仅承载）。
+    pub unscoped_streak: i64,
+    /// 免费模型额度窗口 `{模型名: ModelCap}`（note_model_cap 写，M3 仅承载）。
+    pub model_caps: HashMap<String, ModelCap>,
+    /// 免费模型集合（note_model_cap 判定用；M5 按 realm 从 FREE_CAP_MODELS 填充）。
+    pub free_models: HashSet<String>,
+    /// 最近一次错误消息（note_* 写，日志/诊断用）。
+    pub last_error: String,
+    /// 最近一次错误详情（note_* 写，日志/诊断用）。
+    pub last_error_detail: String,
 }
 
 impl AccountState {
@@ -84,6 +101,11 @@ impl AccountState {
             degrade_count: 0,
             model_cooldowns: HashMap::new(),
             expiring_days: None,
+            unscoped_streak: 0,
+            model_caps: HashMap::new(),
+            free_models: HashSet::new(),
+            last_error: String::new(),
+            last_error_detail: String::new(),
         }
     }
 
