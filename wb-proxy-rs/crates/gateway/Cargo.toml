@@ -9,3 +9,8 @@ serde_json.workspace = true
 md-5.workspace = true
 regex.workspace = true
 getrandom = "0.2"
+# 并发闸 acquire 超时（tokio::time）与 Semaphore——网关 async 运行时基础设施
+tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
