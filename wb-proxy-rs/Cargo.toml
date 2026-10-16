@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/storage", "crates/api"]
+members = ["crates/storage", "crates/api", "crates/identity"]
 
 [workspace.package]
 edition = "2021"
@@ -8,3 +8,5 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

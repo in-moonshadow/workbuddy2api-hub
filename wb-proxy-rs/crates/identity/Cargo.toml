@@ -1,0 +1,10 @@
+[package]
+name = "wb-identity"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+base64.workspace = true
+chrono.workspace = true
