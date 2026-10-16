@@ -88,7 +88,10 @@ pub fn build_identity_headers(p: &IdentityParams) -> HashMap<String, String> {
             headers.insert("X-IDE-Type".into(), "VSCode".into());
             headers.insert("X-IDE-Name".into(), "VSCode".into());
             headers.insert("X-IDE-Version".into(), DEFAULT_WORKBUDDY_IDE_VERSION.into());
-            headers.insert("X-Product-Version".into(), DEFAULT_WORKBUDDY_PRODUCT_VERSION.into());
+            headers.insert(
+                "X-Product-Version".into(),
+                DEFAULT_WORKBUDDY_PRODUCT_VERSION.into(),
+            );
             headers.insert("X-Env-ID".into(), "production".into());
             headers.insert("X-Product".into(), "SaaS".into());
             headers.insert(
@@ -161,7 +164,11 @@ pub fn chat_request_headers(p: &ChatHeadersParams) -> HashMap<String, String> {
     headers.insert("X-CodeBuddy-Request".into(), "1".into());
     headers.insert(
         "Accept-Language".into(),
-        if p.realm == "cn" { "zh-CN".into() } else { "en-US".into() },
+        if p.realm == "cn" {
+            "zh-CN".into()
+        } else {
+            "en-US".into()
+        },
     );
     headers.insert("X-Machine-ID".into(), derive_id(p.uid, "machine"));
     headers.insert("X-Session-ID".into(), derive_id(p.uid, "session"));
@@ -189,8 +196,14 @@ mod tests {
     #[test]
     fn derive_id_matches_python_hashes() {
         // python3 -c "import hashlib; print(hashlib.md5(f'{salt}:{uid}'.encode()).hexdigest())"
-        assert_eq!(derive_id("u1", "machine"), "1c77b9ac7fdc6e92cc94595f68a05717");
-        assert_eq!(derive_id("u1", "session"), "d4bf0937989e4311fdd68b54baf87841");
+        assert_eq!(
+            derive_id("u1", "machine"),
+            "1c77b9ac7fdc6e92cc94595f68a05717"
+        );
+        assert_eq!(
+            derive_id("u1", "session"),
+            "d4bf0937989e4311fdd68b54baf87841"
+        );
         assert_eq!(derive_id("", "machine"), "fc1f3f603c8bcdc0783942ea0169ab1e");
     }
 
@@ -230,7 +243,10 @@ mod tests {
         assert_eq!(h["X-IDE-Type"], "WorkBuddy");
         assert_eq!(h["X-IDE-Version"], "5.5.2");
         assert_eq!(h["X-Product"], "WorkBuddy");
-        assert_eq!(h["User-Agent"], "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2");
+        assert_eq!(
+            h["User-Agent"],
+            "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2"
+        );
         assert_eq!(h["X-Domain"], "www.workbuddy.ai");
         assert_eq!(h["X-User-Id"], "u1");
         assert_eq!(h["Authorization"], "Bearer tok");
@@ -244,7 +260,10 @@ mod tests {
         let h = build_identity_headers(&params(PRODUCT_DESKTOP, "cn"));
         assert_eq!(h["X-IDE-Version"], "5.5.6");
         assert_eq!(h["X-Domain"], "copilot.tencent.com");
-        assert_eq!(h["User-Agent"], "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1");
+        assert_eq!(
+            h["User-Agent"],
+            "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+        );
     }
 
     #[test]

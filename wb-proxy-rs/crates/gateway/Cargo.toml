@@ -7,4 +7,5 @@ rust-version.workspace = true
 [dependencies]
 serde_json.workspace = true
 md-5.workspace = true
+regex.workspace = true
 getrandom = "0.2"
