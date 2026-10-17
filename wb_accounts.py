@@ -43,6 +43,13 @@ WEB_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
                   "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0")
 DAILY_CHAT_MODEL = "deepseek-v4.1-flash"
 DAILY_CHAT_WEB_PROMPT = "Hi"
+#: 桌面腿的渠道校验拦截（HTTP 400, code 11128）。实测正文：
+#: {"code":11128,"msg":"request illegal","displayMsg":{"en":"Request blocked...",
+#: "zh":"这次调用没通过渠道校验，可能不是官方客户端发出的..."}}。code 用正则
+#: 匹配（requestId 是 hex，"11128" 裸子串可能撞上，与 11140 同一处理口径）。
+#: 注意 11128 还有别的语义（"conversation id missing"），那些不是渠道拦截，
+#: 但桌面腿本来就不带 conversation id，所以这里只按 code 判就够了。
+_DAILY_CHAT_CHANNEL_RE = re.compile(r'"code"\s*:\s*"?11128"?')
 #: 网页通道一轮最多等多久（秒）。实测一次「Hi」十几秒就跑完，留足余量。
 WEB_TURN_TIMEOUT = int(os.environ.get("WB_WEB_TURN_TIMEOUT") or "120")
 
@@ -1550,7 +1557,39 @@ class Account(object):
             # 桌面腿同样可能撞 6004；记录口径与网页腿一致（见
             # _note_daily_chat_cap），否则同一次尝试只在网页腿留下痕迹。
             self._note_daily_chat_cap(err)
-            return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
+            # 桌面腿被渠道校验拦下（code 11128「这次调用没通过渠道校验，可能
+            # 不是官方客户端发出的」）：这是上游对「这个账号 × 这个模型」的判定，
+            # 改请求头或换身份都修不好——同一份 headers() 在别的账号上是 200。
+            # 但真正给每日活跃计数的是网页腿，而网页腿实测是通的；这里把桌面腿
+            # 的失败降级成「这一腿没走成」，继续跑网页腿，否则一天的 30/50 积分
+            # 会因为一条不计数的那条腿而整天丢光（42203090215 现场）。
+            desktop_channel_blocked = _DAILY_CHAT_CHANNEL_RE.search(err) is not None
+            if not desktop_channel_blocked:
+                return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
+            desktop_note = f"HTTP {exc.code}: {err[:100]}"
+            if web is None:
+                web = bool(self.path) and wb_settings.daily_chat_web(
+                    os.path.dirname(self.path))
+            if not web:
+                # 没开网页腿就真的没有别的路可走了，照旧算失败。
+                return {"ok": False, "error": desktop_note}
+            result = {"ok": True, "msg": ""}
+            res = self.daily_chat_web(trigger=None)
+            result["web"] = res
+            if res.get("ok"):
+                result["msg"] = ("桌面腿被渠道校验拦截（%s），网页通道 %s：%d 段输出，%d ms"
+                                 % (desktop_note, res.get("status") or "completed",
+                                    res.get("chunks") or 0, res.get("elapsed_ms") or 0))
+                self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
+            else:
+                # 两条腿都没成：今天不算做过，后续巡检继续重试。
+                result["ok"] = False
+                result["msg"] = ("桌面腿被渠道校验拦截（%s），网页通道也失败：%s"
+                                 % (desktop_note, res.get("error")))
+                result["error"] = result["msg"]
+            return result
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

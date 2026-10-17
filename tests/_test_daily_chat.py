@@ -431,5 +431,115 @@ class DailyChatCapTests(unittest.TestCase):
         self.assertEqual(acc.capped_model_names(), [wb_accounts.DAILY_CHAT_MODEL])
 
 
+class DesktopChannelBlockTests(unittest.TestCase):
+    """桌面腿撞 11128 时不能把网页腿一起带走。
+
+    现场（2026-10-17, 42203090215）：桌面腿 POST /v2/chat/completions 被上游
+    渠道校验拦下 —— 同一份 headers() 在别的账号上是 200，且桌面腿同一个账号换
+    deepseek-v4.1 / claude-sonnet-4.5 都能过校验（只是 14018 额度为 0），所以
+    这是「这个账号 × 这个模型」的判定，不是我们构造请求的方式有问题。而真正给
+    每日活跃计数的是网页腿，实测网页腿 200 正常。原先桌面腿一失败就 return，
+    网页腿整条不跑，那天的 30/50 积分静默丢光，且因为不写 lastDailyChat，
+    每次巡检都拿它重试（一天重试 4 次全是同一个 11128）。
+    """
+
+    UID = "c90a4e93-edad-42fe-aa3a-133fb27cf6b6"
+    BLOCKED_400 = json.dumps({
+        "code": 11128, "msg": "request illegal", "requestId": "a" * 32,
+        "displayMsg": {"en": "Request blocked. Please send it again"},
+        "displayTips": {"en": "This call failed channel verification, possibly "
+                              "because it was not sent from an official client."},
+    })
+    OTHER_400 = '{"code":40001,"msg":"some other rejection"}'
+
+    def account(self, path=None):
+        acc = wb_accounts.Account({"uid": self.UID, "realm": "intl",
+                                   "accessToken": "dummy-token",
+                                   "lastDailyChat": None})
+        acc.path = path
+        return acc
+
+    def run_with(self, acc, desktop_body, web_result):
+        """桌面腿抛桌面 body；网页腿整体替换成给定返回。"""
+        def fake(req, *_args, **_kwargs):
+            raise urllib.error.HTTPError(
+                getattr(req, "full_url", str(req)), 400, "err", {},
+                io.BytesIO(desktop_body.encode("utf-8")))
+
+        seen = []
+
+        def fake_web(trigger=None):
+            seen.append(trigger)
+            return web_result
+
+        old_urlopen = wb_accounts.urlopen
+        old_web = acc.daily_chat_web
+        wb_accounts.urlopen = fake
+        acc.daily_chat_web = fake_web
+        try:
+            res = acc._daily_chat_upstream(web=True)
+        finally:
+            wb_accounts.urlopen = old_urlopen
+            acc.daily_chat_web = old_web
+        return res, seen
+
+    def test_a_channel_block_still_runs_the_web_leg(self):
+        acc = self.account()
+        res, seen = self.run_with(
+            acc, self.BLOCKED_400,
+            {"ok": True, "status": "completed", "chunks": 2, "elapsed_ms": 1234})
+        self.assertEqual(len(seen), 1, "11128 之后网页腿必须照跑")
+        self.assertTrue(res.get("ok"), res)
+        self.assertTrue(res.get("web", {}).get("ok"), res)
+        # 说明里要保留桌面腿失败的痕迹，否则面板看不出今天走的哪条腿。
+        self.assertIn("渠道校验", res.get("msg", ""))
+        self.assertIn("11128", res.get("msg", ""))
+
+    def test_a_channel_block_with_a_dead_web_leg_leaves_the_day_open(self):
+        acc = self.account()
+        res, seen = self.run_with(
+            acc, self.BLOCKED_400,
+            {"ok": False, "error": "会话在 120s 内没有跑完（状态=working）"})
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(res.get("ok"), res)
+        self.assertIsNone(acc.last_daily_chat)
+        self.assertTrue(acc.can_daily_chat())
+
+    def test_a_channel_block_marks_the_day_done_when_the_web_leg_finishes(self):
+        directory = os.path.join(_TMP.name, "channel-block")
+        os.makedirs(directory, exist_ok=True)
+        acc = self.account(os.path.join(directory, self.UID + ".json"))
+        res, _seen = self.run_with(acc, self.BLOCKED_400, {"ok": True,
+                                                          "status": "completed"})
+        self.assertTrue(res.get("ok"), res)
+        self.assertTrue(acc.last_daily_chat)
+        self.assertFalse(acc.can_daily_chat())
+
+    def test_any_other_400_still_fails_fast(self):
+        """只有 11128 才降级跑网页腿；别的 400 原样返回，不悄悄当成功。"""
+        acc = self.account()
+        res, seen = self.run_with(acc, self.OTHER_400, {"ok": True})
+        self.assertEqual(seen, [], "非 11128 的 400 不该触发网页腿")
+        self.assertFalse(res.get("ok"), res)
+        self.assertIn("40001", res.get("error", ""))
+
+    def test_a_channel_block_with_the_web_leg_off_fails(self):
+        """没开网页腿时 11128 就是真的失败 —— 没有别的路可走。"""
+        def fake(req, *_args, **_kwargs):
+            raise urllib.error.HTTPError(
+                getattr(req, "full_url", str(req)), 400, "err", {},
+                io.BytesIO(self.BLOCKED_400.encode("utf-8")))
+
+        acc = self.account()
+        old = wb_accounts.urlopen
+        wb_accounts.urlopen = fake
+        try:
+            res = acc._daily_chat_upstream(web=False)
+        finally:
+            wb_accounts.urlopen = old
+        self.assertFalse(res.get("ok"), res)
+        self.assertIn("11128", res.get("error", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
