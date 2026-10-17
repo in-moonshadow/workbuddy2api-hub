@@ -102,3 +102,49 @@ spec：docs/superpowers/specs/2026-10-15-rust-refactor-design.md（:40「gateway
 ## 计划授权后开工顺序
 
 授权后先做 Task 1 骨架（含 reqwest/wiremock 依赖登记），严格 TDD。每 Task 完成即 cargo test 验证并汇报，最后 Task 5 统一账本 + CI 确认。
+
+---
+
+## 实施状态（本小节为追加记录，只增不改）
+
+### Task 1–4：已完成并提交
+
+| Task | 提交 | 内容 |
+|---|---|---|
+| Task 1 | `7e561e18` | 端点表与出站身份头 |
+| Task 2 | `ffd48ed2` | 入站 body 变形管线 |
+| Task 3 | `e0917ecd` | 账号池与调度（+ `8b9362b9` 账号错误回调 `note_*`） |
+| Task 4b | `e3ceeb19` `b1886eb6` | 上游错误分类（纯函数）+ 出站客户端与错误信封 |
+| Task 4c | `dae906b2` | SSE 流清洗 `clean_chunk` 与工具调用聚合 |
+| Task 4d | `45fe364e` | 重试循环与错误信封 |
+| Task 4e | `ecaa17fc` | 流式转发编排与 wiremock 全链路契约测试 |
+
+### Task 5：关卡 5.1–5.4 已完成（5.4 待本关提交）
+
+| 关卡 | 内容 | 产出物 | 状态 |
+|---|---|---|---|
+| 5.1 | 池装载（storage → `AccountPool`） | `cargo test -p wb-gateway` 全绿 | ✅ 已提交 `b2c75b85` |
+| 5.2 | `anthropic.rs` 翻译层（`messages_to_chat` / `chat_to_messages` / `estimate_chat_tokens`） | 同上 | ✅ 已提交 `b2c75b85` |
+| 5.3 | `responses.rs` 翻译层（`responses_to_chat` / `chat_to_response` / `RequestMeta`） | 203 tests 全绿 + fmt/clippy 零警告 | ✅ 本次一起提交 |
+| 5.4 | API 路由接线：`AppState` 扩展 + 10 条 POST chat 路由（OpenAI 6 + Anthropic 4）+ OPTIONS + `/realm` + 404 + CORS + 401 信封 + 并发闸接线；`/v1/responses` 接 `responses_to_chat` / `chat_to_response`（非流式路径） | ① `crates/api/Cargo.toml` 增加 `wb-gateway` path dep + tokio `sync`/`time`；② 新 `crates/api/tests/contract_chat_routes.rs`（10 用例，全走 wiremock 假上游）；③ 全 workspace 全绿 | ✅ 本次提交 |
+| 5.5 | 账本更新 + 全 workspace 验证 + 提交 | 本小节 + `cargo test`/`fmt`/`clippy` 实测输出 | ✅ 本小节 |
+
+### 关卡 5.4 验证数字（实测，非推断）
+
+- `cargo test --workspace`：**TOTAL passed=294 failed=0**
+- `cargo clippy --workspace --all-targets -- -D warnings`：`Finished dev profile ... in 0.39s`，零警告
+- `cargo fmt --all --check`：通过
+- 契约测试**全部**经 `Config.upstream_base_url` 注入 wiremock 假上游；未向真实上游发任何请求
+
+### 计划偏差记录（append-only）
+
+1. **`/v1/responses` web-tools 多轮重放 + `stream_responses_events`（496 行）推迟至 M3-b**：本次仅接非流式 `responses_to_chat` / `chat_to_response`。理由：web-tools 重放依赖工具执行闭环（M3-b 范围），流式 responses 事件形状独立且量大。
+2. **storage `save_realm` 实际签名 `Result<bool, StorageError>`**（计划中写作 `Result<(), _>`）：返回 `bool` 用于区分「合法值已落盘」与「非法值被拒绝但未报错」，`/realm` POST 的 `persisted` 字段依赖此语义。
+3. **storage 额外公开项（计划外但必需）**：`read_active_realm`、`pool_accounts` / `PoolAccount`。前者为 `/realm` GET 读取持久化值；后者为 gateway 池装载提供账号视图（`Account` 是 `representative` 的单账号视图，不足以装载全池）。
+4. **api crate 新增 `reqwest` 依赖**：非流式路径需读上游 SSE body 再聚合（对齐 Python `_chat_nonstream_response` :18584），而 `Outcome::Served` 携带 `reqwest::Response`，api 层必须能具名其类型。
+5. **`parse_body` / `read_chat_json` 返回 `Result<Value, Box<Response>>` + 调用点 `*resp` 解引用**：纯为满足 `clippy::result_large_err`（`Response<Body>` 达 128 字节），无语义变化。
+
+### 已知未覆盖项（显式标为缺口，非「应该会跑」）
+
+- **503 并发耗尽语义**：单个 axum 实例无法在一轮请求内自我占满 32 槽，`contract_chat_routes.rs` 改为钉「池空 → Rejected → 错误信封，不挂起」；真正的并发耗尽由 `gateway::pool` 的 `ConcurrencyGate` 单测覆盖。
+- **流式 chat 转发**：`contract_chat_routes.rs` 只覆盖非流式聚合路径；流式 SSE 转发由 Task 4e 的 wiremock 测试覆盖。
