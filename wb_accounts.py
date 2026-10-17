@@ -1587,7 +1587,7 @@ class Account(object):
         pkg_name = acc.get("PackageName") or "Package"
         pkg_code = acc.get("PackageCode") or ""
 
-        def _val(*keys):
+        def _val_or_none(*keys):
             for k in keys:
                 v = acc.get(k)
                 if v is not None and v != "":
@@ -1595,11 +1595,31 @@ class Account(object):
                         return float(v)
                     except (ValueError, TypeError):
                         pass
-            return 0.0
+            return None
 
-        size = _val("CycleCapacitySizePrecise", "CycleCapacitySize", "CapacitySizePrecise", "CapacitySize")
-        remain = _val("CycleCapacityRemainPrecise", "CycleCapacityRemain", "CapacityRemainPrecise", "CapacityRemain")
-        used = _val("CycleCapacityUsedPrecise", "CycleCapacityUsed", "CapacityUsedPrecise", "CapacityUsed")
+        def _val(*keys):
+            r = _val_or_none(*keys)
+            return 0.0 if r is None else r
+
+        # 容量字段有「累计」与「本周期」两套口径，必须整组同维度取值。
+        # 只认周期口径会漏掉「一次性赠额未动」的包（累计有 100、周期为 0，
+        # 被算成 0）；只认累计口径则会漏掉「月度包周期扣满」的包（累计仍是
+        # 满额、周期已归零，看似还有额度）。取两者剩余较大的一口径，两种形态
+        # 都对。判定必须用能区分「值就是 0」与「字段缺失」的取值函数：原写法
+        # 找不到时返回 0.0，会让周期那句恒真、永不回落累计。
+        cumulative_remain = _val_or_none("CapacityRemainPrecise", "CapacityRemain")
+        cycle_remain = _val_or_none("CycleCapacityRemainPrecise", "CycleCapacityRemain")
+        use_cycle = cycle_remain is not None and (
+            cumulative_remain is None or cycle_remain > cumulative_remain)
+
+        if use_cycle:
+            size = _val("CycleCapacitySizePrecise", "CycleCapacitySize")
+            remain = _val("CycleCapacityRemainPrecise", "CycleCapacityRemain")
+            used = _val("CycleCapacityUsedPrecise", "CycleCapacityUsed")
+        else:
+            size = _val("CapacitySizePrecise", "CapacitySize")
+            remain = _val("CapacityRemainPrecise", "CapacityRemain")
+            used = _val("CapacityUsedPrecise", "CapacityUsed")
 
         if size > 0 and used <= 0 and remain <= size:
             used = max(0.0, size - remain)
