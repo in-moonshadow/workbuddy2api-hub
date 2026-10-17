@@ -299,5 +299,111 @@ class CnCheckinTests(unittest.TestCase):
             wb_accounts.http_json = real_http_json
 
 
+class DailyChatCapTests(unittest.TestCase):
+    """每日活跃通道撞 6004 时必须落 model_caps（与转发路径同一套机制）。
+
+    现场（2026-10-17）：调度器连续三次拿 429/6004，activity_history 记了三行
+    失败，但账号 JSON 的 modelCaps 一直是空的 —— 因为每日活跃不走 wb_proxy 的
+    转发路径，6004 只被当成一条失败日志。这一组把「必须记下来」钉住，同时钉住
+    「普通网络失败不能记」——后者若混进来，会让一次 DNS 抖动把模型禁用到第二天。
+    """
+
+    UID = "c90a4e93-edad-42fe-aa3a-133fb27cf6b6"
+    #: 真实上游原文形状：code 6004 + "reset at <时刻>"
+    BODY_6004 = ('{"code":6004,"msg":"usage exceeds frequency limit, but don\'t '
+                 'worry, your usage will reset at 2026-10-17 12:00:00"}')
+
+    def account(self):
+        return wb_accounts.Account({"uid": self.UID, "realm": "intl",
+                                    "accessToken": "dummy-token",
+                                    "lastDailyChat": None})
+
+    def http_error(self, code, body):
+        """构造一个 urlopen 替身，对任何请求抛指定 HTTPError。"""
+
+        def fake(req, *_args, **_kwargs):
+            raise urllib.error.HTTPError(
+                getattr(req, "full_url", str(req)), code, "err", {},
+                io.BytesIO(body.encode("utf-8")))
+
+        return fake
+
+    def legacy_http_error(self, code, body):
+        """老写法（url 作为第一位置参数）同样要能构造出来。
+
+        `Account.http_json` 里既有 `urlopen(req)` 也有 `urlopen(url, data)` 两种
+        调用形态，替身必须两种都吃得住，否则测试会因为替身自身的签名而失败，
+        而不是因为被测逻辑。
+        """
+
+        def fake(url, *_args, **_kwargs):
+            raise urllib.error.HTTPError(url, code, "err", {},
+                                         io.BytesIO(body.encode("utf-8")))
+
+        return fake
+
+    def _run_web(self, fake):
+        acc = self.account()
+        old = wb_accounts.urlopen
+        wb_accounts.urlopen = fake
+        try:
+            res = acc._daily_chat_web_upstream()
+        finally:
+            wb_accounts.urlopen = old
+        return acc, res
+
+    def test_web_leg_6004_records_a_model_cap(self):
+        acc, res = self._run_web(self.http_error(429, self.BODY_6004))
+        self.assertFalse(res.get("ok"), res)
+        self.assertIn("6004", res.get("error", ""))       # 返回值形状不变
+        self.assertEqual(acc.capped_model_names(), [wb_accounts.DAILY_CHAT_MODEL])
+        self.assertGreater(acc.cap_until(wb_accounts.DAILY_CHAT_MODEL), time.time())
+
+    def test_reset_survives_the_returned_error_truncation(self):
+        """返回给调用方的 error 截断到 120 字符，但解析必须用完整原文。
+
+        上游把 reset 时刻放在第 120 字符之后是常态（前面还有一段英文长句），
+        若图省事拿返回值里那份 detail[:120] 去解析，就会取不到重置时刻、静默
+        不记 —— 断言 cap 落地即钉住了这一点。
+        """
+        long_body = ('{"code":6004,"msg":"' + "x" * 200 +
+                     ' usage exceeds frequency limit, but don\'t worry, your '
+                     'usage will reset at 2026-10-17 12:00:00"}')
+        acc, res = self._run_web(self.http_error(429, long_body))
+        self.assertFalse(res.get("ok"), res)
+        self.assertLessEqual(len(res.get("error", "")), 130)   # 返回值仍是截断的
+        self.assertEqual(acc.capped_model_names(), [wb_accounts.DAILY_CHAT_MODEL])
+
+    def test_plain_network_failure_records_nothing(self):
+        """普通 DNS/连接失败绝不能被记成 cap，否则一次抖动就白禁一天。"""
+
+        def fake(url, *_args, **_kwargs):
+            raise OSError("[Errno -3] Try again")
+
+        acc, res = self._run_web(fake)
+        self.assertFalse(res.get("ok"), res)
+        self.assertEqual(acc.capped_model_names(), [])
+        self.assertEqual(acc.model_caps, {})
+
+    def test_non_6004_rate_limit_records_nothing(self):
+        """只有 6004 才算「窗口用满」；其它 429（如 intl 14003）是软限，不落 cap。"""
+        acc, res = self._run_web(self.http_error(
+            429, '{"code":14003,"msg":"usage exceeds frequency limit"}'))
+        self.assertFalse(res.get("ok"), res)
+        self.assertEqual(acc.model_caps, {})
+
+    def test_desktop_leg_6004_also_records_a_model_cap(self):
+        """桌面腿（_daily_chat_upstream）撞 6004 时同样要记。"""
+        acc = self.account()
+        old = wb_accounts.urlopen
+        wb_accounts.urlopen = self.legacy_http_error(429, self.BODY_6004)
+        try:
+            res = acc._daily_chat_upstream(web=False)
+        finally:
+            wb_accounts.urlopen = old
+        self.assertFalse(res.get("ok"), res)
+        self.assertEqual(acc.capped_model_names(), [wb_accounts.DAILY_CHAT_MODEL])
+
+
 if __name__ == "__main__":
     unittest.main()

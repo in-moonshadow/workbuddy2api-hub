@@ -958,6 +958,34 @@ class Account(object):
             self.model_cooldowns[model] = max(self.model_cooldowns.get(model, 0.0), reset)
         return True
 
+    def _note_daily_chat_cap(self, detail):
+        """把每日活跃通道拿到的 429/6004 记成模型 cap（与转发路径同一套机制）。
+
+        为什么需要这一条：每日活跃走的是自己的通道（调度器排程 / 一键领取 /
+        网页腿），不经过 wb_proxy 的转发路径，于是 6004 在这里只被当成一条失败
+        日志，从不进 model_caps —— 当天后续每一次巡检都会重试同一个必然失败的
+        窗口，面板上表现为同一账号连续多行失败（issue 现场：10-17 的
+        08:36 / 08:44 / 09:00 三连败，modelCaps 仍为空）。
+        记下来之后，恢复时间之前的重试由既有 cap / 模型冷却机制自然挡住，
+        重启后也由 restore_model_caps() 重新挂上。
+
+        detail 必须是**未截断**的上游原文：`reset at YYYY-MM-DD HH:MM:SS` 落在
+        前 120 字符之后时，用返回值里那份 `detail[:120]` 解析会取不到重置时刻，
+        于是静默不记 —— 这正是「面板有失败、modelCaps 却一直空」的成因之一。
+
+        惰性 import wb_proxy：wb_proxy 顶层 import 本模块，本模块顶层再 import
+        它就会成环；函数内导入与 _daily_chat_upstream() 的既有做法一致。
+        任何异常都不外抛 —— 记一次 cap 绝不能改变 daily_chat 的返回值。
+        """
+        try:
+            import wb_proxy
+            if not wb_proxy.rate_limit_is_cap(detail):
+                return False
+            return self.note_model_cap(DAILY_CHAT_MODEL,
+                                       wb_proxy.parse_rate_limit_reset(detail))
+        except Exception:
+            return False
+
     def cap_until(self, model, now=None):
         """这个模型处于「上游判定额度用满」状态的截止时刻；不在其中返回 0。"""
         entry = self.model_caps.get(model)
@@ -1385,6 +1413,10 @@ class Account(object):
                 detail = exc.read().decode("utf-8", "replace")
             except Exception:
                 detail = str(exc)
+            # 429/6004 是「这个模型的窗口额度用满」，不是普通网络失败：记成
+            # cap，别让当天后续巡检一次次重试同一个必然失败的窗口。用完整
+            # detail 解析（返回给调用方的 error 才是截断过的）。
+            self._note_daily_chat_cap(detail)
             return {"ok": False, "error": "HTTP %d: %s" % (exc.code, detail[:120])}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -1503,6 +1535,9 @@ class Account(object):
                 err = exc.read().decode("utf-8", "replace")
             except Exception:
                 err = str(exc)
+            # 桌面腿同样可能撞 6004；记录口径与网页腿一致（见
+            # _note_daily_chat_cap），否则同一次尝试只在网页腿留下痕迹。
+            self._note_daily_chat_cap(err)
             return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
