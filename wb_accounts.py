@@ -981,8 +981,20 @@ class Account(object):
             import wb_proxy
             if not wb_proxy.rate_limit_is_cap(detail):
                 return False
-            return self.note_model_cap(DAILY_CHAT_MODEL,
-                                       wb_proxy.parse_rate_limit_reset(detail))
+            reset_at = wb_proxy.parse_rate_limit_reset(detail)
+            if not self.note_model_cap(DAILY_CHAT_MODEL, reset_at):
+                return False
+            # note_model_cap 只改内存；转发路径由 wb_proxy._save_account_caps 补
+            # 这一步，每日活跃没有那层调用方。不自己落盘的话，重启就把「上游给的
+            # 恢复时刻」丢了（现场：09:28 撞 6004、文件里 modelCaps 至今为空，
+            # 因为 daily_chat 的失败分支从不 save）。落盘失败不影响返回值：本次
+            # 的停用由内存里的模型冷却负责。
+            try:
+                if self.path:
+                    self.save(os.path.dirname(self.path))
+            except Exception:
+                pass
+            return True
         except Exception:
             return False
 

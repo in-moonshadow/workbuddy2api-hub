@@ -359,6 +359,32 @@ class DailyChatCapTests(unittest.TestCase):
         self.assertEqual(acc.capped_model_names(), [wb_accounts.DAILY_CHAT_MODEL])
         self.assertGreater(acc.cap_until(wb_accounts.DAILY_CHAT_MODEL), time.time())
 
+    def test_a_recorded_cap_is_written_to_the_account_file(self):
+        """cap 必须落盘，不能只活在内存里。
+
+        现场（2026-10-17）：调度器 09:28 撞 6004，进程没重启，账号 JSON 的
+        modelCaps 却一直是空的 —— 因为 daily_chat 的失败分支从不 save()，
+        而 note_model_cap 只改内存。转发路径靠 wb_proxy._save_account_caps
+        补这一步，每日活跃没有那层调用方。重启就把上游给的恢复时刻丢了。
+        """
+        directory = os.path.join(_TMP.name, "cap-persist")
+        acc = self.account()
+        acc.path = os.path.join(directory, self.UID + ".json")
+        old = wb_accounts.urlopen
+        wb_accounts.urlopen = self.http_error(429, self.BODY_6004)
+        try:
+            acc._daily_chat_web_upstream()
+        finally:
+            wb_accounts.urlopen = old
+        with open(acc.path, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        caps = saved.get("modelCaps") or {}
+        self.assertIn(wb_accounts.DAILY_CHAT_MODEL, caps, saved)
+        self.assertEqual(caps[wb_accounts.DAILY_CHAT_MODEL].get("reset"), 1792238400.0)
+        # 重新加载后 cap 仍然成立 —— 这才是「跨重启仍然有效」的意思。
+        reloaded = wb_accounts.Account(saved)
+        self.assertEqual(reloaded.cap_until(wb_accounts.DAILY_CHAT_MODEL), 1792238400.0)
+
     def test_reset_survives_the_returned_error_truncation(self):
         """返回给调用方的 error 截断到 120 字符，但解析必须用完整原文。
 
