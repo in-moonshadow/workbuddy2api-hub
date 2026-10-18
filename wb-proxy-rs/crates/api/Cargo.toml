@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
 # sync：ConcurrencyGate 的 Semaphore 与 AccountPool 的进程级 Mutex 在 rx
 # 任务内跨 await 持有；time：ConcurrencyGate::acquire 的槽位等待超时。
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "time"] }
@@ -18,6 +18,7 @@ reqwest = { version = "0.12", default-features = false }
 wb-storage = { path = "../storage" }
 wb-identity = { path = "../identity" }
 wb-gateway = { path = "../gateway" }
+wb-tasks = { path = "../tasks" }
 
 [dev-dependencies]
 http-body-util = "0.1"

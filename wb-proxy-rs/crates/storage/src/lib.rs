@@ -1,4 +1,6 @@
-//! 只读访问 Python 版本留下的 legacy 数据目录。
+//! 读取 Python 版本留下的 legacy 数据目录；**写权限仅限**账号文件里的三个
+//! 幂等日期字段（`lastCheckin` / `lastActivityReport` / `lastDailyChat`，
+//! 见 `write_idempotent_fields`）与 `active_realm.json`（`save_realm`）。
 
 /// 一个账号快照的聚合信息（M1 只需要计数与 realm）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +111,10 @@ pub struct PoolAccount {
 /// 持有 enabled/cooldown_until），Python 也是全部载入后由 `ready()` 判。
 pub fn pool_accounts(accounts_dir: &Path) -> Result<Vec<PoolAccount>, StorageError> {
     let mut out = Vec::new();
-    for (_, doc) in account_entries(accounts_dir)? {
+    for (_, doc) in account_entries(accounts_dir)?
+        .into_iter()
+        .map(AccountEntry::name_and_doc)
+    {
         let access_token = doc
             .get("accessToken")
             .and_then(|v| v.as_str())
@@ -155,6 +160,144 @@ pub fn save_realm(accounts_dir: &Path, realm: &str) -> Result<bool, StorageError
     let text = serde_json::json!({ "realm": realm }).to_string();
     fs::write(&path, text).map_err(|err| StorageError::Io(path, err))?;
     Ok(true)
+}
+
+/// `wb_identity::export::RUNTIME_ONLY_FIELDS` 的镜像（`crates/identity/src/export.rs:47`）。
+///
+/// 为什么是镜像而非 `use`：storage 是**零依赖叶子 crate**（只依赖 `serde_json`），
+/// 让 storage 反向依赖 identity 会在 workspace 依赖图上多一条 `storage → identity`
+/// 边，而 identity 的字段分类本就源自 Python `wb_accounts.py`，两者是**同一份
+/// 契约的两次落笔**。为了不让两份定义漂移，`tests/contract_idempotent_fields.rs`
+/// 用 `wb-identity`（**仅 dev-dependency**，不进入生产依赖图）逐字断言本常量与
+/// `wb_identity::export::RUNTIME_ONLY_FIELDS` 相等 —— 漂移即测试失败。
+const RUNTIME_ONLY_FIELDS: [&str; 2] = ["lastError", "cooldownUntil"];
+
+/// 落盘前剥离的运行时字段（对齐 Python `wb_accounts.py:782-783`）。
+fn strip_runtime_only(doc: &mut serde_json::Map<String, serde_json::Value>) {
+    for field in RUNTIME_ONLY_FIELDS {
+        doc.remove(field);
+    }
+}
+
+/// 账号凭据文件里由任务/签到流程回写的三个「幂等日期」字段（Python
+/// `last_checkin` / `last_activity_report` / `last_daily_chat`，见
+/// `wb_accounts.py:755-756` 的 `lastDailyChat` / `lastActivityReport` 与
+/// `:1594` 的 `lastCheckin`）。
+///
+/// 值是 `"%Y-%m-%d %H:%M:%S"` **本地时间**字符串（Python `time.strftime`），
+/// 判定「今天是否已做」用的是其前 10 字符 `%Y-%m-%d` 前缀比较。**不写 UTC**：
+/// 写 UTC 会让 22:00 保活、09:00 签到跨出当天的判定，凭空多/少跑一轮。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdempotentFields {
+    /// JSON 键 `lastCheckin`：签到成功时刻。
+    pub last_checkin: Option<String>,
+    /// JSON 键 `lastActivityReport`：活跃上报成功时刻。
+    pub last_activity_report: Option<String>,
+    /// JSON 键 `lastDailyChat`：国际版每日对话成功时刻。
+    pub last_daily_chat: Option<String>,
+}
+
+impl IdempotentFields {
+    /// `Some` 表示要改写该键；`None` 表示**保持文件里的现值不动**。
+    fn apply(&self, doc: &mut serde_json::Map<String, serde_json::Value>) {
+        let pairs = [
+            ("lastCheckin", self.last_checkin.as_deref()),
+            ("lastActivityReport", self.last_activity_report.as_deref()),
+            ("lastDailyChat", self.last_daily_chat.as_deref()),
+        ];
+        for (key, value) in pairs {
+            if let Some(value) = value {
+                doc.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+        }
+    }
+}
+
+/// 从账号文件读三个幂等字段；文件缺失/非对象返回 `None` 字段（不报错）。
+pub fn read_idempotent_fields(
+    accounts_dir: &Path,
+    name: &str,
+) -> Result<IdempotentFields, StorageError> {
+    let path = account_path(accounts_dir, name)?;
+    let Some(doc) = read_json(&path)? else {
+        return Ok(IdempotentFields::default());
+    };
+    let get = |key: &str| doc.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    Ok(IdempotentFields {
+        last_checkin: get("lastCheckin"),
+        last_activity_report: get("lastActivityReport"),
+        last_daily_chat: get("lastDailyChat"),
+    })
+}
+
+/// 单账号**原子**读改写回写（闸门 0）。
+///
+/// 语义逐条对齐 Python `Account.save()`（`wb_accounts.py:764-794`）：
+/// 1. 读**磁盘上的最新内容**再合并（不是覆盖调用方手里的旧快照）——否则并发
+///    的两个流程会互相抹掉对方刚写的字段；
+/// 2. 只改 `IdempotentFields` 给出的键，其余键（含未知键）**原样保留**；
+/// 3. 落盘前剥离 `RUNTIME_ONLY_FIELDS`（`lastError` / `cooldownUntil`）；
+/// 4. 临时文件与目标**同目录**（跨文件系统 `rename` 会失败），文件名
+///    `<path>.<pid>.<序号>.tmp` 保证多次/多线程写互不踩踏；
+/// 5. 写 `indent(2)` 的 UTF-8 JSON（键序按 `serde_json` 的默认 BTreeMap，
+///    与 Python 的插入序不同，但 JSON 语义等价，读取方不依赖键序）；
+/// 6. `rename` 成功才算落盘；任何一步失败都清理临时文件并返回错误。
+///
+/// 与 `save_realm` 的区别（闸门 0 G0-2）：那个是裸 `fs::write`，无 temp、无
+/// rename、无缩进，**不可**用于账号文件。
+pub fn write_idempotent_fields(
+    accounts_dir: &Path,
+    name: &str,
+    fields: &IdempotentFields,
+) -> Result<(), StorageError> {
+    let path = account_path(accounts_dir, name)?;
+    let Some(doc) = read_json(&path)? else {
+        return Err(StorageError::Io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::NotFound, "account file not found"),
+        ));
+    };
+    let mut map = match doc {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            return Err(StorageError::Json(
+                path,
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "account file is not a JSON object",
+                )),
+            ))
+        }
+    };
+    fields.apply(&mut map);
+    strip_runtime_only(&mut map);
+
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .map_err(|err| StorageError::Json(path.clone(), err))?;
+    let tmp = path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("account"),
+        std::process::id(),
+        thread_token()
+    ));
+    fs::write(&tmp, text).map_err(|err| StorageError::Io(tmp.clone(), err))?;
+    if let Err(err) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(StorageError::Io(path, err));
+    }
+    Ok(())
+}
+
+/// 临时文件名的唯一后缀（仅需「同进程内多次写不同名」）。
+fn thread_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 fn unix_secs() -> f64 {
@@ -241,9 +384,9 @@ pub fn load_snapshot(
     let now = unix_secs();
     let mut accounts = 0usize;
     let mut accounts_ready = 0usize;
-    for (_, doc) in account_entries(accounts_dir)? {
+    for entry in account_entries(accounts_dir)? {
         accounts += 1;
-        if is_ready(&doc, now) {
+        if is_ready(&entry.doc, now) {
             accounts_ready += 1;
         }
     }
@@ -270,9 +413,28 @@ pub struct Account {
     pub credential_file: String,
 }
 
-/// 遍历账号目录，返回 (文件名, JSON 文档) 列表；按文件枚举顺序（对齐 Python
-/// `AccountPool._load` 的加载顺序，representative 依赖它取「第一个」）。
-fn account_entries(accounts_dir: &Path) -> Result<Vec<(String, serde_json::Value)>, StorageError> {
+/// 枚举出的一个账号文件 (文件名, JSON 文档)；`path` 按文件名重新解析，
+/// 路径穿越防护见 [`account_path`]。
+#[derive(Debug, Clone)]
+struct AccountEntry {
+    name: String,
+    doc: serde_json::Value,
+}
+
+impl AccountEntry {
+    /// 只读消费方的快捷取法。
+    fn name_and_doc(self) -> (String, serde_json::Value) {
+        (self.name, self.doc)
+    }
+}
+
+/// 遍历账号目录，返回账号条目列表，**按文件名升序**排序。
+///
+/// 排序对齐 Python `AccountPool.load()` 的 `sorted(os.listdir(self.dir))`
+/// （`wb_accounts.py:2551-2571`）：闸门 0 G0-4 —— `representative()` 取「第一个
+/// 有 token 的账号」，若顺序依赖 `read_dir` 的文件系统返回次序，同一份数据在
+/// 不同机器/不同时刻会选中不同账号，`/health` 的身份字段静默漂移。
+fn account_entries(accounts_dir: &Path) -> Result<Vec<AccountEntry>, StorageError> {
     let entries = fs::read_dir(accounts_dir)
         .map_err(|err| StorageError::Io(accounts_dir.to_path_buf(), err))?;
     let mut out = Vec::new();
@@ -294,9 +456,36 @@ fn account_entries(accounts_dir: &Path) -> Result<Vec<(String, serde_json::Value
             Some(doc) if doc.is_object() => doc,
             _ => continue,
         };
-        out.push((name, doc));
+        out.push(AccountEntry { name, doc });
     }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// 按文件名精确定位单个账号文件（写回入口用）。
+///
+/// 只接受**已存在于账号目录内**的普通 `.json` 文件名：拒绝路径分隔符、`..`、
+/// 非 `.json` 扩展名与 `NON_ACCOUNT_FILES`，避免上游传入的名字把写入引到目录外。
+fn account_path(accounts_dir: &Path, name: &str) -> Result<PathBuf, StorageError> {
+    let invalid = || {
+        StorageError::Io(
+            accounts_dir.join(name),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid account file name",
+            ),
+        )
+    };
+    if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
+        return Err(invalid());
+    }
+    if !Path::new(name).extension().is_some_and(|ext| ext == "json") {
+        return Err(invalid());
+    }
+    if NON_ACCOUNT_FILES.contains(&name) {
+        return Err(invalid());
+    }
+    Ok(accounts_dir.join(name))
 }
 
 /// 代表账号：第一个有 access_token 的账号，否则第一个，池空则 None
@@ -306,7 +495,9 @@ pub fn representative(accounts_dir: &Path, realm: &str) -> Option<Account> {
     let entries = account_entries(accounts_dir).ok()?;
     let mut first_with_token: Option<Account> = None;
     let mut first: Option<Account> = None;
-    for (name, doc) in entries {
+    for entry in entries {
+        let name = entry.name;
+        let doc = entry.doc;
         let account_realm = doc.get("realm").and_then(|v| v.as_str()).unwrap_or("");
         if !realm.is_empty() && account_realm != realm {
             continue;

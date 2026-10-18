@@ -9,3 +9,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# 仅测试用：逐字对拍 `RUNTIME_ONLY_FIELDS` 镜像，不进入生产依赖图。
+wb-identity = { path = "../identity" }

@@ -1307,7 +1307,10 @@ mod tests {
         );
         let frame = anthropic_sse_frame("ping", &json!({"type": "ignored", "a": 1}));
         let text = String::from_utf8(frame).unwrap();
-        assert!(text.starts_with("event: ping\ndata: {\"a\":1,\"type\":\"ping\"}"));
+        // Python `dict` 覆盖已有键时保留原位置（`body["type"] = event`，:13817），
+        // 于是 `{"type": ..., "a": 1}` 覆盖后仍是 `type` 在前。开启 serde_json
+        // `preserve_order` 后 Rust 侧同样是「按键存在则原位替换」，故断言键序不变。
+        assert!(text.starts_with("event: ping\ndata: {\"type\":\"ping\",\"a\":1}"));
     }
 
     #[test]

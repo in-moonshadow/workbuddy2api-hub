@@ -45,11 +45,18 @@ pub fn chat_base_url(realm: &str, product: &str) -> String {
     endpoint_for(realm, product).0.to_string()
 }
 
-/// realm 配置的 chat 相关字段，对齐 wb_accounts.REALM_CONFIGS（:173-190）。
+/// realm 配置的对外字段，对齐 wb_accounts.REALM_CONFIGS（:176-205）。
 /// cn 的 Origin 是 codebuddy.cn 而 X-Domain 是 copilot.tencent.com——两者不同源。
 pub struct RealmConfig {
     pub origin: &'static str,
     pub chat_ua: &'static str,
+    /// 计费/签到端点的 base（`_checkin_upstream` 用 `billing_upstream + CHECKIN_PATH`）。
+    /// intl 与 chat 同主机；cn 走 codebuddy.cn。
+    pub billing_upstream: &'static str,
+    /// 计费用轻量 User-Agent（只有 `WorkBuddy/x.y.z`，不含产品串）。
+    pub billing_ua: &'static str,
+    /// `Account.domain` 为空时 `X-Domain` 的兜底。
+    pub domain: &'static str,
 }
 
 /// get_realm_config 的等价：未知 realm 兜底 intl。
@@ -58,11 +65,17 @@ pub fn realm_config(realm: &str) -> RealmConfig {
         RealmConfig {
             origin: "https://www.codebuddy.cn",
             chat_ua: "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1",
+            billing_upstream: "https://www.codebuddy.cn",
+            billing_ua: "WorkBuddy/5.5.6",
+            domain: "copilot.tencent.com",
         }
     } else {
         RealmConfig {
             origin: "https://www.workbuddy.ai",
             chat_ua: "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2",
+            billing_upstream: "https://www.workbuddy.ai",
+            billing_ua: "WorkBuddy/5.5.2",
+            domain: "www.workbuddy.ai",
         }
     }
 }
@@ -144,5 +157,26 @@ mod tests {
         assert_eq!(intl.origin, "https://www.workbuddy.ai");
         let unknown = realm_config("eu");
         assert_eq!(unknown.origin, intl.origin);
+    }
+
+    /// 计费口径（REALM_CONFIGS 的 billing_upstream / billing_ua / domain）。
+    #[test]
+    fn realm_config_billing_fields_match_python() {
+        let cn = realm_config("cn");
+        assert_eq!(cn.billing_upstream, "https://www.codebuddy.cn");
+        assert_eq!(cn.billing_ua, "WorkBuddy/5.5.6");
+        assert_eq!(cn.domain, "copilot.tencent.com");
+        // cn 的 billing base 与 chat base 不同主机
+        assert_ne!(cn.billing_upstream, chat_base_url("cn", PRODUCT_DESKTOP));
+
+        let intl = realm_config("intl");
+        assert_eq!(intl.billing_upstream, "https://www.workbuddy.ai");
+        assert_eq!(intl.billing_ua, "WorkBuddy/5.5.2");
+        assert_eq!(intl.domain, "www.workbuddy.ai");
+        // intl 的 billing base 与 chat base 同主机
+        assert_eq!(
+            intl.billing_upstream,
+            chat_base_url("intl", PRODUCT_DESKTOP)
+        );
     }
 }

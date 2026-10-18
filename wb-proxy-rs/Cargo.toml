@@ -1,13 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["crates/storage", "crates/api", "crates/identity", "crates/gateway"]
+members = [
+    "crates/storage",
+    "crates/api",
+    "crates/identity",
+    "crates/gateway",
+    "crates/tasks",
+]
 
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
 
 [workspace.dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 md-5 = "0.10"

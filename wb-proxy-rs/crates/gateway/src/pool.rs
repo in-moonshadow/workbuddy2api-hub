@@ -44,6 +44,14 @@ pub struct ModelCap {
 pub struct AccountState {
     pub uid: String,
     pub realm: String,
+    /// 凭据档文件名（如 `abc123.json`）。Python `Account.credential_file`；
+    /// 幂等字段回写（wb-storage `write_idempotent_fields`）需要它定位文件。
+    /// 手工构造（测试注入）时可为空串，此时不可回写。
+    pub credential_file: String,
+    /// 企业空间 id（Python `Account.enterprise_id`，wb_accounts.py:500-508）：
+    /// 取 `data.enterpriseId`，为空回退 JWT 的 `enterprise_id` claim。
+    /// 非空即「企业账号」：签到/活跃上报被短路（契约 11/12/14）。
+    pub enterprise_id: String,
     /// 面板开关（Python 原生假值语义：M3 强制 bool，M5 面板接线再对齐）。
     pub enabled: bool,
     /// 是否存在 access_token（空串视为无）。
@@ -92,6 +100,8 @@ impl AccountState {
         Self {
             uid: uid.into(),
             realm: realm.into(),
+            credential_file: String::new(),
+            enterprise_id: String::new(),
             enabled: true,
             has_token: true,
             access_token: String::new(),
@@ -243,6 +253,8 @@ const NON_ACCOUNT_FILES: [&str; 3] = ["settings.json", "model.json", "active_rea
 /// - product：`normalize_product(data.product)`（未知回退 workbuddy）
 /// - expires_at：`normalize_epoch(data.expiresAt)`，为空回退 `jwt_exp(token)`
 /// - enabled / weight：面板持久化字段原样读入（夹到 [1,100]）
+/// - credential_file：凭据档文件名（幂等字段回写定位用）
+/// - enterprise_id：`data.enterpriseId`，为空回退 JWT `enterprise_id` claim
 ///
 /// 运行期状态（cooldown/breaker/soft_streak 等）一律按 `AccountState::new()`
 /// 的默认值起算——Python 的 last_error/model_cooldowns 也是 RUNTIME_ONLY，
@@ -317,9 +329,26 @@ pub fn load_account_pool(accounts_dir: &std::path::Path) -> Vec<AccountState> {
             .and_then(|v| v.as_i64())
             .unwrap_or(1)
             .clamp(1, 100);
+        // 企业 id（wb_accounts.py:500-508）：凭据档里的 enterpriseId 常常为空——
+        // 企业账号是登录时切空间换来的 token，id 只写在 token 里。不回填则
+        // is_enterprise() 判假，企业账号会被误送去签到/活跃上报并静默失败。
+        let enterprise_id = match doc
+            .get("enterpriseId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+        {
+            "" => wb_identity::jwt::jwt_claims(token)
+                .get("enterprise_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            value => value.to_string(),
+        };
         accounts.push(AccountState {
             uid: uid.clone(),
             realm: realm.clone(),
+            credential_file: name.to_string(),
+            enterprise_id,
             enabled,
             has_token: !token.is_empty(),
             access_token: token.to_string(),
@@ -1344,6 +1373,60 @@ mod tests {
         // 空 uid + 空 token → jwt_uid 也空 → 整行丢弃
         write_account(&dir, "empty.json", serde_json::json!({"accessToken": ""}));
         assert_eq!(load(&dir).len(), 0);
+    }
+
+    /// 幂等字段回写靠 `credential_file` 定位文件：它必须等于排序后的文件名，
+    /// 且手工构造的 `AccountState` 默认为空串（不可回写）。
+    #[test]
+    fn load_records_credential_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_account(
+            &dir,
+            "z.json",
+            serde_json::json!({"uid": "u-z", "realm": "cn"}),
+        );
+        write_account(
+            &dir,
+            "a.json",
+            serde_json::json!({"uid": "u-a", "realm": "cn"}),
+        );
+        let accounts = load(&dir);
+        assert_eq!(accounts[0].uid, "u-a");
+        assert_eq!(accounts[0].credential_file, "a.json");
+        assert_eq!(accounts[1].credential_file, "z.json");
+        // 手工构造（测试注入）不指向任何文件
+        assert_eq!(AccountState::new("u", "cn").credential_file, "");
+    }
+
+    /// 企业 id：凭据档优先；档里为空则回退 JWT `enterprise_id` claim
+    /// （wb_accounts.py:500-508 —— 企业 token 换空间后 id 只在 token 里）。
+    #[test]
+    fn load_prefers_file_enterprise_id_then_jwt_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        write_account(
+            &dir,
+            "file.json",
+            serde_json::json!({"uid": "u-file", "realm": "cn", "enterpriseId": "ent-file"}),
+        );
+        let token = fake_jwt(&serde_json::json!({
+            "sub": "u-jwt", "enterprise_id": "ent-jwt",
+        }));
+        write_account(
+            &dir,
+            "jwt.json",
+            serde_json::json!({"uid": "u-jwt", "realm": "cn", "accessToken": token}),
+        );
+        write_account(
+            &dir,
+            "plain.json",
+            serde_json::json!({"uid": "u-plain", "realm": "cn"}),
+        );
+        let accounts = load(&dir);
+        // 排序：file.json < jwt.json < plain.json
+        assert_eq!(accounts[0].enterprise_id, "ent-file");
+        assert_eq!(accounts[1].enterprise_id, "ent-jwt", "档里为空应回退 token");
+        assert_eq!(accounts[2].enterprise_id, "");
+        assert_eq!(AccountState::new("u", "cn").enterprise_id, "");
     }
 
     #[test]

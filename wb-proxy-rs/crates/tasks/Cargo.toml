@@ -1,0 +1,26 @@
+[package]
+name = "wb-tasks"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 契约类型全为 serde_json::Value / 纯数据；无任何 HTTP 依赖（HTTP 由 wb-gateway 提供）
+serde_json.workspace = true
+# 幂等日期字段的本地时间格式化（"%Y-%m-%d %H:%M:%S"）；契约 12-17 依赖本地时区
+chrono.workspace = true
+# 账号池与出站头（chat_request_headers / load_account_pool / UpstreamClient）
+wb-gateway = { path = "../gateway" }
+# 幂等字段读写（闸门 0 产出的 read/write_idempotent_fields）
+wb-storage = { path = "../storage" }
+# 关卡 4.5：RealSleeper 的节流等待（tokio::time::sleep）；关卡 4.7 的
+# production_fetch 需要 tokio::join! 并发两路取数（宏展开依赖 macros）。
+# runtime 仍由外层（wb-api）提供；测试侧另有 rt-multi-thread 的 dev 依赖。
+tokio = { version = "1", features = ["time", "macros"] }
+
+[dev-dependencies]
+# 契约测试的 mock 上游；绝不向真实上游发请求
+wiremock = "0.6"
+tempfile = "3"
+# 关卡 4.3 起 report_events / travel_status 为 async，测试需 #[tokio::test]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

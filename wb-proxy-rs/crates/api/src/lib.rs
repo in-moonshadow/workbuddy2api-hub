@@ -12,3 +12,11 @@ pub use config::Config;
 pub fn app(cfg: Arc<Config>) -> axum::Router {
     routes::router(cfg)
 }
+
+pub fn app_with(
+    cfg: Arc<Config>,
+    panels: Arc<crate::auth::PanelSessions>,
+    task: Arc<wb_tasks::api_routes::TaskRuntime>,
+) -> axum::Router {
+    routes::app_with(cfg, panels, task)
+}

@@ -20,6 +20,8 @@ use wb_gateway::pool::ConcurrencyGate;
 use wb_gateway::responses::{chat_to_response, responses_to_chat, RequestMeta};
 use wb_gateway::retry::{anthropic_error_obj, Outcome};
 use wb_gateway::stream::{aggregate_stream, strip_data_prefix};
+use wb_tasks::api_routes as task_routes;
+use wb_tasks::scheduler::PanelSink;
 
 /// 面板会话 TTL：7 天（对齐 wb_settings.SESSION_TTL）。
 const SESSION_TTL: u64 = 7 * 24 * 3600;
@@ -76,6 +78,7 @@ struct AppState {
     panels: Arc<PanelSessions>,
     upstream: Arc<Upstream>,
     gate: Arc<ConcurrencyGate>,
+    task: Arc<task_routes::TaskRuntime>,
 }
 
 impl AppState {
@@ -85,7 +88,11 @@ impl AppState {
     /// 状态，Python 也是全量载入后由 `ready()` 判）。`access_token` 只在
     /// 进程内传递，**不打印**。装载失败（目录不可读）时以空池启动并让
     /// chat 路径回 503（池不可用），不 panic。
-    fn build(cfg: Arc<Config>, panels: Arc<PanelSessions>) -> Self {
+    fn build(
+        cfg: Arc<Config>,
+        panels: Arc<PanelSessions>,
+        task: Arc<task_routes::TaskRuntime>,
+    ) -> Self {
         let accounts: Vec<wb_gateway::pool::AccountState> =
             match wb_storage::pool_accounts(&cfg.accounts_dir) {
                 Ok(entries) => entries
@@ -113,16 +120,50 @@ impl AppState {
             panels,
             upstream,
             gate,
+            task,
         }
     }
 }
 
 pub fn router(cfg: Arc<Config>) -> Router {
-    let state = AppState::build(cfg, Arc::new(PanelSessions::new(SESSION_TTL)));
+    app_with(
+        cfg.clone(),
+        Arc::new(PanelSessions::new(SESSION_TTL)),
+        task_routes::TaskRuntime::production(&cfg.accounts_dir, Arc::new(ApiPanelSink)),
+    )
+}
+
+pub fn app_with(
+    cfg: Arc<Config>,
+    panels: Arc<PanelSessions>,
+    task: Arc<task_routes::TaskRuntime>,
+) -> Router {
+    let state = AppState::build(cfg, panels, task);
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/", get(dashboard))
-        .route("/realm", get(realm_get).post(realm_post));
+        .route("/realm", get(realm_get).post(realm_post))
+        .route(
+            "/accounts/checkin",
+            post(accounts_checkin).options(preflight),
+        )
+        .route("/tasks", get(tasks_get).options(preflight))
+        .route("/tasks/run", post(tasks_run).options(preflight))
+        .route("/tasks/travel", post(tasks_travel).options(preflight))
+        .route(
+            "/tasks/streak-bonus",
+            post(tasks_streak_bonus).options(preflight),
+        )
+        .route("/tasks/claim-all", post(tasks_claim_all).options(preflight))
+        .route("/scheduler", get(scheduler_get).options(preflight))
+        .route(
+            "/scheduler/trigger",
+            post(scheduler_trigger).options(preflight),
+        )
+        .route(
+            "/scheduler/toggle",
+            post(scheduler_toggle).options(preflight),
+        );
     for path in OPENAI_PATHS {
         router = router.route(path, post(chat_openai_entry).options(preflight));
     }
@@ -717,4 +758,188 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
         }
     }
     response
+}
+
+/// 生产面板 sink：no-op（面板日志暂未接入 dashboard，M5 对齐）。
+#[derive(Clone, Default)]
+pub struct ApiPanelSink;
+
+impl PanelSink for ApiPanelSink {
+    fn add_log_entry(&self, _msg: &str, _tag: &str) {
+        // no-op
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 任务路由 handlers（关卡 4.10）
+// ---------------------------------------------------------------------------
+
+async fn accounts_checkin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let payload = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if !payload.is_object() {
+        return openai_error(400, "expected a JSON object", "invalid_request_error");
+    }
+    let res = task_routes::route_accounts_checkin(&state.task, &payload).await;
+    Json(res).into_response()
+}
+
+async fn tasks_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let uid = params.get("uid").cloned();
+    let res = task_routes::route_tasks_get(&state.task, uid.as_deref()).await;
+    Json(res).into_response()
+}
+
+async fn tasks_run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let payload = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if !payload.is_object() {
+        return openai_error(400, "expected a JSON object", "invalid_request_error");
+    }
+    let res = task_routes::route_tasks_run(&state.task, &payload).await;
+    Json(res).into_response()
+}
+
+async fn tasks_travel(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let payload = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if !payload.is_object() {
+        return openai_error(400, "expected a JSON object", "invalid_request_error");
+    }
+    let res = task_routes::route_tasks_travel(&state.task, &payload).await;
+    Json(res).into_response()
+}
+
+async fn tasks_streak_bonus(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let payload = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if !payload.is_object() {
+        return openai_error(400, "expected a JSON object", "invalid_request_error");
+    }
+    let res = task_routes::route_tasks_streak_bonus(&state.task, &payload).await;
+    Json(res).into_response()
+}
+
+async fn tasks_claim_all(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let payload = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if !payload.is_object() {
+        return openai_error(400, "expected a JSON object", "invalid_request_error");
+    }
+    let res = task_routes::route_tasks_claim_all(&state.task, &payload).await;
+    Json(res).into_response()
+}
+
+async fn scheduler_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let res = task_routes::route_scheduler_get(&state.task);
+    Json(res).into_response()
+}
+
+async fn scheduler_trigger(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let _ = body;
+    let res = task_routes::route_scheduler_trigger(&state.task);
+    Json(res).into_response()
+}
+
+async fn scheduler_toggle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let _ = body;
+    let res = task_routes::route_scheduler_toggle(&state.task);
+    Json(res).into_response()
 }

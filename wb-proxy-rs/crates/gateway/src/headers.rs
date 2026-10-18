@@ -42,6 +42,92 @@ fn random_hex() -> String {
     to_hex(&bytes)
 }
 
+/// `derive_id(uid, "req") + "-" + 6 位纳秒尾数`，对齐 wb_fingerprint.generate_request_id
+/// （`:20-24`：`str(time.time_ns() % 1000000).zfill(6)`）。
+///
+/// 前缀稳定（同一 uid 永远同前缀），后缀每次不同——上游按「稳定前缀 + 变化后缀」
+/// 识别同一设备的连续请求。时间源以参数注入，契约测试可据此断言固定值。
+pub fn generate_request_id(uid: &str, now_nanos: u128) -> String {
+    let suffix = (now_nanos % 1_000_000).to_string();
+    format!("{}-{suffix:0>6}", derive_id(uid, "req"))
+}
+
+/// 生产用时间源：`SystemTime` 自 UNIX_EPOCH 起的纳秒数。
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// billing 出站头组合的输入，对齐 `Account.headers(purpose="billing")`（:1169-1196）。
+pub struct BillingHeadersParams<'a> {
+    pub uid: &'a str,
+    pub token: &'a str,
+    pub realm: &'a str,
+    /// 账号自己的 `domain`；空串时回落 `cfg.domain`。
+    pub domain: &'a str,
+    pub enterprise_id: &'a str,
+    pub device_token: Option<&'a str>,
+}
+
+/// 对齐 `Account.headers(purpose="billing")`（wb_accounts.py:1169-1196）。
+///
+/// 计费端点不吃 chat 那套身分头：没有 X-IDE-* / X-Agent-*，User-Agent 是轻量
+/// `WorkBuddy/x.y.z`；无企业时打 `X-No-Enterprise-Id: 1`（chat 侧是缺席而非置 1）；
+/// `X-Product: SaaS` 只在 cn 出现。`X-Request-ID` 沿用 generate_request_id 的
+/// 「稳定前缀 + 变化后缀」，与 chat 侧的随机 32 hex 不同。
+pub fn billing_request_headers(p: &BillingHeadersParams) -> HashMap<String, String> {
+    let cfg = realm_config(p.realm);
+    let mut headers = HashMap::new();
+    headers.insert("Content-Type".into(), "application/json".into());
+    headers.insert("Accept".into(), "application/json, text/plain, */*".into());
+    headers.insert("X-Requested-With".into(), "XMLHttpRequest".into());
+    headers.insert("User-Agent".into(), cfg.billing_ua.into());
+    headers.insert("Origin".into(), cfg.origin.into());
+    headers.insert("Referer".into(), format!("{}/", cfg.origin));
+    headers.insert("Authorization".into(), format!("Bearer {}", p.token));
+    headers.insert("X-User-Id".into(), p.uid.into());
+    headers.insert(
+        "X-Domain".into(),
+        if p.domain.trim().is_empty() {
+            cfg.domain.to_string()
+        } else {
+            p.domain.trim().to_string()
+        },
+    );
+    headers.insert("X-CodeBuddy-Request".into(), "1".into());
+    // Python 是 `"en-US" if self.realm == "intl" else "zh-CN"`：非 intl 一律中文。
+    headers.insert(
+        "Accept-Language".into(),
+        if p.realm == "intl" {
+            "en-US".into()
+        } else {
+            "zh-CN".into()
+        },
+    );
+    headers.insert(
+        "X-Request-ID".into(),
+        generate_request_id(p.uid, now_nanos()),
+    );
+    headers.insert("X-Machine-ID".into(), derive_id(p.uid, "machine"));
+    headers.insert("X-Session-ID".into(), derive_id(p.uid, "session"));
+    if p.enterprise_id.is_empty() {
+        headers.insert("X-No-Enterprise-Id".into(), "1".into());
+    } else {
+        // billing 侧 tenant 恒等于 enterprise（chat 侧才允许 tenant 单独覆盖）。
+        headers.insert("X-Enterprise-Id".into(), p.enterprise_id.into());
+        headers.insert("X-Tenant-Id".into(), p.enterprise_id.into());
+    }
+    if p.realm == "cn" {
+        headers.insert("X-Product".into(), "SaaS".into());
+    }
+    if let Some(token) = p.device_token.map(str::trim).filter(|t| !t.is_empty()) {
+        headers.insert("X-Device-Token".into(), token.into());
+    }
+    headers
+}
+
 /// build_identity_headers 的输入，字段名对齐 wb_identity.py 参数表。
 pub struct IdentityParams<'a> {
     pub product: &'a str,
@@ -353,5 +439,98 @@ mod tests {
         assert!(!none.contains_key("X-Device-Token"));
         let some = chat_request_headers(&chat_params("intl", Some("  dt-1  ")));
         assert_eq!(some["X-Device-Token"], "dt-1");
+    }
+
+    // ---- billing 头（Account.headers(purpose="billing")） ----
+
+    #[test]
+    fn generate_request_id_shape_matches_python() {
+        // 前 32 位是 derive_id(uid, "req")，后缀是纳秒数 % 1e6 补零到 6 位
+        let id = generate_request_id("u1", 123_456_789);
+        assert_eq!(id.len(), 32 + 1 + 6);
+        assert_eq!(&id[..32], derive_id("u1", "req"));
+        assert_eq!(&id[33..], "456789");
+        // 尾数不足 6 位要补零（Python zfill(6)）
+        let small = generate_request_id("u1", 42);
+        assert_eq!(&small[33..], "000042");
+        // 取模：纳秒数溢出百万位只保留后 6 位
+        assert_eq!(&generate_request_id("u1", 1_000_042)[33..], "000042");
+    }
+
+    fn billing_params<'a>(
+        realm: &'a str,
+        domain: &'a str,
+        enterprise_id: &'a str,
+    ) -> BillingHeadersParams<'a> {
+        BillingHeadersParams {
+            uid: "u1",
+            token: "tok",
+            realm,
+            domain,
+            enterprise_id,
+            device_token: None,
+        }
+    }
+
+    #[test]
+    fn billing_headers_cn_matches_python() {
+        let h = billing_request_headers(&billing_params("cn", "", ""));
+        assert_eq!(h["Content-Type"], "application/json");
+        assert_eq!(h["Accept"], "application/json, text/plain, */*");
+        assert_eq!(h["X-Requested-With"], "XMLHttpRequest");
+        // 轻量 UA，不是 chat 那串产品串
+        assert_eq!(h["User-Agent"], "WorkBuddy/5.5.6");
+        assert_eq!(h["Origin"], "https://www.codebuddy.cn");
+        assert_eq!(h["Referer"], "https://www.codebuddy.cn/");
+        assert_eq!(h["Authorization"], "Bearer tok");
+        assert_eq!(h["X-User-Id"], "u1");
+        // domain 空串时回落 cfg.domain
+        assert_eq!(h["X-Domain"], "copilot.tencent.com");
+        assert_eq!(h["X-CodeBuddy-Request"], "1");
+        assert_eq!(h["Accept-Language"], "zh-CN");
+        assert_eq!(h["X-Machine-ID"], "1c77b9ac7fdc6e92cc94595f68a05717");
+        assert_eq!(h["X-Session-ID"], "d4bf0937989e4311fdd68b54baf87841");
+        // 无企业 → X-No-Enterprise-Id，且不下发 Enterprise/Tenant
+        assert_eq!(h["X-No-Enterprise-Id"], "1");
+        assert!(!h.contains_key("X-Enterprise-Id"));
+        assert!(!h.contains_key("X-Tenant-Id"));
+        // cn 才带 X-Product: SaaS
+        assert_eq!(h["X-Product"], "SaaS");
+        // 计费端点不吃 chat 身分头
+        assert!(!h.contains_key("X-IDE-Type"));
+        assert!(!h.contains_key("X-Agent-Intent"));
+        assert!(!h.contains_key("X-Product-Version"));
+        // request-id 前缀稳定、后缀 6 位数字
+        let rid = &h["X-Request-ID"];
+        assert_eq!(&rid[..32], derive_id("u1", "req"));
+        assert_eq!(rid.len(), 39);
+    }
+
+    #[test]
+    fn billing_headers_intl_and_overrides() {
+        let h = billing_request_headers(&billing_params("intl", "www.workbuddy.ai", ""));
+        assert_eq!(h["User-Agent"], "WorkBuddy/5.5.2");
+        assert_eq!(h["Origin"], "https://www.workbuddy.ai");
+        assert_eq!(h["Accept-Language"], "en-US");
+        // intl 不打 X-Product
+        assert!(!h.contains_key("X-Product"));
+
+        // 账号自带 domain 优先
+        let d = billing_request_headers(&billing_params("cn", " custom.example.com ", ""));
+        assert_eq!(d["X-Domain"], "custom.example.com");
+
+        // 有企业：Enterprise/Tenant 同时下发（billing 侧 tenant 恒等于 enterprise）
+        let e = billing_request_headers(&billing_params("cn", "", "ent-1"));
+        assert_eq!(e["X-Enterprise-Id"], "ent-1");
+        assert_eq!(e["X-Tenant-Id"], "ent-1");
+        assert!(!e.contains_key("X-No-Enterprise-Id"));
+    }
+
+    #[test]
+    fn billing_headers_device_token_optional() {
+        let mut p = billing_params("cn", "", "");
+        assert!(!billing_request_headers(&p).contains_key("X-Device-Token"));
+        p.device_token = Some("  dt-1  ");
+        assert_eq!(billing_request_headers(&p)["X-Device-Token"], "dt-1");
     }
 }
