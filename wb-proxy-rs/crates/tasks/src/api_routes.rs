@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use serde_json::{json, Value};
 
@@ -21,8 +21,7 @@ use wb_storage::read_idempotent_fields;
 
 use crate::checkin::production_billing_base;
 use crate::claim_all::{self, route_claim_all, uid8, ClaimAllDeps, ClaimAllRequest};
-use crate::growth_api::TaskAccount;
-use crate::growth_api::TaskEndpoints;
+use crate::growth_api::{accept_tasks, claim_task, fetch_growth_tasks, TaskAccount, TaskEndpoints};
 use crate::growth_runner::{
     build_cat_travel, run_growth_tasks, CatTravel, RunnerAccount, RunnerCtx, RunnerDeps, RunnerEnv,
 };
@@ -190,7 +189,9 @@ impl TaskRuntime {
             scheduler: OnceLock::new(),
         });
 
-        let exec: Arc<dyn CycleExecutor> = Arc::new(ProductionExecutor { task: task.clone() });
+        let exec: Arc<dyn CycleExecutor> = Arc::new(ProductionExecutor {
+            task: Arc::downgrade(&task),
+        });
         let _ = task.exec.set(exec.clone());
 
         let exec_ref: &'static dyn CycleExecutor = unsafe {
@@ -237,10 +238,42 @@ impl TaskRuntime {
     pub fn scheduler(&self) -> Option<Arc<Scheduler<'static>>> {
         self.scheduler.get().cloned()
     }
+
+    /// 仅供契约测试：构建指向 mock base 的运行时，直接注入 ready 账号，
+    /// 并返回其 `exec`（ProductionExecutor）。`runtime` 被 `forget` 以保持
+    /// `ProductionExecutor` 内部的 `Weak<TaskRuntime>` 在整个测试期间有效。
+    pub fn test_with_ready(
+        ready: Vec<ReadyAccount>,
+        endpoints: TaskEndpoints<'static>,
+        panel: Arc<dyn PanelSink>,
+    ) -> Arc<dyn CycleExecutor> {
+        let runtime = Arc::new(TaskRuntime {
+            accounts_dir: PathBuf::new(),
+            pool: vec![],
+            pool_present: false,
+            ready,
+            cache: Arc::new(SnapshotCache::with_ttl(0.0)),
+            billing_base: String::new(),
+            endpoints,
+            client: UpstreamClient::new(),
+            clock: LocalClock,
+            schedule_clock: LocalScheduleClock,
+            sleeper: RealSleeper,
+            panel,
+            exec: OnceLock::new(),
+            scheduler: OnceLock::new(),
+        });
+        let exec = Arc::new(ProductionExecutor {
+            task: Arc::downgrade(&runtime),
+        });
+        let _ = runtime.exec.set(exec.clone());
+        std::mem::forget(runtime);
+        exec
+    }
 }
 
 struct ProductionExecutor {
-    task: Arc<TaskRuntime>,
+    task: Weak<TaskRuntime>,
 }
 
 impl CycleExecutor for ProductionExecutor {
@@ -254,7 +287,7 @@ impl CycleExecutor for ProductionExecutor {
         &'a self,
         acc: &'a AccountView,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>> {
-        let task = self.task.clone();
+        let task = self.task.upgrade().expect("runtime alive");
         Box::pin(async move {
             let ra = task.ready.iter().find(|r| r.state.uid == acc.uid);
             let ra = match ra {
@@ -285,7 +318,7 @@ impl CycleExecutor for ProductionExecutor {
         &'a self,
         acc: &'a AccountView,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>> {
-        let task = self.task.clone();
+        let task = self.task.upgrade().expect("runtime alive");
         Box::pin(async move {
             let ra = task.ready.iter().find(|r| r.state.uid == acc.uid);
             let ra = match ra {
@@ -320,7 +353,7 @@ impl CycleExecutor for ProductionExecutor {
         &'a self,
         acc: &'a AccountView,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>> {
-        let task = self.task.clone();
+        let task = self.task.upgrade().expect("runtime alive");
         Box::pin(async move {
             let ra = task.ready.iter().find(|r| r.state.uid == acc.uid);
             let ra = match ra {
@@ -342,30 +375,176 @@ impl CycleExecutor for ProductionExecutor {
     }
     fn streak_bonus<'a>(
         &'a self,
-        _acc: &'a AccountView,
+        acc: &'a AccountView,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>> {
+        let task = self.task.upgrade().expect("runtime alive");
         Box::pin(async move {
-            json!({"ok": false, "error": "streak_bonus not implemented in rust port yet"})
+            let ra = task.ready.iter().find(|r| r.state.uid == acc.uid);
+            let ra = match ra {
+                Some(r) => r,
+                None => {
+                    return json!({"ok": false, "error": "account not found"});
+                }
+            };
+            let runner_acc = ra.runner_account();
+            let url = format!("{}/activity/growth/streak/claim", task.endpoints.chat_base);
+            let empty = json!({});
+            match task
+                .client
+                .post(&url, runner_acc.api.chat_headers, &empty)
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                    Ok(d) if d.get("code").and_then(Value::as_i64) == Some(0) => {
+                        let data = d.get("data").cloned().unwrap_or(json!({}));
+                        let logs = data
+                            .get("logs")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        json!({"ok": true, "logs": logs})
+                    }
+                    Ok(d) => {
+                        let msg = d
+                            .get("msg")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "code={}",
+                                    d.get("code").map(|c| c.to_string()).unwrap_or_default()
+                                )
+                            });
+                        json!({"ok": false, "error": msg})
+                    }
+                    Err(e) => json!({"ok": false, "error": format!("streak bonus failed: {e}")}),
+                },
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    json!({
+                        "ok": false,
+                        "error": format!("HTTP {}: {}", status.as_u16(), text)
+                    })
+                }
+                Err(e) => json!({"ok": false, "error": format!("streak bonus failed: {e}")}),
+            }
         })
     }
     fn night_growth<'a>(
         &'a self,
-        _acc: &'a AccountView,
+        acc: &'a AccountView,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>> {
+        let task = self.task.upgrade().expect("runtime alive");
         Box::pin(async move {
-            json!({"ok": false, "error": "night_growth not implemented in rust port yet"})
+            let ra = task.ready.iter().find(|r| r.state.uid == acc.uid);
+            let ra = match ra {
+                Some(r) => r,
+                None => {
+                    return json!({"ok": false, "error": "account not found", "logs": []});
+                }
+            };
+            let account = ra.creds.as_task_account();
+            let ep = &task.endpoints;
+            let mut logs: Vec<String> = Vec::new();
+            let mut credit: i64 = 0;
+
+            let tasks = fetch_growth_tasks(&task.client, &account, ep).await;
+            let night_tasks: Vec<&GrowthTask> = tasks
+                .iter()
+                .filter(|t| crate::NIGHT_TASK_CODES.contains(&t.task_code.as_str()))
+                .collect();
+
+            if night_tasks.is_empty() {
+                return json!({"ok": true, "logs": [], "credit": 0});
+            }
+
+            for nt in night_tasks {
+                if nt.status == "not_accepted" {
+                    let codes = vec![nt.task_code.clone()];
+                    accept_tasks(&task.client, &account, &codes, 20, ep).await;
+                    let tasks2 = fetch_growth_tasks(&task.client, &account, ep).await;
+                    if let Some(nt2) = tasks2.iter().find(|t| t.task_code == nt.task_code) {
+                        if nt2.status == "completed" {
+                            let claim = claim_task(&task.client, &account, &nt.task_code, ep).await;
+                            if claim.ok {
+                                credit += claim.credit;
+                                logs.push("领奖成功".into());
+                            } else {
+                                logs.push(format!("领奖失败: {}", claim.msg.unwrap_or_default()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            json!({"ok": true, "logs": logs, "credit": credit})
         })
     }
     fn daily_chat<'a>(
         &'a self,
-        _acc: &'a AccountView,
+        acc: &'a AccountView,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>> {
+        let task = self.task.upgrade().expect("runtime alive");
         Box::pin(async move {
-            json!({"ok": false, "error": "daily_chat not implemented in rust port yet"})
+            let ra = task.ready.iter().find(|r| r.state.uid == acc.uid);
+            let ra = match ra {
+                Some(r) => r,
+                None => {
+                    return json!({"ok": false, "error": "account not found"});
+                }
+            };
+            let runner_acc = ra.runner_account();
+            let url = format!("{}/v2/activity/daily-chat", task.endpoints.chat_base);
+            let empty = json!({});
+            match task
+                .client
+                .post(&url, runner_acc.api.chat_headers, &empty)
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                    Ok(d) if d.get("code").and_then(Value::as_i64) == Some(0) => {
+                        let msg = d
+                            .get("msg")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        json!({"ok": true, "msg": msg})
+                    }
+                    Ok(d) => {
+                        let msg = d
+                            .get("msg")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "code={}",
+                                    d.get("code").map(|c| c.to_string()).unwrap_or_default()
+                                )
+                            });
+                        json!({"ok": false, "error": msg})
+                    }
+                    Err(e) => json!({"ok": false, "error": format!("daily chat failed: {e}")}),
+                },
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    json!({
+                        "ok": false,
+                        "error": format!("HTTP {}: {}", status.as_u16(), text)
+                    })
+                }
+                Err(e) => json!({"ok": false, "error": format!("daily chat failed: {e}")}),
+            }
         })
     }
     fn accounts(&self) -> Vec<AccountView> {
-        self.task.ready.iter().map(|r| r.view.clone()).collect()
+        let task = self.task.upgrade().expect("runtime alive");
+        task.ready.iter().map(|r| r.view.clone()).collect()
     }
 }
 
