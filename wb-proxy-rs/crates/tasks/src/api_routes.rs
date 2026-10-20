@@ -952,16 +952,45 @@ pub async fn route_tasks_streak_bonus(task: &TaskRuntime, payload: &Value) -> Va
         v
     };
 
+    let exec = match task.exec() {
+        Some(e) => e,
+        None => return json!({"ok": false, "msg": "executor unavailable"}),
+    };
+    let exec_ref: &'static dyn CycleExecutor = unsafe {
+        std::mem::transmute::<&dyn CycleExecutor, &'static dyn CycleExecutor>(exec.as_ref())
+    };
+
     let mut results: Vec<Value> = Vec::new();
+    let mut all_ok = true;
     for ra in &targets {
         let nick = ra
             .nickname
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uid8(&ra.state.uid));
-        results.push(json!({"uid": ra.state.uid, "nickname": nick, "ok": false, "msg": "streak bonus not implemented in rust port yet"}));
+        let res = exec_ref.streak_bonus(&ra.view).await;
+        let ok = res.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        if !ok {
+            all_ok = false;
+        }
+        let msg = res
+            .get("msg")
+            .or(res.get("error"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+        results.push(json!({"uid": ra.state.uid, "nickname": nick, "ok": ok, "msg": msg}));
     }
-    json!({"ok": false, "msg": "streak bonus not implemented in rust port yet", "results": results, "accounts_count": targets.len()})
+    json!({
+        "ok": all_ok,
+        "msg": if all_ok {
+            "streak bonus completed"
+        } else {
+            "streak bonus partially failed"
+        },
+        "results": results,
+        "accounts_count": targets.len()
+    })
 }
 
 pub async fn route_tasks_claim_all(task: &TaskRuntime, payload: &Value) -> Value {
