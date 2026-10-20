@@ -84,7 +84,7 @@ spec：`docs/superpowers/specs/2026-10-15-rust-refactor-design.md`（:40 tasks �
 14. **`can_report_activity`**（:1371-1380）：仅 cn + 非企业版 + `last_activity_report` 日期前缀判定。
 15. **`report_activity`**（:1643-1670）：`build_event(self, "chat")` → `report_events`，非 `code=0` → `{"ok":False,"error":"活跃上报被上游拒绝（未返回 code=0）"}`；成功才写 `last_activity_report` 并落盘；随后读 `fetch_streak_days` 拼尾部（None → 「连登天数未知」，`<=0` → 「可能被上游静默丢弃」，否则「连续打卡 N 天」）。事件**必须带 `userId`**，否则上游 200 静默丢弃。
 16. **`fetch_streak_days`**（:189-203）：失败返回 `None` 并记日志 `fetch_streak_days failed: {exc}`；**`None` 与 `0` 语义不同**，不得合并。
-17. **`daily_chat_granted_today` / `can_daily_chat`**（:1329-1369）：先查**服务器快照** `self.credits.packages[]`（name 含 `bonus`、`size ∈ {30.0, 50.0}`、`grant_reason` 为空、`create_time` 为今天），再查本地 `last_daily_chat` 日期前缀。→ Rust claim-all 的 intl 分支需要先有 credits 快照（M5 字段），本轮按 M4-b 占位。
+17. **`daily_chat_granted_today` / `can_daily_chat`**（:1336-1436）：判「今天是否已完成一次**计入官方每日活跃**的对话」，**以本地证据为准**：`last_daily_chat` 日期前缀（只有网页腿真正跑完才写），外加活动历史里今天「网页通道 completed」的成功记录（账号文件写盘失败时的兜底）。上游 `self.credits.packages[]`（name 含 `bonus`、`size ∈ {30.0, 50.0}`、`grant_reason` 为空）**只作兜底，且必须走 D+1 口径**：对话发生在 D 天，奖励包的 `create_time` 落在 D+1 天，「今天的包」是**昨天**的结算，不能拿来判「今天已完成」—— 那会让账号隔天才拿一包（今天被昨天的包挡住 → 今天没有对话 → 明天没有包）。2026-10-20 逐包核对 20 个 30/50 包：19 个的前一日有成功对话，20/20 的发放时刻都早于当日首次成功对话。→ Rust claim-all 的 intl 分支需要先有 credits 快照（M5 字段），本轮按 M4-b 占位；若届时从快照取值，只能查**明天**日期的包。
 
 ### C. claim-all 编排（wb_proxy.py）
 

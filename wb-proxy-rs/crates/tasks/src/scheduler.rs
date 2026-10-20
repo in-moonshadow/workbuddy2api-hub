@@ -269,7 +269,15 @@ pub struct AccountView {
     pub last_activity_report: Option<String>,
     /// 上次国际活跃对话时间（`lastDailyChat`）。
     pub last_daily_chat: Option<String>,
-    /// 积分快照里今天是否已出现每日活跃奖励包（`daily_chat_granted_today()`）。
+    /// 今天是否已完成一次**计入官方每日活跃**的对话（`daily_chat_granted_today()`）。
+    ///
+    /// ⚠️ 上游奖励包跨日发放：对话发生在 D 天，奖励包的 `create_time` 落在 D+1
+    /// 天（2026-10-20 逐包核对 20 个 30/50 包：19 个的前一日有成功对话，且
+    /// 20/20 的发放时刻都早于当日首次成功对话）。所以**不能**拿「积分快照里有
+    /// 今天的奖励包」判「今天已完成」—— 那是**昨天**的结算，拿它拦截会让账号
+    /// 隔天才拿一包（今天被昨天的包挡住 → 今天没有对话 → 明天没有包）。
+    /// 本字段应由调用方按本地证据（`last_daily_chat` / 活动历史）填；若将来要
+    /// 从 credits 快照填，必须走 D+1 口径（查**明天**日期的包）。
     pub daily_chat_granted_today: bool,
 }
 
@@ -325,8 +333,9 @@ impl AccountView {
         )
     }
 
-    /// `acc.can_daily_chat()`（`wb_accounts.py:1359-1369`）：
-    /// 非 intl ⇒ 否；积分包已证明今天发过 ⇒ 否；否则看 `lastDailyChat` 是否今天。
+    /// `acc.can_daily_chat()`（`wb_accounts.py:1428`）：
+    /// 非 intl ⇒ 否；今天已完成（`daily_chat_granted_today`）⇒ 否；否则看
+    /// `lastDailyChat` 是否今天。
     pub fn can_daily_chat(&self, today: &str) -> bool {
         if self.realm != "intl" {
             return false;

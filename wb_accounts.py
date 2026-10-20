@@ -1,5 +1,6 @@
 import re
 import base64
+import datetime
 import json
 import os
 import ssl
@@ -52,6 +53,12 @@ DAILY_CHAT_WEB_PROMPT = "Hi"
 _DAILY_CHAT_CHANNEL_RE = re.compile(r'"code"\s*:\s*"?11128"?')
 #: 网页通道一轮最多等多久（秒）。实测一次「Hi」十几秒就跑完，留足余量。
 WEB_TURN_TIMEOUT = int(os.environ.get("WB_WEB_TURN_TIMEOUT") or "120")
+#: 网页腿真正跑完时，daily_chat 的 msg 里会出现「网页通道 completed」；网页腿失败
+#: 时是「网页通道失败」。活动历史里 ok=True 但消息不是这个形态的尝试（桌面腿成功、
+#: 网页腿失败）并没有计入官方每日活跃，不能当成「今天已完成」—— 当成已完成会让
+#: 当天的 30/50 积分静默丢掉（这正是网页腿失败必须继续重试的原因）。判不出来就
+#: 当作没做：方向是「宁可多做，不要漏做」。
+DAILY_CHAT_WEB_OK_MARK = "网页通道 completed"
 
 
 def _retryable(exc):
@@ -1327,19 +1334,81 @@ class Account(object):
         return not str(self.last_checkin).startswith(today_str)
 
     def daily_chat_granted_today(self):
-        """积分快照里是否已出现**今天**的每日活跃奖励包。
+        """今天是否已经完成过一次**计入官方每日活跃**的对话。
 
-        `self.credits` 是 `fetch_credits()` 刷新的本地快照，读它不发上游请求
-        （与 `can_daily_chat()` 作为纯判断函数的定位相符）。判定口径与看板
-        `/accounts/credits/grants` 摊平出来的行一致：包名含 bonus、面额
-        30/50、grant_reason 为空、发放时间是今天。快照缺失或结构异常一律
-        当作「没有」，由调用方回落到本地记录。
+        上游发奖跨日：对话发生在 D 天，奖励包的 create_time 落在 D+1 天。
+        2026-10-20 逐包核对 20 个 30/50 奖励包：19 个的前一日有成功对话，
+        且 20/20 的发放时刻都早于当日首次成功对话（唯一例外是 42203090215
+        的 10-18 包，对应它 10-17 那次「客户端报 11128、上游仍然计数」的对话，
+        反过来印证 D+1）。所以「今天的包」说的是**昨天**的对话已结算；拿它去
+        挡今天的对话，会让每个账号隔天才拿一包：今天被昨天的包挡住 → 今天
+        没有对话 → 明天没有包 → 循环卡住。
+
+        能证明「今天已被上游记账」的包日期是**明天**，当天根本看不到，所以同日
+        判定只能落在本地证据上：
+
+        1. `last_daily_chat` 落盘标记：只有网页腿真正跑完（= 计入官方每日活跃
+           的那条腿）时才写；桌面腿成功但网页腿失败不写。
+        2. 活动历史里今天该账号「网页通道 completed」的成功记录：账号文件写盘
+           失败时 `last_daily_chat` 会丢，这条兜底。
+        3. 上游积分包只作兜底，且按 D+1 口径读：出现**明天**日期的 30/50 奖励
+           包才说明今天的对话已被记账（当前上游行为下当天不可见，这道护栏基本
+           不命中；上游若改成同日发奖，它会漏判，方向是多跑一次，不是漏做）。
+
+        读不到/结构异常一律当作「没做」——宁可多做一次，不要漏做。
+        """
+        today = datetime.date.today()
+        if str(self.last_daily_chat or "").startswith(today.isoformat()):
+            return True
+        if self._daily_chat_history_done_today():
+            return True
+        return self._has_bonus_package_dated(
+            (today + datetime.timedelta(days=1)).isoformat())
+
+    def _daily_chat_history_done_today(self):
+        """活动历史里今天是否已有一次**网页腿真的跑完**的每日活跃对话。
+
+        `last_daily_chat` 是账号文件里的落盘标记；写盘失败时标记会丢，于是当天
+        后续每次巡检都会重跑一次完整对话（白耗账号积分）。活动历史是同一件事
+        的另一份落盘（先写历史，再写账号文件），用它兜底。
+
+        历史里的 ok=True 不等于「计入了官方每日活跃」：桌面腿成功但网页腿失败
+        的那次尝试同样是 ok=True，而只有网页腿跑完才计入 30/50 积分 —— 把它
+        当成已完成会让当天的积分静默丢掉（网页腿失败必须继续重试，正是这个
+        原因）。所以只认消息里带「网页通道 completed」的记录；网页腿失败时
+        消息里是「网页通道失败」，认不出来就当作没做。
+
+        读历史失败/结构异常一律当作「没做」，绝不因它抛错。
+        """
+        if not self.uid:
+            return False
+        try:
+            out = wb_activity.query(range_key="today", uid=self.uid,
+                                    task=wb_activity.TASK_DAILY_CHAT,
+                                    result="ok", limit=50)
+        except Exception:
+            return False
+        rows = out.get("rows") if isinstance(out, dict) else None
+        if not isinstance(rows, (list, tuple)):
+            return False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if DAILY_CHAT_WEB_OK_MARK in str(row.get("message") or ""):
+                return True
+        return False
+
+    def _has_bonus_package_dated(self, date_str):
+        """积分快照里有没有 create_time 落在 date_str 那天的每日活跃奖励包。
+
+        判定口径与看板 `/accounts/credits/grants` 摊平出来的行一致：包名含
+        bonus、面额 30/50、grant_reason 为空。`self.credits` 是 `fetch_credits()`
+        刷新的本地快照，读它不发上游请求；快照缺失或结构异常一律当作「没有」。
         """
         credits = self.credits if isinstance(self.credits, dict) else {}
         packages = credits.get("packages")
         if not isinstance(packages, (list, tuple)):
             return False
-        today_str = time.strftime("%Y-%m-%d")
         for pkg in packages:
             if not isinstance(pkg, dict):
                 continue
@@ -1352,21 +1421,19 @@ class Account(object):
                 continue
             if str(pkg.get("grant_reason") or "").strip():
                 continue
-            if str(pkg.get("create_time") or "").startswith(today_str):
+            if str(pkg.get("create_time") or "").startswith(date_str):
                 return True
         return False
 
     def can_daily_chat(self):
         if self.realm != "intl":
             return False
-        # 服务端快照优先：积分包已证明今天发过活跃奖励，就别再跑一次
-        # （跑一次要真起一个 agent 会话、消耗该账号少量积分）。
+        # 今天已经有一次计入官方每日活跃的对话就别再跑一次（跑一次要真起一个
+        # agent 会话、消耗该账号少量积分）。判据见 daily_chat_granted_today()：
+        # 本地落盘标记与活动历史为准，上游奖励包按 D+1 口径只作兜底。
         if self.daily_chat_granted_today():
             return False
-        if not self.last_daily_chat:
-            return True
-        today_str = time.strftime("%Y-%m-%d")
-        return not str(self.last_daily_chat).startswith(today_str)
+        return True
 
     def can_report_activity(self):
         """国内版每天一次的对话活跃上报（点亮 growth 连登）是否还没做过。"""
