@@ -33,6 +33,9 @@ pub mod checkin;
 // [`scheduler::CycleExecutor`] 与 `growth_tasks` 接缝注入，测试不发真实请求。
 pub mod api_routes;
 pub mod claim_all;
+// 关卡 4.14：国际版每日活跃（daily_chat）——桌面腿 + 网页腿 ACP 会话。
+// 权威源是 `wb_accounts.py:1449-1661`；ACP 协议在 `wb_gateway::acp`。
+pub mod daily_chat;
 pub mod events;
 pub mod growth_api;
 pub mod growth_runner;

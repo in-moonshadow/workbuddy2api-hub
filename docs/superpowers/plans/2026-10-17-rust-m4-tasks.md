@@ -214,6 +214,38 @@ return {"ok": (code == 0 or code == 10001), ...}   # ← 之后才判成败
 - 更新本文件「实施状态」小节；跑三项验证。
 - 产出物：`cargo test --workspace` / `fmt --check` / `clippy -D warnings` 的**实测输出原文**写入账本（非推断数字）。
 
+### 关卡 4.12：端点按账号身份选择（`daily_chat` 前置）
+- 现状缺陷：Rust 侧成长任务用国内版常量（`events.rs:25 CHAT_BASE`），国际版账号的每日活跃会打到 `copilot.tencent.com`；旧的 `ProductionExecutor::daily_chat` 打的是**臆造端点** `/v2/activity/daily-chat`（Python 全仓 0 命中）。
+- 做法：新增 `crates/tasks/src/daily_chat.rs`，端点由 `wb_gateway::endpoints::chat_base_url(realm, product)` 按**账号身份**解析（国际版 → `https://www.workbuddy.ai`），不新增任何端点常量。
+- 产出物：`DailyChatConfig::resolved_chat_base` 的单元测试（国际版 → `www.workbuddy.ai`；国内版 → `copilot.tencent.com`，证明是按身份解析而非写死）。
+
+### 关卡 4.13：网页腿 ACP 会话（`wb_webagent.py` → `wb_gateway::acp`）
+- 移植 Python `wb_webagent.py`（258 行）到 `crates/gateway/src/acp.rs`：`PROTOCOL_VERSION=1`、clientCapabilities、GET `<link>`（SSE + `Acp-Connection-Id`）、POST JSON-RPC 三步（`initialize` / `session/load` / `session/prompt`）、按 `poll_interval` 轮询到 `completed`。
+- **放在 wb-gateway 而非 wb-tasks**：wb-tasks 刻意无 HTTP 依赖（`Cargo.toml` 注释：「契约类型全为 serde_json::Value / 纯数据；无任何 HTTP 依赖（HTTP 由 wb-gateway 提供）」）。
+- Python 的 `poll_status` 是同步闭包，Rust 需异步 → 用 boxed future 的 `PollStatus` 类型别名表达同一语义。
+- 产出物：`cargo test -p wb-gateway acp` = 10 passed / 0 failed。
+
+### 关卡 4.14：国际版 `daily_chat` 两腿编排
+- 桌面腿：`POST {chat_base}/v2/chat/completions`，body 逐字照抄 Python（`model` / `messages` / `stream` / `max_tokens` / `reasoning_effort`）再过 `wb_gateway::body::build_upstream_body`。
+- 渠道校验（`"code": 11128`）命中 → **降级**：网页腿单独跑，不判失败。
+- 网页腿：建会话 → 取沙箱 `link`/`token` → `acp::run_turn` → 轮询到 `completed`。
+- **`lastDailyChat` 只在网页腿真的跑完时写**（Python :1650-1656）；桌面腿成功但网页腿失败时**不写**，当天后续巡检才能重试。
+- `daily_chat_web` 开关读 `accounts_dir/settings.json`（默认开，对齐 `wb_settings.py:1200`）。
+- 产出物：`crates/tasks/tests/contract_daily_chat.rs` 全绿（10 条：两腿成功写盘 / 网页腿失败不写盘 / 11128 降级 / 11128+网页失败 / 桌面腿其他失败不跑网页腿 / 非国际版拒绝 / 关网页腿走旧语义 / 请求体逐字对齐 Python / 账号不找到不发请求 / 写盘后账号视图刷新）。
+
+### 关卡 4.15：账本 + 全 workspace 验证
+- 更新本文件「实施状态」小节；跑三项验证。
+- 产出物：`cargo test --workspace` / `fmt --check` / `clippy -D warnings` 的**实测输出原文**写入账本（非推断数字）。
+
+### 关卡 4.16：M4-b 代码评审修复（出站超时 + 4 处语义补齐）
+- **M1（必须修）**：出站 HTTP 无限时 ⇒ 上游一次挂起就把巡检循环卡死。给 `UpstreamClient` 加**带时限的变体**（`post_with_timeout` / `get_with_timeout`），既有 `post` / `get` 一字不动（M3 流式聊天要把响应体转给用户，总时限会腰斩长回答）；daily_chat + ACP 链路的缓冲型调用全部切到带时限的变体。
+- **S1**：上游的会话 id 可能不是字符串（Python `str(conversation)` 拼 URL）⇒ 接受数字，URL 用字符串形态、结果里保留上游原值。
+- **S2**：ACP 轮询循环退出后**补查一次状态**（Python `wb_webagent.py:249-253`）——漏查会把「刚跑完但轮询没赶上」的会话判成超时。
+- **S3**：ACP 的 SSE 建链必须**恰好 HTTP 200**（Python `if resp.status != 200`，不是 `is_success()`）。
+- **S5**：补契约用例（数字型 id、损坏的 `settings.json`）。
+- **S4**：记为 **M5 待办**（Python 的两个手动端点 Rust 侧尚无）。
+- 产出物：见「实施状态」小节末尾的关卡 4.16 记录。
+
 ## 约束
 
 - 本文件之外不动任何代码；等用户审阅本计划并明确授权后才开工。
@@ -672,3 +704,131 @@ _下一关：4.9 claim-all 编排（`ordered = intl_targets + cn_targets`、错�
 - 未提交；按计划约束「commit 与推送逐次确认」，由用户逐次批准后再提交。
 
 _下一关：M4-b（`run_streak_bonus` 内部 4 步、`do_cat_travel`、`run_night_growth`、intl `daily_chat` 网页腿；`CreditsRefresher` / `PriceRefresher` / `UpdateChecker`、面板/设置/用量端点归 M5 或后续里程碑）。_
+
+### 关卡 4.12 / 4.13 / 4.14 / 4.15：M4-b 国际版每日活跃（daily_chat）— 已完成（2026-10-20）
+
+**授权**：用户 2026-10-20 选定「收口 M4-b 语义缺口（推荐）」+「移植网页腿 ACP 会话（推荐）」。范围三条：①端点按 realm/product 选（不再用 CN 常量打国际版）②移植 Python 网页腿 ACP 会话（`wb_webagent.py`）③更新 M4 账本。
+
+**1. 本关产出物**
+
+| 产出物 | 位置 | 复核方式（实测） |
+|---|---|---|
+| ACP 会话客户端 | `crates/gateway/src/acp.rs`（新增） | `cargo test -p wb-gateway acp` = 10 passed / 0 failed |
+| 每日活跃两腿编排 | `crates/tasks/src/daily_chat.rs`（新增） | `cargo test -p wb-tasks --lib daily_chat` = 7 passed / 0 failed |
+| 端点按身份解析 | `daily_chat.rs` → `DailyChatConfig::resolved_chat_base` | 单元测试：国际版 → `www.workbuddy.ai`；国内版 → `copilot.tencent.com` |
+| 执行器接线（替换臆造端点） | `crates/tasks/src/api_routes.rs` → `ProductionExecutor::daily_chat` | `cargo test -p wb-tasks --test contract_daily_chat` = 10 passed / 0 failed |
+| 契约测试（重写） | `crates/tasks/tests/contract_daily_chat.rs` | 10 条用例全绿 |
+
+**2. 三项验证实测输出（原文，非推断）**
+
+```
+$ cargo fmt --all -- --check
+FMT_OK
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+
+$ cargo test --workspace
+passed=544 failed=0
+```
+
+分项：`cargo test -p wb-gateway acp` = 10 passed；`cargo test -p wb-tasks --lib daily_chat` = 7 passed；`cargo test -p wb-tasks --test contract_daily_chat` = 10 passed。
+
+**3. 修复前的三处缺陷（逐条对照 Python）**
+
+| # | 缺陷 | 证据 | 现状 |
+|---|---|---|---|
+| B1 | 臆造端点 `POST {chat_base}/v2/activity/daily-chat` | Python 全仓 0 命中 | 已换成 `POST {chat_base}/v2/chat/completions` |
+| B2 | 端点用国内版常量 | `crates/tasks/src/events.rs:25 CHAT_BASE` | 已改成 `wb_gateway::endpoints::chat_base_url(realm, product)` 按账号身份解析 |
+| B3 | 没有网页腿（ACP 会话） | Python `wb_webagent.py` 258 行 | 已移植到 `wb_gateway::acp` 并接入 `daily_chat` 两腿编排 |
+
+**4. 差异清单（本关新增）**
+
+| # | 差异 | 来源 | 影响 | 处理 |
+|---|---|---|---|---|
+| D16 | 桌面腿成功后不刷新积分快照 | Python `_daily_chat_upstream` 成功后调 `fetch_credits()` | 面板积分仍是旧快照 | **M5**（Rust 侧无 credits 抓取） |
+| D17 | 不写活动历史 | Python `wb_activity.record_attempt` | 面板缺「每日活跃」流水行 | **M5**（Rust 侧无 activity store） |
+| D18 | 429/6004 不记模型 cap | Python `_note_daily_chat_cap` | 同模型窗口满时仍反复重试 | **M5**（`notes::note_model_cap` 已有，接线未做） |
+| D19 | 每账号 HTTP 代理未支持 | Python `Account.proxy` 逐请求走代理 | Rust 全部直连 | 后续里程碑（Rust 侧尚无代理配置项） |
+| D20 | `accounts()` 每轮重读幂等字段 | 本关新加 | 修正「写盘后内存视图仍是旧值 → 同一账号当天反复跑每日活跃」 | 有意修复，已加注释 |
+| D21 | `acp::run_turn` 加 `#[allow(clippy::too_many_arguments)]` | 本关新加 | 10 个入参照抄 Python 签名 | 与 `crates/gateway/src/notes.rs:105` 一致 |
+| D22 | `is_channel_blocked` 未锚定 | 与 Python 正则一致（`111280` 也会命中） | 极少数误判成渠道拦截 | 与 Python 一致，**故意不**「修正」 |
+| D23 | 失败返回体多一个 `persist_error` 键 | 与 `checkin::CheckinOutcome` 一致 | 落盘失败可见 | 有意差异 |
+
+**5. 与 Python 语义对齐的关键点（易踩坑，务必保留）**
+
+- **`lastDailyChat` 只在网页腿成功时写**：桌面腿成功 + 网页腿失败 → **不写**（Python :1650-1656 明确注释：否则当天 30/50 积分静默丢掉且不再重试，面板还显示成功）。契约用例 `desktop_success_web_failure_does_not_write_last_daily_chat` 钉住这一点。
+- **`code: 11128` 是降级不是失败**（Python :1620-1656）：命中就把桌面腿记成「这一腿没走成」，网页腿单独跑。
+- **`daily_chat_web` 默认开**（`wb_settings.py:1200`：`value is None → True`；非 JSON `true` 的值一律算关）。
+- **奖励包跨日发放（D+1）**：判「今天已完成」只依据 `lastDailyChat`，**不**依据积分快照里有没有今天的包（那是**昨天**的结算，拿它拦截会让账号隔天才拿一包）。Rust 侧 `daily_chat_granted_today` 恒 `false`，正好符合 D+1 口径。
+- **网页腿必须接上沙箱**：只建会话不算数（issue #90：会话会永远停在 CREATING）。Rust 侧对应「建会话 → 取 `link`/`token` → ACP 三步 → 轮询到 `completed`」四步，缺一不可。
+
+**6. 结论**
+
+- M4-b 的 `daily_chat` 部分（桌面腿 + 网页腿 ACP + `lastDailyChat` 落盘 + 契约测试 + 账本）已完成，三项验证全绿。
+- M4-b 剩余项**未开始**：`run_streak_bonus` 内部 4 步、`do_cat_travel`、`run_night_growth`。
+- 未提交；按计划约束「commit 与推送逐次确认」，由用户逐次批准后再提交。
+
+_下一关：M4-b 剩余项（`run_streak_bonus` 内部 4 步 / `do_cat_travel` / `run_night_growth`），或按用户指定切到 M5（面板 / 设置 / 用量端点 / `CreditsRefresher` / `PriceRefresher` / `UpdateChecker`）。M3-b（`/v1/responses` 翻译层 + web-tools 回放）、M6 影子回放、M7 切换均未开始。_
+
+### 关卡 4.16：M4-b 代码评审修复（出站超时 + S1/S2/S3/S5）— 已完成（2026-10-20）
+
+**背景**：关卡 4.12–4.15 完成后跑了一轮代码评审，结论是「必须修 1 项 + 5 条建议 + 6 处逐字核对通过」。本关把必须修项与 4 条建议就地修掉（改动仍在 M4-b 范围内：daily_chat + ACP 这条链路的代码就是本里程碑引入的）。
+
+**1. 本关产出物**
+
+| 产出物 | 位置 | 复核方式（实测） |
+|---|---|---|
+| 带时限的出站变体 | `crates/gateway/src/outbound.rs` → `post_with_timeout` / `get_with_timeout` / `describe_error` | `cargo test -p wb-gateway outbound` = 8 passed / 0 failed（含「慢上游必须超时」「不带时限的 `post` 仍不超时」） |
+| ACP 建链严格 200 | `crates/gateway/src/acp.rs` → `AcpChannel::open` | `cargo test -p wb-gateway acp` = 13 passed / 0 failed（含「201 也必须拒」） |
+| ACP 收尾补查状态 | `crates/gateway/src/acp.rs` → `run_turn` | 同上（含「JSON-RPC 失败后仍要补查一次状态」） |
+| daily_chat 全链路上时限 | `crates/tasks/src/daily_chat.rs` → `DESKTOP_TIMEOUT`(20s) / `WEB_TIMEOUT`(30s) | `cargo test -p wb-tasks --lib daily_chat` = 7 passed / 0 failed |
+| 数字型会话 id | `crates/tasks/src/daily_chat.rs` → `py_truthy` + `conversation_raw` | `cargo test -p wb-tasks --test contract_daily_chat` = 12 passed / 0 failed |
+
+**2. 三项验证实测输出（原文，非推断）**
+
+```
+$ cargo fmt --all -- --check
+FMT_OK
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.74s
+
+$ cargo test --workspace
+passed=552 failed=0
+```
+
+（上一关为 `passed=544`；本关新增 8 条用例：outbound 3 条、acp 3 条、contract 2 条。）
+
+**3. 修复前的缺陷（逐条对照 Python）**
+
+| # | 缺陷 | 证据 | 现状 |
+|---|---|---|---|
+| M1 | 出站 HTTP 完全无限时：`UpstreamClient::post/get` 用 `reqwest::Client::builder().build()`，既无 `timeout` 也无 `connect_timeout` | Python 侧每次 `urlopen` 都带 `timeout=20/30`；`wb_webagent.py:102,109` 用 `http.client(..., timeout=self.timeout)` | daily_chat + ACP 链路的缓冲型调用全部带上时限；**M3 流式路径刻意保持无限时** |
+| S1 | 会话 id 只认字符串 | Python `wb_accounts.py:1503` `(payload.get("data") or {}).get("id")` 不限定类型，URL 里 `quote(str(conversation))` | 接受数字/布尔等任意标量，URL 用 `str()` 形态，结果里保留上游原值 |
+| S2 | ACP 轮询循环退出后不再查状态 | Python `wb_webagent.py:249-253` 有补查 | 补查（只更新 `status`，不改 `finished`——与 Python 一致） |
+| S3 | ACP 建链接受任意 2xx | Python `wb_webagent.py:123` 是 `if resp.status != 200` | 改成「恰好 200」 |
+| S5 | 缺数字 id / 损坏 `settings.json` 的用例 | — | 补 2 条契约用例 |
+
+**4. 差异清单（本关新增）**
+
+| # | 差异 | 来源 | 影响 | 处理 |
+|---|---|---|---|---|
+| D24 | **其余任务调用的出站同样无限时**：`crates/tasks/src/growth_api.rs:82/193/290/315`、`checkin.rs:280/341`、`events.rs:297/316/342`、`summary.rs:131`、`growth_runner.rs:432/472`，以及 M3 流式路径 `crates/gateway/src/retry.rs:364` | 本关只修了 daily_chat + ACP 这条链路的调用点 | 同样存在「上游挂起 ⇒ 巡检停摆」的风险 | **范围外，未改**：按「只动被要求动的地方」不扩散。**M7 切流前必须处理**（流式路径只能用「只加连接/读超时、不加总时限」的办法） |
+| D25 | 超时语义：Python 是**逐次读**的 socket 超时，Rust 用的是 reqwest 的**总时限**（从开始连接到响应体读完） | `urlopen(timeout=N)` vs `RequestBuilder::timeout` | 对「几 KB 的 JSON 答复」没有实质差别；总时限更严格（绝不会无限挂住） | 有意为之，代码注释已写明 |
+| D26 | ACP 的 SSE **只给「等响应头」这段加时限**，正文流不设总时限 | 长连接 SSE 要活过 120s 的等待窗口 | 上游长时间静默时 Rust 会继续读（Python 的 socket 超时会让读线程死掉） | 有意为之：判定「跑完」靠状态轮询，SSE 只统计事件数 |
+| D27 | `web.conversation` 现在保留上游**原值**（上游给数字就是数字） | Python `result["conversation"] = conversation` 塞的是原值 | 字符串场景逐字不变 | 与 Python 对齐 |
+| D28 | 出站错误文案统一过 `describe_error` | — | 超时/连接失败不再显示「error sending request for url」 | 有意改进 |
+
+**5. 留给 M5 的待办（评审 S4）**
+
+- Python `wb_proxy.py:17549` `_route_accounts_daily_chat`（手动跑每日活跃的端点）——Rust 侧**无**对应入口。
+- Python `wb_proxy.py:17568` `_route_accounts_daily_chat_web`（**只**跑网页腿、且**刻意不写** `lastDailyChat` 的端点）——Rust 侧**无**独立 `daily_chat_web` 入口。
+
+**6. 结论**
+
+- M1 + S1/S2/S3/S5 已修并有实测用例钉住；`passed=552 failed=0`，fmt 与 clippy 全绿。
+- **S4 与 D24 明确留到 M5 / M7 前处理**，不在本关扩散改动。
+- 未提交；按计划约束「commit 与推送逐次确认」，由用户逐次批准后再提交。
+
+

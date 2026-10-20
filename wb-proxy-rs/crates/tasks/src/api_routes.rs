@@ -21,6 +21,9 @@ use wb_storage::read_idempotent_fields;
 
 use crate::checkin::production_billing_base;
 use crate::claim_all::{self, route_claim_all, uid8, ClaimAllDeps, ClaimAllRequest};
+use crate::daily_chat::{
+    daily_chat as run_daily_chat, DailyChatAccount, DailyChatConfig, DailyChatCtx,
+};
 use crate::growth_api::{accept_tasks, claim_task, fetch_growth_tasks, TaskAccount, TaskEndpoints};
 use crate::growth_runner::{
     build_cat_travel, run_growth_tasks, CatTravel, RunnerAccount, RunnerCtx, RunnerDeps, RunnerEnv,
@@ -96,6 +99,11 @@ pub struct TaskRuntime {
     pub cache: Arc<SnapshotCache>,
     pub billing_base: String,
     pub endpoints: TaskEndpoints<'static>,
+    /// 每日活跃（国际版 daily_chat）的运行配置。
+    ///
+    /// 生产口径：端点按**账号身份**解析（国际版 → `www.workbuddy.ai`），
+    /// 不用国内版常量。契约测试把它换成 mock base。
+    pub daily_chat_config: DailyChatConfig,
     pub client: UpstreamClient,
     pub clock: LocalClock,
     pub schedule_clock: LocalScheduleClock,
@@ -180,6 +188,7 @@ impl TaskRuntime {
             cache,
             billing_base,
             endpoints,
+            daily_chat_config: DailyChatConfig::default(),
             client,
             clock,
             schedule_clock,
@@ -247,14 +256,36 @@ impl TaskRuntime {
         endpoints: TaskEndpoints<'static>,
         panel: Arc<dyn PanelSink>,
     ) -> Arc<dyn CycleExecutor> {
+        Self::test_with_ready_dir(
+            ready,
+            endpoints,
+            DailyChatConfig::default(),
+            PathBuf::new(),
+            panel,
+        )
+    }
+
+    /// 仅供契约测试：与 [`Self::test_with_ready`] 相同，但可指定**账号目录**
+    /// 与**每日活跃配置**。
+    ///
+    /// 每日活跃要把 `lastDailyChat` 写回账号文件，故契约测试需要一个真实的
+    /// 账号目录（`test_with_ready` 的空目录会让落盘必然失败）。
+    pub fn test_with_ready_dir(
+        ready: Vec<ReadyAccount>,
+        endpoints: TaskEndpoints<'static>,
+        daily_chat_config: DailyChatConfig,
+        accounts_dir: PathBuf,
+        panel: Arc<dyn PanelSink>,
+    ) -> Arc<dyn CycleExecutor> {
         let runtime = Arc::new(TaskRuntime {
-            accounts_dir: PathBuf::new(),
+            accounts_dir,
             pool: vec![],
             pool_present: false,
             ready,
             cache: Arc::new(SnapshotCache::with_ttl(0.0)),
             billing_base: String::new(),
             endpoints,
+            daily_chat_config,
             client: UpstreamClient::new(),
             clock: LocalClock,
             schedule_clock: LocalScheduleClock,
@@ -491,60 +522,60 @@ impl CycleExecutor for ProductionExecutor {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>> {
         let task = self.task.upgrade().expect("runtime alive");
         Box::pin(async move {
-            let ra = task.ready.iter().find(|r| r.state.uid == acc.uid);
-            let ra = match ra {
+            let ra = match task.ready.iter().find(|r| r.state.uid == acc.uid) {
                 Some(r) => r,
                 None => {
                     return json!({"ok": false, "error": "account not found"});
                 }
             };
-            let runner_acc = ra.runner_account();
-            let url = format!("{}/v2/activity/daily-chat", task.endpoints.chat_base);
-            let empty = json!({});
-            match task
-                .client
-                .post(&url, runner_acc.api.chat_headers, &empty)
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-                    Ok(d) if d.get("code").and_then(Value::as_i64) == Some(0) => {
-                        let msg = d
-                            .get("msg")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .unwrap_or_default();
-                        json!({"ok": true, "msg": msg})
-                    }
-                    Ok(d) => {
-                        let msg = d
-                            .get("msg")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "code={}",
-                                    d.get("code").map(|c| c.to_string()).unwrap_or_default()
-                                )
-                            });
-                        json!({"ok": false, "error": msg})
-                    }
-                    Err(e) => json!({"ok": false, "error": format!("daily chat failed: {e}")}),
-                },
-                Ok(resp) => {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    json!({
-                        "ok": false,
-                        "error": format!("HTTP {}: {}", status.as_u16(), text)
-                    })
-                }
-                Err(e) => json!({"ok": false, "error": format!("daily chat failed: {e}")}),
+            let account = DailyChatAccount {
+                uid: &ra.creds.uid,
+                token: &ra.creds.token,
+                realm: &ra.state.realm,
+                product: &ra.state.product,
+                chat_headers: &ra.creds.chat_headers,
+            };
+            let ctx = DailyChatCtx {
+                dir: &task.accounts_dir,
+                account_name: &ra.state.credential_file,
+                clock: &task.clock as &dyn Clock,
+            };
+            let outcome =
+                run_daily_chat(&task.client, &account, &task.daily_chat_config, &ctx, None).await;
+            let mut body = outcome.body.as_object().cloned().unwrap_or_default();
+            if let Some(err) = &outcome.persist_error {
+                body.insert("persist_error".to_string(), json!(err));
             }
+            Value::Object(body)
         })
     }
     fn accounts(&self) -> Vec<AccountView> {
         let task = self.task.upgrade().expect("runtime alive");
-        task.ready.iter().map(|r| r.view.clone()).collect()
+        task.ready
+            .iter()
+            .map(|r| {
+                // 每轮重新读一次幂等字段：签到 / 每日活跃刚写盘时，下一轮的
+                // `can_checkin` / `can_daily_chat` 必须看到新值——否则同一天会
+                // 反复重跑每日活跃对话（每次都在上游建一次真实 agent 会话）。
+                // 只在读到值时覆盖：这三个字段只会被写入、不会被清空；账号文件
+                // 缺失时 `read_idempotent_fields` 返回全 None，不该抹掉内存值。
+                let mut view = r.view.clone();
+                if let Ok(fields) =
+                    read_idempotent_fields(&task.accounts_dir, &r.state.credential_file)
+                {
+                    if fields.last_checkin.is_some() {
+                        view.last_checkin = fields.last_checkin;
+                    }
+                    if fields.last_activity_report.is_some() {
+                        view.last_activity_report = fields.last_activity_report;
+                    }
+                    if fields.last_daily_chat.is_some() {
+                        view.last_daily_chat = fields.last_daily_chat;
+                    }
+                }
+                view
+            })
+            .collect()
     }
 }
 
