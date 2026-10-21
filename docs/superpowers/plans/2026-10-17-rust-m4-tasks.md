@@ -1033,5 +1033,193 @@ C 线提出「静态表 vs 运行时目录哪个权威」。**核实 Python 后�
 - 线 C 的第 2/3/4 项遗留：`price` 无策略库、`update` 无 GitHub HTTP 抓取、`activity` 的压实未接调度、企业版积分路径未移植。
 - M3-b（`/v1/responses` 翻译 + web-tools replay）、M6（影子回放）、M7（切流）未启动。
 
+---
+
+### 关卡 4.18：M5 接线三前提 + 后台积分刷新线程 — 已完成（2026-10-21）
+
+**授权**：用户 2026-10-21 指示「继续rust重构」。上一关（M4-b 剩余 + M5 数据/端点层）落地后，账本遗留里**唯一不需要额外外部决策**的整块是「M5 后台刷新线程未做——只有纯判定层」+「D36 `credits_refresh` 仍回填 `None`」。本关把这两块做掉，并把「三个纯判定层一个都没接线」的根因补上。
+
+**开工前的两轮只读调研（结论与代码不符的地方如实记在下方「更正」）**
+
+| 调研问题 | 结论 | 证据 |
+|---|---|---|
+| Rust 侧面板/设置/用量路由是否存在 | **不存在**。全仓 `.route(` 只有 13 条（`crates/api/src/routes.rs:142-183`），`/usage*` 与 `/settings*` 只出现在 `MANAGEMENT_PATH_PREFIXES`（那只是「不加 CORS 头的前缀表」）。`dashboard.html` 实际调用的 `/usage`、`/usage/by-account`、`/usage/perf`、`/usage/analytics`、`/usage/remaining`、`/usage/timeseries`、`/settings`、`/settings/save`、`/panel/login` **一条都没有 Rust 实现** | 同上 |
+| Rust 调度器生产中是否跑 | **从未启动**。`Scheduler::start()`（`crates/tasks/src/scheduler.rs:650-667`）存在但全仓无调用者；`api/src/main.rs` 不 spawn 任何后台任务 | 同上 |
+| 四个数据层模块有没有生产消费者 | **零**。`credits` / `price` / `update` / `activity` 在生产路径上的唯一引用是 `crates/tasks/src/cap.rs:111` 调 `crate::credits::local_text` | 同上 |
+
+#### 本关结构：三个前提 + 一条线程
+
+| 前提 | 内容 | 阻塞谁 |
+|---|---|---|
+| **P1** | **spawn 点**：Rust 侧此前没有任何后台任务启动点（`api/src/main.rs` 不 spawn）⇒ 先在 `crates/api/src/routes.rs` 的**生产入口** `router()` 里建启动点 | 全部后台任务 |
+| **P2** | **settings 读写 API**：`wb-storage` 此前只有 `read_json` 私有 helper，没有任意 JSON 存取 | 价格/更新/积分 TTL 三个线程 |
+| **P3** | **积分快照存储点**：Python 把积分快照存在**账号文件**的 `credits` 键（`wb_accounts.py:1971-1972` 的 `self.save(...)`）⇒ Rust 侧照此落点 | 积分线程 + D36 |
+| **T** | `CreditsRefresher` 线程本体 + 生产数据源 + 状态端点 | — |
+
+#### 产出物
+
+| 线 | 产出物 | 位置 | 复核方式 |
+|---|---|---|---|
+| A | wb-storage 接线层 | `crates/storage/src/lib.rs`（+134 行） | `cargo test -p wb-storage` = **11 passed** |
+| A | 存储层契约测试 | `crates/storage/tests/settings_and_credits.rs`（新建，10 用例） | 同上 |
+| B | 刷新类 settings 键位口径 | `crates/tasks/src/settings.rs`（新建，463 行） | `cargo test -p wb-tasks` |
+| B | 后台积分刷新线程 | `crates/tasks/src/credits_refresher.rs`（新建，489 行） | 同上 |
+| B | 刷新器契约测试 | `crates/tasks/tests/contract_credits_refresher.rs`（新建，10 用例） | 同上 |
+| C | 生产数据源 | `crates/tasks/src/credits_source.rs`（新建） | 同上 |
+| C | 接线层 + 状态端点 + 契约测试 | `crates/tasks/src/api_routes.rs`、`crates/api/src/routes.rs`、`crates/api/tests/contract_credits_refresher.rs`（新建，8 用例） | 同上 |
+
+#### 语义基准：Python `CreditsRefresher`（逐条核实到行号）
+
+权威源：`wb_accounts.py:2451-2586`（类定义 2451；`interval_seconds=1800` 2471；**`_failed_cooldown = 6 * 3600.0` 2483**；`ttl_seconds()` 2498-2508；`stalest_account()` 2510-2536（enabled+token 过滤 2522-2523、冷却跳过 2524-2525、`updated_at` 非数字⇒`age=inf` 2526-2531、`age < ttl` 跳过 2532-2533、取最旧 2534-2535）；`refresh_once()` 2538-2564（`ttl<=0` 直接返回 2540-2542、失败停放 2553-2554、**日志文案「暂缓一小时」是错的** 2556-2557）；`run()` 2566-2576（**`_wake.wait(timeout=interval)` 在循环体第一行 ⇒ 启动后 30 分钟才第一次跑**）；`status()` 六键 2578-2586）。
+
+⚠️ **Python 侧的日志文案与实际冷却时长不符**：文案写「暂缓一小时」，实际是 6 小时（`:2483`）。Rust 侧按**实际值** 6 小时实现，并在注释里标注了这一点。
+
+#### P2：wb-storage 的 settings 读写（新增公开 API）
+
+| API | 语义 |
+|---|---|
+| `read_settings(accounts_dir)` | **宽容读**：文件缺失 / 空 / 不是 JSON 对象 / **JSON 损坏** ⇒ 一律回落空对象（不报错）。理由：settings 是可选文件，坏了也不该让服务起不来 |
+| `write_settings(accounts_dir, patch)` | **浅合并**（顶层键覆盖，未提到的键原样保留）+ 原子写。**严格**：文件已存在但 JSON 损坏 ⇒ **报错、不写**（否则这一写会把用户其余设置连同损坏内容一起抹掉） |
+| `read_account_credits(accounts_dir, name)` | 读账号文件的 `credits` 键；没有 ⇒ `Ok(None)`（= 从未抓过） |
+| `write_account_credits(accounts_dir, name, credits)` | 原子读改写 `credits` 键；其余键原样保留；落盘前剥离 `RUNTIME_ONLY_FIELDS`；账号文件不存在 ⇒ 报错（不静默新建空壳） |
+| `write_json_atomic(path, value)` | 抽出共用的原子写（同目录 temp + rename + `indent(2)`），三处写回路径共用它，避免各自实现漂移 |
+| `PoolAccount` 扩展 | `+file_name`（闸门 0 的 **G0-3** 遗留：此前 `account_entries` 丢弃 `PathBuf`，写回只能靠重拼文件名）、`+enabled`、`+credits`。全仓仅 `crates/storage/src/lib.rs` 内部构造 ⇒ 加字段不破坏任何调用点 |
+
+#### P3 + D36：积分快照落点与 `credits_refresh` 回填
+
+落点与 Python 一致：**账号文件的 `credits` 键**（12 键，`Credits::to_json()` 逐字对齐 Python dict：`remain/used/size/used_percent/remain_percent/is_paid_user/checkin/earliest_expiring/packages[]/updated_at/updated_iso`）。
+
+D36 从「恒回填 `None`」改为「读账号文件里**本地已存**的快照」（新增 `wb_tasks::api_routes::local_credits_snapshot` 供三处闭包共用）。⚠️ 这是**有意差异**（D36-b），不是等价实现，详见差异清单。
+
+#### P1 + T：spawn 点与线程
+
+- 启动点放在 `crates/api/src/routes.rs` 的**生产入口** `router()` 内；契约测试走 `app_with()`，**不会**起任何后台线程 ⇒ 测试永不触发真实上游请求。
+- 受 `WB_BACKGROUND_TASKS=1` 开关控制，**默认关**（D49）。
+- 线程骨架照抄 `Scheduler::start/stop/run_loop`（`stop_event` + `JoinHandle`），`crates/tasks/Cargo.toml` 的 `tokio` 补 `rt` feature（已有依赖加 feature，不是新依赖）。
+- 新增状态端点 `GET /accounts/credits-refresher`（鉴权与 `/scheduler` 同款），返回体六键与 Python `status()` 逐字一致。
+
+#### 差异清单（本关新增）
+
+| # | 差异 | 影响 | 处理 |
+|---|---|---|---|
+| **D49** | **后台任务默认关闭**：Python `wb_proxy.py:18757-18785` 在 `_bootstrap` 里**无条件**起 `Scheduler` / `PriceRefresher` / `CreditsRefresher` / `UpdateChecker` 四个后台线程；Rust 侧需显式设 `WB_BACKGROUND_TASKS=1` 才启动 | 未切流前若默认就起，会出现「同一个账号池被 Python 与 Rust 两个实例同时签到/刷积分」 | **有意**：M7 切流时再对齐 Python 的默认行为。当前默认关 ⇒ Rust 二进制启动不产生任何上游流量 |
+| **D50**（D36-b） | `credits_refresh` **读本地快照**，不是 Python 的「领奖后同步即时抓上游」 | 领奖后面板显示的余额最多**滞后一个 TTL**（默认 12h），不是立刻更新 | **有意 + 半关闭**：Rust 的注入点是**同步闭包**，做不了异步抓取；要彻底对齐须把注入点改成 async（跨 `growth_runner` / `night_growth` / `claim_all` 三个模块的签名改造），留到后续关卡。**D36 由「未做」改为「半关闭」** |
+| D51 | `credits_refresh_hours` 为负时**读路径回落默认 12.0**（不是 0） | 手改 JSON 写负数得到的是 12.0 而非「关闭」 | 与 Python **一致**（Python 读路径 `wb_settings.py:860-861` 回落默认，只有写路径 `:865-876` 才夹到 0） |
+| D52 | 旧键 `pricing_refresh_hours` → `pricing_refresh_minutes` 的迁移**只读不写** | 两个键可能并存（新键优先，行为一致） | 有意：`write_settings` 是顶层浅合并，删不了键。Python 迁移会写回并删旧键 |
+| D53 | `pricing_enabled` **缺键 = 开**、`update_check_enabled` **缺键 = 关** | 两个开关方向相反 | 与 Python 一致（`wb_settings.py:980-989` / `:1354-1362`）。后两个线程本关未做，键位口径已固化 |
+| D54 | `pricing_refresh_minutes` 用**整分钟**（Python 是 float） | `0 < v < 1` 的极小值截成 0（= 关闭），Python 会当成正间隔 | 有意（接口约定 `i64`） |
+
+#### 本关验证数字（仓库内实测）
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --workspace` | **723 passed / 0 failed**（基线 684 ⇒ **+39**） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 零警告 |
+| `cargo fmt --all -- --check` | FMT_OK |
+
+新增用例明细：storage 11（`settings_and_credits.rs`）+ tasks 刷新器 10（`contract_credits_refresher.rs`）+ settings 模块内单测 + api 接线 8（`contract_credits_refresher.rs`）。
+
+#### 更正（对上一关记录的更正，按「只增不改」原则追加）
+
+- 上一关「集成收口」表格第 5 行写「D 线端点 | 两个手动 daily_chat 端点 + **面板/设置/用量路由**（`api/src/routes.rs`）」——**与代码不符**：实际只有 `/panel/status` 落地，`/usage*` / `/settings*` / `/panel/login` **一条都没有**。本关开工前的调研已独立核实（全仓 `.route(` 只有 13 条），M5 端点层仍是**大块未完成**。
+- 上一关遗留项「M5 的后台刷新线程未做——只有纯判定层」**部分过时**：`credits` / `price` / `update` / `activity` 四个模块**零生产消费者**（唯一生产引用是 `cap.rs:111` 调 `credits::local_text`），比「只有纯判定层」更严重——它们连判定层都还没接线。
+- 上一关 D36 记的是「`credits_refresh` 是同步闭包 ⇒ 接线时只能回填 `None`」——本关补上了存储点，回填不再是 `None`，但语义是「读本地快照」（D50），**不是** Python 的即时抓取。
+
+#### 本关遗留（未做）
+
+- `PriceRefresher` / `UpdateChecker` 两个后台线程**仍未做**（需要 OpenRouter / GitHub 的 HTTP 抓取与策略库文件读写，属 wb-gateway 与 wb-storage 的新工作面）。
+- Python 的 `GET /accounts/credits`（**同步全池刷新**）未移植——本关只做了状态端点。
+- 活动历史压实：**Python 侧也不是独立线程**，而是挂在写路径上（`wb_activity.py:204` → `_compaction_due:341-348`，距上次压实 ≥ 6h **或** 文件 > 2MB 即触发）。上一关遗留里「压实未接调度」的说法要修正为「**压实判定要接写路径**」，不是「要建调度器」。
+- 企业版积分路径（`_fetch_credits_enterprise`，`wb_accounts.py:2060`）未移植。
+- M3-b（`/v1/responses` 翻译 + web-tools replay）、M6（影子回放）、M7（切流）未启动。
+- `ApiPanelSink::add_log_entry` 仍是 no-op（`crates/api/src/routes.rs`）——后台线程的日志进不了面板日志页。
 
 
+
+
+---
+
+### 关卡 4.19：M5 剩下两个后台线程 + 用量路由 — 已完成（2026-10-21）
+
+**授权**：用户 2026-10-21 指示「并行做」——并行推进上一关收尾时提的两项：①`PriceRefresher` + `UpdateChecker` 两个后台线程；②`/usage*` 用量路由（让面板能用）。三条实现线**文件所有权互斥**并行推进，主会话做接线与集成审查。
+
+#### 结构：P0 接线准备 → 三线并行 → 主会话接线
+
+| 阶段 | 内容 |
+|---|---|
+| **P0（主会话，先做）** | 建 5 个占位模块 + **一次性**把模块声明加好（`tasks::{price_refresher,update_checker,usage}`、`gateway::{pricing,github}`）⇒ 三条线只填内容、**谁都不碰 `lib.rs`**（并发编辑同一文件会互相覆盖）；`TaskRuntime` 加 `usage_dir` 字段（按 Python `wb_proxy.py:402-403`：**`usage/` 与 `accounts/` 同级**，env `WB_USAGE_DIR` 可覆盖） |
+| **线 A** | `PriceRefresher` 线程 + OpenRouter 抓取 |
+| **线 B** | `UpdateChecker` 线程 + GitHub releases 抓取 |
+| **线 C** | 用量落盘 + `/usage` 三条路由 |
+| **接线（主会话）** | `price_source.rs`（线 A 缺的生产数据源）→ `TaskRuntime` 装 `price_refresher`/`update_checker` 两槽 → spawn 点起这两个线程 → 新增 `GET /pricing`、`GET /updates` → `HUB_VERSION` + 跨语言 parity 测试 → 修 chat 契约测试的用量目录副作用 |
+
+#### 产出物
+
+| 线 | 文件 | 行数 | 复核方式 |
+|---|---|---|---|
+| A | `crates/gateway/src/pricing.rs` | 212 | `cargo test -p wb-gateway` = 249 passed（+6 wiremock 单测） |
+| A | `crates/tasks/src/price_refresher.rs` | 806 | `contract_price_refresher.rs` 9 条 |
+| A | `crates/tasks/tests/contract_price_refresher.rs` | 407 | 同上 |
+| B | `crates/gateway/src/github.rs` | 486 | `cargo test -p wb-gateway` = 249 passed（+8 wiremock 单测） |
+| B | `crates/tasks/src/update_checker.rs` | 760 | `contract_update_checker.rs` 15 条 |
+| B | `crates/tasks/tests/contract_update_checker.rs` | 533 | 同上 |
+| C | `crates/tasks/src/usage.rs` | 747 | 10 条单测 |
+| C | `crates/api/src/chat.rs` / `routes.rs` | +170 / +226 | `contract_usage_routes.rs` 13 条 |
+| C | `crates/api/tests/contract_usage_routes.rs` | 508 | 同上 |
+| 主 | `crates/tasks/src/price_source.rs` | 新建 | 生产数据源（线 A 未交付） |
+| 主 | `crates/tasks/src/api_routes.rs` | 接线 | 两个槽位 + 两条状态路由函数 |
+| 主 | `crates/api/src/routes.rs` | 接线 | spawn 两条线程 + `GET /pricing` `GET /updates` |
+| 主 | `crates/api/tests/contract_background_status.rs` | 新建 | 4 条（含跨语言版本号 parity） |
+
+#### 语义基准（Python 行号，逐条核实）
+
+| 语义 | Python 权威 |
+|---|---|
+| 定价周期 5 分钟、0=关闭 | `wb_pricing.py:2303`（`DEFAULT_REFRESH_MINUTES`）、`wb_settings.py:912-935` |
+| 定价总开关**缺键 = 开**、关着 park 不计时 | `wb_settings.py:980-989`、`wb_pricing.py:2477-2484` |
+| 定价**只有无历史时才立即抓**；抓取失败沿用旧价不写盘 | `wb_pricing.py:2465-2508`、`:2389-2398` |
+| 定价落盘 `usage/pricing-policies.jsonl` + `pricing-timeline.jsonl` | `wb_pricing.py:1456-1468`、`:1940-2008` |
+| 更新检查：首次 30s、轮询 300s、窗口 24h、开关**缺键 = 关**、manual 绕过、只发现不安装 | `wb_updates.py:48-52`、`:250-254`、`:282-309`、`wb_settings.py:1354-1362` |
+| 更新记账 = settings 的 `update_check` 键（**只有三个字段**） | `wb_settings.py:1396-1416` |
+| 用量：请求路径内**同步 append** 一行 JSONL，**没有后台线程** | `wb_proxy.py:665-742`、`:744-760` |
+| 用量聚合按需重算 + TTL 缓存 | `wb_proxy.py:3057`、`:6005`、`:6133` |
+
+#### 差异清单（本关新增）
+
+| # | 差异 | 影响 | 处理 |
+|---|---|---|---|
+| **D55** | **取价清单为空**（Rust 侧无模型目录）⇒ 抓回来的模型列表匹配不到任何 hub 模型 ⇒ 走到「一个都没匹配上」分支、**不写盘** | 定价刷新线程在模型目录落地前**抓了也白抓** | **有意 + 已知缺口**（与 D43 同源）：`PriceSource::catalog()` 默认空清单。Python 侧是「内置静态目录 ∪ live 目录新增」 |
+| **D56** | **策略表行粒度不同**：Python 是「一个价格一行 + 内容哈希去重」，本移植是「每轮追加整份快照一行」 | 稳态下两个文件每轮增长（Python 不会） | 有意：读这两个文件的消费端必须按本移植格式实现，**不能照抄 Python 的读法**。Python 的 `policy_id`/`load_policies`/`prune_policies`/`live_index` 未移植 |
+| **D57** | 用量行的 `outcome` 用 Python 的 **`completed`/`failed`**，不是 `ok`/`error` | 写 `ok` 会被 Python 的 `_fold_usage_snapshot`（`:3954`）记成失败，成功率算错 | 有意：`usage/usage.jsonl` 是 **Python 与 Rust 共用的同一文件**，被解释的字段必须保语义 |
+| **D58** | `iso` 写 `%Y-%m-%d %H:%M:%S`（空格），Python 行里是 `T` 分隔 | 纯展示字符串不一致 | 影响为零：Python 只把 `iso` 当展示透传，**没有任何聚合按 `iso` 分组**（日桶一律按 `at` 折算） |
+| **D59** | 用量行的 `key` 恒空串 | Python 面板 analytics 的 `keys` 列表对 Rust 写的行恒为空 | 有意：Rust 侧只有密钥本体，**绝不能落盘** |
+| **D60** | `current_version` 用 **hub 发布版本号 `1.7.1`**（`env!("CARGO_PKG_VERSION")` = `0.1.0` 会让 `update_available` 恒为真） | 更新判定的基准 | 已修：新增 `update_checker::HUB_VERSION = "1.7.1"`（对齐 Python `wb_proxy.py:15207` 的 `server_version` 与 `:9729` 的 `"version"`），并加**跨语言 parity 测试**（读 `wb_proxy.py` 逐字比对两个字面量与 Rust 常量三者相等） |
+| **D61** | 用量聚合是**逐行累加**：无 TTL 缓存、无 ETag、无增量折叠；缺 `cost_cny`/`usd_cny`/`keys`/`accounts_map`/`by_model_realm`/`by_model_acct`/`cost_policy`/`reasoning_effort`/`ttft_ms`/`gen_ms`；`analytics` 的 `summary`/`accounts`/`models` 是**单层**，Python 是 `window`/`all_time` **双层** | 面板上少若干字段、analytics 结构不同 | 有意（最小可用版）。`cost_cny` **故意不写**：不折成本却写 0.0 会被误读成「成本为 0」而不是「未知」 |
+| **D62** | realm 过滤：`GET /usage` **按 realm 过滤**（`?realm=`，`all` = 不过滤）；`/usage/analytics` 与 `/usage/by-account` **不过滤** | 与 Python 一致（`_get_v1_usage:15839-15842` / `_get_usage_analytics:16003-16006` / `_usage_by_account_uncached:6104`） | 对齐。更老的行没有 `realm` 字段时选择**保留**（无法证明属于别的 realm），Python 会推断成别的值 |
+| **D63** | `total_requests` = **全部行数**（成功 + 失败）；Python 的 `requests` 只数成功行 | 两者在有失败行时不等 | 有意：Rust 另加 `requests`/`errors` 两键对齐 Python；`total_requests` 是 Rust 额外键 |
+| **D64** | `account` 字段：上游拒绝时拿不到账号 ⇒ 空串 | Rust 写的失败行在「按账号」视图里落进 `(unattributed)` | 已知限制：Python 的 `record_error` 在重试轮次里能带上账号 |
+| **D65** | 跨 crate 常量重复：`RELEASES_URL`/`LATEST_RELEASE_URL`/`TOKEN_ENV`/`REQUEST_TIMEOUT` 在 gateway 与 tasks 各存一份 | 可能漂移 | 依赖方向 tasks→gateway，gateway 不能反向依赖 tasks；用契约测试里的一条断言盯着两份不许漂移 |
+| **D66** | 后台任务**三个线程统一默认关**（D49 的延续） | Rust 侧启动不产生任何上游流量 | 有意：M7 切流时再对齐 Python 的无条件启动 |
+
+#### 本关验证数字（仓库内实测）
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --workspace` | **794 passed / 0 failed**（上一关 723 ⇒ **+71**） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 零警告 |
+| `cargo fmt --all -- --check` | FMT_OK |
+
+#### 本关修掉的一个测试副作用
+
+`crates/api/tests/contract_chat_routes.rs` 原先把 **tempdir 根目录**当 `accounts_dir` ⇒ `usage_dir_from` 推出 `/tmp/usage` ⇒ chat 契约测试把用量行写进 **`/tmp/usage/usage.jsonl`**（实测已累积 110 行，每次跑测试都增长，且不 hermetic）。修法：测试的账号/realm/settings 改写到 tempdir 内的 `accounts/` 子目录 ⇒ 用量目录随之落在 tempdir 内的 `usage/`。**未给 `Config` 加 `usage_dir` 字段**（那是 `wb_api` 的公开结构体，加字段要动 11 处调用点；改为测试内解决，不动公开 API）。
+
+⚠️ `/tmp/usage/usage.jsonl` 里**遗留的 110 行历史数据未删**（删除属用户数据处置，须经批准）。
+
+#### 本关遗留（未做）
+
+- `/usage` 只接了 3 条；Python 还有 `/v1/usage`、`/usage/recent`、`/usage/remaining`、`/usage/timeseries`、`/usage/perf`、`/activity/history`（`/activity/history` 可直接用 `wb_tasks::activity::query`）⇒ 面板的用量页仍不完整。
+- `/settings`、`/settings/save`、`/panel/login|logout|password` 仍缺 ⇒ 面板登录页没通（`/panel/login` 需 PBKDF2，无依赖）。
+- 定价侧因 D55 在模型目录落地前不写盘；`pricing-overrides.json` 的读取、`runtime_overrides` 注入未实现。
+- 企业版积分路径（`_fetch_credits_enterprise`）未移植。
+- M3-b（`/v1/responses` 翻译 + web-tools replay）、M6（影子回放）、M7（切流）未启动。
+- `ApiPanelSink::add_log_entry` 仍是 no-op ⇒ 三个后台线程的日志进不了面板日志页。

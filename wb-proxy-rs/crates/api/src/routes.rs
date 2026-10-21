@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::auth::{key_ok, PanelSessions};
-use crate::chat::{extract_session_key, run_chat, ChatParams, Upstream};
+use crate::chat::{extract_session_key, run_chat, ChatParams, ChatRun, Upstream, UsageContext};
 use crate::Config;
 
 use wb_gateway::anthropic::{chat_to_messages, messages_to_chat};
@@ -126,11 +126,47 @@ impl AppState {
 }
 
 pub fn router(cfg: Arc<Config>) -> Router {
-    app_with(
-        cfg.clone(),
-        Arc::new(PanelSessions::new(SESSION_TTL)),
-        task_routes::TaskRuntime::production(&cfg.accounts_dir, Arc::new(ApiPanelSink)),
-    )
+    let task = task_routes::TaskRuntime::production(&cfg.accounts_dir, Arc::new(ApiPanelSink));
+    start_background_tasks(&task);
+    app_with(cfg.clone(), Arc::new(PanelSessions::new(SESSION_TTL)), task)
+}
+
+/// 启动后台任务（调度器 + 后台积分刷新器）。
+///
+/// ⚠️ **默认关闭**，需显式设置 `WB_BACKGROUND_TASKS=1` 才启动。
+///
+/// 与 Python 的差异（D49）：Python 侧 `wb_proxy.py:18757-18785` 在 `_bootstrap`
+/// 里**无条件**起 `Scheduler` / `PriceRefresher` / `CreditsRefresher` /
+/// `UpdateChecker` 四个后台线程；Rust 侧此时**尚未切流**（M7 之前生产跑的仍是
+/// Python 实例），若默认就起，会出现「同一个账号池被两个实例同时签到/刷积分」。
+/// 故 Rust 侧默认不启动后台任务，切流（M7）时再对齐 Python 的默认行为。
+///
+/// ⚠️ 本函数只在**生产入口** `router()` 里调用；契约测试走 `app_with()`，
+/// 不会起任何后台线程 ⇒ 测试永不触发真实上游请求。
+fn start_background_tasks(task: &Arc<task_routes::TaskRuntime>) {
+    let enabled = std::env::var("WB_BACKGROUND_TASKS")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if !enabled {
+        eprintln!("[wb-api] 后台任务未启动（需显式设置 WB_BACKGROUND_TASKS=1）");
+        return;
+    }
+    if let Some(scheduler) = task.scheduler() {
+        scheduler.start();
+        eprintln!("[wb-api] 后台调度器已启动");
+    }
+    if let Some(refresher) = task.credits_refresher.get() {
+        refresher.start();
+        eprintln!("[wb-api] 后台积分刷新器已启动");
+    }
+    if let Some(pricing) = task.price_refresher.get() {
+        pricing.start();
+        eprintln!("[wb-api] 后台定价刷新器已启动");
+    }
+    if let Some(updater) = task.update_checker.get() {
+        updater.start();
+        eprintln!("[wb-api] 后台更新检查器已启动");
+    }
 }
 
 pub fn app_with(
@@ -165,6 +201,18 @@ pub fn app_with(
         )
         .route("/tasks/claim-all", post(tasks_claim_all).options(preflight))
         .route("/scheduler", get(scheduler_get).options(preflight))
+        .route("/pricing", get(pricing_get).options(preflight))
+        .route("/updates", get(updates_get).options(preflight))
+        .route("/usage", get(usage_get).options(preflight))
+        .route(
+            "/usage/by-account",
+            get(usage_by_account).options(preflight),
+        )
+        .route("/usage/analytics", get(usage_analytics).options(preflight))
+        .route(
+            "/accounts/credits-refresher",
+            get(credits_refresher_get).options(preflight),
+        )
         .route(
             "/scheduler/trigger",
             post(scheduler_trigger).options(preflight),
@@ -295,36 +343,69 @@ fn overload_response(is_anthropic: bool) -> Response {
     }
 }
 
+/// 一次 chat 的最终应答 + 记账所需的信息（关卡 4.19 线 C）。
+struct ChatReply {
+    /// 给客户端的响应。
+    response: Response,
+    /// 上游 usage 块（没拿到 ⇒ `None`）。
+    usage: Option<Value>,
+    /// 失败时的 HTTP 状态（成功 ⇒ `None`）。
+    status: Option<u16>,
+    /// 失败时的一句话说明（成功 ⇒ `None`）。
+    message: Option<String>,
+}
+
 /// 读上游 `reqwest::Response` 全文，逐行 `strip_data_prefix` 后聚合。
 ///
 /// 对齐 Python `_chat_nonstream_response` :18584：上游回的是 **SSE 流**，
 /// 非流式响应靠 `aggregate_stream` 把 SSE 事件拼成 chat JSON。
-async fn aggregate_upstream(resp: reqwest::Response, model: &str, now: f64) -> Response {
+async fn aggregate_upstream(resp: reqwest::Response, model: &str, now: f64) -> ChatReply {
     let text = match resp.text().await {
         Ok(t) => t,
         Err(err) => {
-            return openai_error(
-                502,
-                &format!("upstream stream error: {err}"),
-                "server_error",
-            )
+            let message = format!("upstream stream error: {err}");
+            return ChatReply {
+                response: openai_error(502, &message, "server_error"),
+                usage: None,
+                status: Some(502),
+                message: Some(message),
+            };
         }
     };
     let payloads: Vec<&str> = text.lines().map(strip_data_prefix).collect();
     let result = aggregate_stream(&payloads, model, "", now);
-    (StatusCode::OK, Json(result)).into_response()
+    let usage = result.get("usage").cloned();
+    ChatReply {
+        response: (StatusCode::OK, Json(result)).into_response(),
+        usage,
+        status: None,
+        message: None,
+    }
 }
 
 /// 把 `Outcome` 落到 HTTP 响应（非流式）。`Rejected` 直接透传上游状态与
 /// 信封；`Served` 走 `aggregate_upstream`。
-async fn outcome_to_response(outcome: Outcome, model: &str, now: f64) -> Response {
+async fn outcome_to_response(outcome: Outcome, model: &str, now: f64) -> ChatReply {
     match outcome {
         Outcome::Served(resp, _) => aggregate_upstream(resp, model, now).await,
-        Outcome::Rejected { status, body } => (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(body),
-        )
-            .into_response(),
+        Outcome::Rejected { status, body } => {
+            let message = body
+                .get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("upstream rejected with status {status}"));
+            ChatReply {
+                response: (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(body),
+                )
+                    .into_response(),
+                usage: None,
+                status: Some(status),
+                message: Some(message),
+            }
+        }
     }
 }
 
@@ -409,7 +490,10 @@ async fn chat_openai_entry(
 
     // `total_tokens` 类估算在 gateway 内处理；api 层只搬运。
     let _ = &state;
-    let outcome = run_chat(
+    let ChatRun {
+        outcome,
+        account_uid,
+    } = run_chat(
         &state.upstream,
         ChatParams {
             realm: &state.cfg.realm,
@@ -428,7 +512,24 @@ async fn chat_openai_entry(
     )
     .await;
 
-    let response = outcome_to_response(outcome, &model, now).await;
+    let reply = outcome_to_response(outcome, &model, now).await;
+    record_chat_usage(
+        &state,
+        UsageContext {
+            model: &model,
+            payload: &payload,
+            usage: reply.usage.as_ref(),
+            account: account_uid.as_deref(),
+            realm: &state.cfg.realm,
+            // 客户端 API key 的**标识**在 Rust 侧拿不到（只有密钥本体，
+            // 绝不能落盘）⇒ 恒为空串，与 Python「没带 key 跑」的桶同款。
+            key: "",
+            status: reply.status,
+            message: reply.message.as_deref(),
+            started: now,
+        },
+    );
+    let response = reply.response;
     if is_responses {
         wrap_response_response(response).await
     } else {
@@ -502,7 +603,10 @@ async fn chat_anthropic_entry(
     let session_key = extract_session_key(&headers, &payload);
     let now = now_secs();
     let opts = body_options(&state, &payload, now);
-    let outcome = run_chat(
+    let ChatRun {
+        outcome,
+        account_uid,
+    } = run_chat(
         &state.upstream,
         ChatParams {
             realm: &state.cfg.realm,
@@ -521,24 +625,68 @@ async fn chat_anthropic_entry(
     )
     .await;
 
-    match outcome {
-        Outcome::Served(resp, _) => {
-            let chat = match read_chat_json(resp, &model, now).await {
-                Ok(v) => v,
-                Err(resp) => return *resp,
-            };
-            let out = chat_to_messages(&chat);
-            Json(out).into_response()
-        }
+    let reply = match outcome {
+        Outcome::Served(resp, _) => match read_chat_json(resp, &model, now).await {
+            Ok(chat) => {
+                let usage = chat.get("usage").cloned();
+                ChatReply {
+                    response: Json(chat_to_messages(&chat)).into_response(),
+                    usage,
+                    status: None,
+                    message: None,
+                }
+            }
+            Err(resp) => ChatReply {
+                response: *resp,
+                usage: None,
+                status: Some(502),
+                message: Some("upstream stream error".to_string()),
+            },
+        },
         Outcome::Rejected { status, body } => {
             // 上游拒绝已是 Anthropic 形状（retry.rs 产出），直接透传。
-            (
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                Json(body),
-            )
-                .into_response()
+            let message = body
+                .get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("upstream rejected with status {status}"));
+            ChatReply {
+                response: (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(body),
+                )
+                    .into_response(),
+                usage: None,
+                status: Some(status),
+                message: Some(message),
+            }
         }
-    }
+    };
+
+    record_chat_usage(
+        &state,
+        UsageContext {
+            model: &model,
+            payload: &payload,
+            usage: reply.usage.as_ref(),
+            account: account_uid.as_deref(),
+            realm: &state.cfg.realm,
+            key: "",
+            status: reply.status,
+            message: reply.message.as_deref(),
+            started: now,
+        },
+    );
+    reply.response
+}
+
+/// 给一次 chat 记一行用量（关卡 4.19 线 C）。
+///
+/// **记账失败不影响原响应**（落盘失败只打日志，Python `_persist_usage`
+/// 同款）。成功行记 `completed`，失败行记 `failed` + `status`。
+fn record_chat_usage(state: &AppState, ctx: UsageContext<'_>) {
+    crate::chat::record_usage(&state.task.usage_dir, &ctx);
 }
 
 /// 读并聚合上游 SSE 成 chat JSON（Anthropic 路径复用）。
@@ -1021,6 +1169,53 @@ async fn scheduler_get(State(state): State<AppState>, headers: HeaderMap) -> Res
     Json(res).into_response()
 }
 
+/// 后台积分刷新器的状态（关卡 4.18）。
+///
+/// 形状与 Python `CreditsRefresher.status()`（`wb_accounts.py:2578-2586`）
+/// 逐字一致：六个键 `ttl_hours / interval_seconds / last_run / last_uid /
+/// last_error / logs`。
+async fn credits_refresher_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let res = task_routes::route_credits_refresher_status(&state.task);
+    Json(res).into_response()
+}
+
+/// 后台定价刷新器的状态（关卡 4.19）。
+///
+/// 形状与 Python `PRICING.status()`（`wb_pricing.py:2511-2554`）一致。
+async fn pricing_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let res = task_routes::route_pricing_status(&state.task);
+    Json(res).into_response()
+}
+
+/// 后台更新检查器的状态（关卡 4.19）。
+///
+/// 形状与 Python `UPDATES.status()`（`wb_updates.py:257-271`）一致。
+async fn updates_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let res = task_routes::route_updates_status(&state.task);
+    Json(res).into_response()
+}
+
 async fn scheduler_trigger(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1053,4 +1248,124 @@ async fn scheduler_toggle(
     let _ = body;
     let res = task_routes::route_scheduler_toggle(&state.task);
     Json(res).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// 用量路由（关卡 4.19 线 C）
+//
+// Python 侧对应 `_get_v1_usage`（:15839）、`_get_usage_by_account`（:16015）
+// 与 `_get_usage_analytics`（:16003）。三者都在 `_is_panel_route` 的管辖下
+// （`/usage` 前缀，:15662-15691）⇒ **需要鉴权**；鉴权模式与 `/scheduler`
+// 一样：`key_ok` 走 API key / 面板会话 / 免鉴权三条路径。
+//
+// ⚠️ Python 还把 `/v1/usage` 也指向同一份快照（:15719），Rust 侧本关卡
+// 只接了 `/usage` 三条路由（`/v1/usage` 留后续关卡）。
+// ---------------------------------------------------------------------------
+
+/// 读用量行。
+///
+/// **读失败降级成空集**（只打日志）：面板每几秒轮询一次，一次 IO 抖动不该
+/// 让整个页面 500。**日志不存在不是错误** —— 新装的实例回一份空聚合。
+fn read_usage_rows(state: &AppState) -> Vec<Value> {
+    match wb_tasks::usage::load_usage_rows(&state.task.usage_dir) {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("[wb-api] 读用量日志失败: {err}");
+            Vec::new()
+        }
+    }
+}
+
+/// `GET /usage`：用量快照（Python `_get_v1_usage`）。
+///
+/// **按 realm 过滤**（Python `_get_v1_usage` :15839-15842）：
+/// `?realm=` → `X-Realm` 头 → 当前 realm；`all` 表示不过滤。
+async fn usage_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
+    let rows: Vec<Value> = read_usage_rows(&state)
+        .into_iter()
+        .filter(|row| wb_tasks::usage::realm_matches(row, &realm))
+        .collect();
+    Json(wb_tasks::usage::build_usage_snapshot(&rows)).into_response()
+}
+
+/// `GET /usage/by-account`：按账号聚合（Python `_get_usage_by_account`）。
+///
+/// **不过滤 realm**（Python `_usage_by_account_uncached` :6104 从头到尾没有
+/// realm 过滤：这份视图一直描述**整份日志**）。
+async fn usage_by_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let rows = read_usage_rows(&state);
+    Json(wb_tasks::usage::build_usage_by_account(&rows)).into_response()
+}
+
+/// `GET /usage/analytics`：按日期分组的分析（Python `_get_usage_analytics`）。
+///
+/// **默认不过滤 realm**（Python `_get_usage_analytics` :16003-16006：
+/// `req_realm = query.get("realm")[0] or None` ⇒ 缺省是 **None = 全 realm**
+/// 合并统计）；给了 `?realm=` 才过滤。
+async fn usage_analytics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let realm = realm_filter(&params, &headers, None);
+    let rows: Vec<Value> = read_usage_rows(&state)
+        .into_iter()
+        .filter(|row| wb_tasks::usage::realm_matches(row, &realm))
+        .collect();
+    Json(wb_tasks::usage::build_usage_analytics(&rows)).into_response()
+}
+
+/// 解析 realm 过滤条件（Python 的 `realm_scope` 语义）。
+///
+/// 优先级：`?realm=` → `X-Realm` 头 → `fallback`（`None` = 不过滤）。
+/// `"all"` 与空串都表示「所有 realm」（Python `realm_scope` 把 `"all"`
+/// 归一成 `None`）。
+fn realm_filter(
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    fallback: Option<&str>,
+) -> String {
+    params
+        .get("realm")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-realm")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| fallback.map(str::to_string))
+        .unwrap_or_default()
 }

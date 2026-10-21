@@ -19,6 +19,11 @@ pub mod outbound;
 pub mod pool;
 pub mod prompt;
 pub mod responses;
+// 关卡 4.19：两个后台线程的 **HTTP 那一半**——`pricing` 取 OpenRouter 价目
+// （Python `wb_pricing.fetch_openrouter`），`github` 取 releases（Python
+// `wb_updates.fetch_releases`）。本 crate 只取回原文，不塑形。
+pub mod github;
+pub mod pricing;
 pub mod retry;
 pub mod sanitize;
 pub mod stream;

@@ -81,37 +81,54 @@ async fn fixture(realm: &str, mock_status: u16) -> (tempfile::TempDir, MockServe
         .await;
 
     let dir = tempfile::tempdir().unwrap();
+    let acc_dir = accounts_dir(dir.path());
+    fs::create_dir_all(&acc_dir).unwrap();
     fs::write(
-        dir.path().join("active_realm.json"),
+        acc_dir.join("active_realm.json"),
         format!(r#"{{"realm":"{realm}"}}"#),
     )
     .unwrap();
     // auth_disabled=true：让成功路径用例不被默认鉴权拦住（401 用例单独设 launcher_key）。
     fs::write(
-        dir.path().join("settings.json"),
+        acc_dir.join("settings.json"),
         r#"{"ui_language":"zh","auth_disabled":true}"#,
     )
     .unwrap();
-    fs::write(dir.path().join("acc-1.json"), account_doc(realm)).unwrap();
+    fs::write(acc_dir.join("acc-1.json"), account_doc(realm)).unwrap();
     (dir, server)
 }
 
 /// 需要鉴权的 fixture（给 401 用例）：settings 带 launcher_key 且未关鉴权。
 fn auth_fixture_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("active_realm.json"), r#"{"realm":"intl"}"#).unwrap();
+    let acc_dir = accounts_dir(dir.path());
+    fs::create_dir_all(&acc_dir).unwrap();
+    fs::write(acc_dir.join("active_realm.json"), r#"{"realm":"intl"}"#).unwrap();
     fs::write(
-        dir.path().join("settings.json"),
+        acc_dir.join("settings.json"),
         r#"{"ui_language":"zh","launcher_key":"wb-test-key"}"#,
     )
     .unwrap();
-    fs::write(dir.path().join("acc-1.json"), account_doc("intl")).unwrap();
+    fs::write(acc_dir.join("acc-1.json"), account_doc("intl")).unwrap();
     dir
+}
+
+/// 账号目录：放在 tempdir **里面**的 `accounts/`。
+///
+/// ⚠️ 用量目录是从 `accounts_dir` 的**同级**目录推导的（`usage_dir_from`：
+/// `usage/` 与 `accounts/` 同级，对齐 Python `wb_proxy.py:402-403`）。若把
+/// accounts_dir 直接设成 tempdir 根，同级目录就变成 `/tmp` ⇒ 测试的用量行
+/// 会写到 `/tmp/usage/usage.jsonl`（tempdir 外面，不 hermetic 且每次跑都在长）。
+fn accounts_dir(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("accounts");
+    // 建目录是这个 helper 的副作用：测试里的账号/realm/settings 都往这里写。
+    let _ = std::fs::create_dir_all(&path);
+    path
 }
 
 fn config(dir: &Path, base_url: Option<&str>, realm: &str) -> Config {
     Config {
-        accounts_dir: dir.to_path_buf(),
+        accounts_dir: accounts_dir(dir),
         dashboard: dir.join("dashboard.html"),
         api_key: None,
         lan: false,
@@ -210,9 +227,13 @@ async fn anthropic_message_paths_return_messages_shape() {
 async fn anthropic_count_tokens_paths_return_input_tokens() {
     for uri in ANTHROPIC_COUNT_PATHS {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("active_realm.json"), r#"{"realm":"intl"}"#).unwrap();
         fs::write(
-            dir.path().join("settings.json"),
+            accounts_dir(dir.path()).join("active_realm.json"),
+            r#"{"realm":"intl"}"#,
+        )
+        .unwrap();
+        fs::write(
+            accounts_dir(dir.path()).join("settings.json"),
             r#"{"ui_language":"zh","auth_disabled":true}"#,
         )
         .unwrap();
@@ -271,7 +292,11 @@ async fn options_preflight_on_chat_paths_is_204_with_star_headers() {
 #[tokio::test]
 async fn realm_get_reports_process_realm_and_options() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("active_realm.json"), r#"{"realm":"cn"}"#).unwrap();
+    fs::write(
+        accounts_dir(dir.path()).join("active_realm.json"),
+        r#"{"realm":"cn"}"#,
+    )
+    .unwrap();
     let cfg = Arc::new(config(dir.path(), None, "cn"));
     let response = app(cfg)
         .oneshot(
@@ -303,7 +328,7 @@ async fn realm_post_persists_valid_and_rejects_invalid() {
     assert_eq!(value["ok"], true);
     assert_eq!(value["persisted"], true);
     // 落盘确认
-    let written = fs::read_to_string(dir.path().join("active_realm.json")).unwrap();
+    let written = fs::read_to_string(accounts_dir(dir.path()).join("active_realm.json")).unwrap();
     assert!(
         written.contains("cn"),
         "realm must be persisted, got {written}"
@@ -403,9 +428,13 @@ async fn upstream_rejection_is_passed_through_openai_envelope() {
 #[tokio::test]
 async fn empty_pool_does_not_hang_and_returns_error_envelope() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("active_realm.json"), r#"{"realm":"intl"}"#).unwrap();
     fs::write(
-        dir.path().join("settings.json"),
+        accounts_dir(dir.path()).join("active_realm.json"),
+        r#"{"realm":"intl"}"#,
+    )
+    .unwrap();
+    fs::write(
+        accounts_dir(dir.path()).join("settings.json"),
         r#"{"ui_language":"zh","auth_disabled":true}"#,
     )
     .unwrap();

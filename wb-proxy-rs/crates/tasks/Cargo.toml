@@ -19,8 +19,9 @@ wb-gateway = { path = "../gateway" }
 wb-storage = { path = "../storage" }
 # 关卡 4.5：RealSleeper 的节流等待（tokio::time::sleep）；关卡 4.7 的
 # production_fetch 需要 tokio::join! 并发两路取数（宏展开依赖 macros）。
+# 关卡 4.18（线 B）：credits_refresher 的后台线程需要 tokio::spawn（依赖 rt）。
 # runtime 仍由外层（wb-api）提供；测试侧另有 rt-multi-thread 的 dev 依赖。
-tokio = { version = "1", features = ["time", "macros"] }
+tokio = { version = "1", features = ["time", "macros", "rt"] }
 
 [dev-dependencies]
 # 契约测试的 mock 上游；绝不向真实上游发请求

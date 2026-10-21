@@ -65,6 +65,27 @@ pub mod summary;
 // 权威源是 `wb_tasks.py:771-879`；旧的 Rust 实现调的是上游不存在的
 // `POST /activity/growth/streak/claim`（Python 全仓 0 命中），本模块取代之。
 pub mod streak_bonus;
+// 关卡 4.18（线 B）：刷新类后台任务 —— `settings` 是刷新类任务用到的
+// settings 键位口径（`credits_refresh_hours` / `pricing_refresh_minutes` /
+// `pricing_enabled` / `update_check_enabled`），`credits_refresher` 是后台积分
+// 刷新线程。权威源分别是 Python `wb_settings.py` 与 `wb_accounts.py` 的
+// `CreditsRefresher`。
+pub mod credits_refresher;
+pub mod settings;
+// 关卡 4.19：另外两个后台线程 + 用量聚合。`price_refresher` 是 Python
+// `wb_pricing.PriceRefresher` 的移植，`update_checker` 是 Python
+// `wb_updates.UpdateChecker` 的移植，`usage` 是用量落盘与聚合
+// （Python `wb_proxy.record_usage` 与 `usage_snapshot` 等）。
+pub mod price_refresher;
+// 关卡 4.19（主会话）：`price_refresher` 的**生产数据源**——settings 读总
+// 开关（缺键=开）、`usage/` 写盘、OpenRouter 取价。
+pub mod price_source;
+pub mod update_checker;
+pub mod usage;
+// 关卡 4.18（线 C）：积分刷新的**生产数据源**——把 `wb_gateway::credits`
+// （HTTP 那一半）与 `crate::credits`（塑形那一半）接起来，并把快照原子
+// 写回账号文件。权威源是 Python `wb_accounts.Account.fetch_credits()`。
+pub mod credits_source;
 
 // ---------------------------------------------------------------------------
 // 契约 2：growth task 的 12 字段归一化

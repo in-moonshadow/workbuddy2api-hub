@@ -45,6 +45,44 @@ use crate::GrowthTask;
 // 生产装配辅助结构
 // ---------------------------------------------------------------------------
 
+/// 用量目录（Python `wb_proxy.USAGE_DIR` 的等价）。
+///
+/// Python：env `WB_PROXY_USAGE_DIR` 或**脚本同级**的 `usage/` 目录
+/// （`wb_proxy.py:402-403`），与 `accounts/` 同级。Rust 侧据此从
+/// `accounts_dir` 的**同级**目录推导，可用 `WB_USAGE_DIR` 覆盖。
+pub fn usage_dir_from(accounts_dir: &std::path::Path) -> PathBuf {
+    if let Ok(dir) = std::env::var("WB_USAGE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    accounts_dir
+        .parent()
+        .map(|p| p.join("usage"))
+        .unwrap_or_else(|| PathBuf::from("usage"))
+}
+
+/// 读账号文件里**本地已存**的积分快照（D36-b 的 `credits_refresh` 实现）。
+///
+/// Python 的 `account.fetch_credits()` 是「领奖后**同步即时抓上游**」；Rust 的
+/// 注入点是**同步闭包**，发不了异步请求 ⇒ 改为读本地快照（由后台刷新器
+/// `CreditsRefresher` 按 TTL 维护）。
+///
+/// ⚠️ 这是**有意差异**，不是等价实现：余额最多滞后一个 TTL（默认 12h）。
+/// 彻底对齐要把注入点改成 async（跨 `growth_runner` / `night_growth` /
+/// `claim_all` 三个模块的签名改造），留到后续关卡。
+///
+/// 读不到（账号文件缺失 / 没有 `credits` 键 / 读失败）⇒ `None`，
+/// 与 Python `fetch_credits()` 失败分支的「不改 credits」一致。
+pub fn local_credits_snapshot(
+    accounts_dir: &std::path::Path,
+    credential_file: &str,
+) -> Option<Value> {
+    wb_storage::read_account_credits(accounts_dir, credential_file)
+        .ok()
+        .flatten()
+}
+
 #[derive(Debug, Clone)]
 pub struct PooledTaskAccount {
     pub uid: String,
@@ -123,6 +161,12 @@ pub type SnapshotFetch = Arc<
 
 pub struct TaskRuntime {
     pub accounts_dir: PathBuf,
+    /// 用量目录（Python `wb_proxy.USAGE_DIR` 的等价）。
+    ///
+    /// Python：env `WB_PROXY_USAGE_DIR` 或**脚本同级**的 `usage/` 目录
+    /// （`wb_proxy.py:402-403`），与 `accounts/` 同级。Rust 侧据此从
+    /// `accounts_dir` 的**同级**目录推导，可用 `WB_USAGE_DIR` 覆盖。
+    pub usage_dir: PathBuf,
     pub pool: Vec<AccountState>,
     pub pool_present: bool,
     pub ready: Vec<ReadyAccount>,
@@ -146,6 +190,22 @@ pub struct TaskRuntime {
     pub panel: Arc<dyn PanelSink>,
     pub exec: OnceLock<Arc<dyn CycleExecutor>>,
     pub scheduler: OnceLock<Arc<Scheduler<'static>>>,
+    /// 后台积分刷新器（关卡 4.18）。
+    ///
+    /// 线程本体在 [`crate::credits_refresher`]，数据源在
+    /// [`crate::credits_source::ProductionCreditsSource`]。用 `OnceLock` 装，
+    /// 与 `exec` / `scheduler` 同一套做法：构造期装一次，之后只读。
+    pub credits_refresher: OnceLock<Arc<crate::credits_refresher::CreditsRefresher>>,
+    /// 后台定价刷新器（关卡 4.19）。
+    ///
+    /// 线程本体在 [`crate::price_refresher`]，生产数据源在
+    /// [`crate::price_source::SettingsPriceSource`]。
+    pub price_refresher: OnceLock<Arc<crate::price_refresher::PriceRefresher>>,
+    /// 后台更新检查器（关卡 4.19）。
+    ///
+    /// 线程本体在 [`crate::update_checker`]，生产数据源是同文件里的
+    /// `SettingsUpdateSource`。
+    pub update_checker: OnceLock<Arc<crate::update_checker::UpdateChecker>>,
 }
 
 impl TaskRuntime {
@@ -216,8 +276,10 @@ impl TaskRuntime {
         let schedule_clock = LocalScheduleClock;
         let sleeper = RealSleeper;
 
+        let usage_dir = usage_dir_from(&accounts_dir);
         let task = Arc::new(TaskRuntime {
             accounts_dir,
+            usage_dir,
             pool,
             pool_present,
             ready,
@@ -232,12 +294,56 @@ impl TaskRuntime {
             panel: panel.clone(),
             exec: OnceLock::new(),
             scheduler: OnceLock::new(),
+            credits_refresher: OnceLock::new(),
+            price_refresher: OnceLock::new(),
+            update_checker: OnceLock::new(),
         });
 
         let exec: Arc<dyn CycleExecutor> = Arc::new(ProductionExecutor {
             task: Arc::downgrade(&task),
         });
         let _ = task.exec.set(exec.clone());
+
+        // 后台积分刷新器（关卡 4.18）：TTL 来自 settings 的 `credits_refresh_hours`
+        // （默认 12h，上限 720h，0 = 关闭）。**线程不在这里启动**——启动点
+        // 在 `wb-api` 侧（`WB_BACKGROUND_TASKS` 开关控制），构造期只装配。
+        let settings = crate::settings::load_refresh_settings(&task.accounts_dir);
+        let refresher = Arc::new(crate::credits_refresher::CreditsRefresher::new(
+            Arc::new(crate::credits_source::ProductionCreditsSource::new(&task)),
+            settings.credits_refresh_hours,
+        ));
+        let _ = task.credits_refresher.set(refresher);
+
+        // 后台定价刷新器（关卡 4.19）：间隔来自 settings 的
+        // `pricing_refresh_minutes`（默认 5 分钟，0 = 关闭）。**线程不在这里
+        // 启动**——启动点与积分刷新器一样在 `wb-api` 侧（`WB_BACKGROUND_TASKS`）。
+        //
+        // ⚠️ 已知缺口：取价清单为空（Rust 侧无模型目录）⇒ 抓回来的模型列表
+        // 匹配不到任何 hub 模型 ⇒ 不写盘。见 `crate::price_source` 的模块文档。
+        let pricing_interval = settings.pricing_refresh_minutes.max(0) as f64 * 60.0;
+        let price_refresher = crate::price_source::production_price_refresher(
+            &task.accounts_dir,
+            &task.usage_dir,
+            pricing_interval,
+        );
+        let _ = task.price_refresher.set(price_refresher);
+
+        // 后台更新检查器（关卡 4.19）：`current_version` 用**本项目的发布版本号**
+        // （Python `wb_proxy.py:15207` 的 `server_version = "wb-proxy/1.7.1"`），
+        // 可用 env `WB_VERSION` 覆盖。不填 `0.1.0`（crate 版本）——那会让
+        // `update_available` 把任何正式版都判成「有更新」。
+        let current_version = std::env::var("WB_VERSION")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| crate::update_checker::HUB_VERSION.to_string());
+        let update_source = Arc::new(crate::update_checker::SettingsUpdateSource::new(
+            &task.accounts_dir,
+        ));
+        let update_checker = Arc::new(crate::update_checker::UpdateChecker::with_current_version(
+            update_source,
+            &current_version,
+        ));
+        let _ = task.update_checker.set(update_checker);
 
         let exec_ref: &'static dyn CycleExecutor = unsafe {
             std::mem::transmute::<&dyn CycleExecutor, &'static dyn CycleExecutor>(exec.as_ref())
@@ -352,8 +458,10 @@ impl TaskRuntime {
         panel: Arc<dyn PanelSink>,
         clock: Arc<dyn Clock>,
     ) -> Arc<dyn CycleExecutor> {
+        let usage_dir = usage_dir_from(&accounts_dir);
         let runtime = Arc::new(TaskRuntime {
             accounts_dir,
+            usage_dir,
             pool: vec![],
             pool_present: false,
             ready,
@@ -368,6 +476,9 @@ impl TaskRuntime {
             panel,
             exec: OnceLock::new(),
             scheduler: OnceLock::new(),
+            credits_refresher: OnceLock::new(),
+            price_refresher: OnceLock::new(),
+            update_checker: OnceLock::new(),
         });
         let exec = Arc::new(ProductionExecutor {
             task: Arc::downgrade(&runtime),
@@ -475,10 +586,16 @@ impl CycleExecutor for ProductionExecutor {
                 clock: task.clock.as_ref(),
             };
             // 领奖成功后刷新积分余额 —— Python `do_cat_travel` 的
-            // `account.fetch_credits()`（`wb_tasks.py:478`）。Rust 侧 M5 的
-            // `CreditsRefresher`（后台刷新 + 快照存储）尚未落地，此刻回填
-            // `None`（= 刷新失败不抛），**这是已知缺口**，不是等价实现。
-            let mut credits_refresh = || None::<Value>;
+            // `account.fetch_credits()`（`wb_tasks.py:478`）。
+            //
+            // ⚠️ **有意差异（D36-b）**：Python 是「领奖后**同步即时抓上游**」，
+            // 而 Rust 的注入点是**同步闭包**，发不了异步请求；这里改为读取
+            // 账号文件里**本地已存的快照**（由后台刷新器按 TTL 维护）。
+            // ⇒ 余额最多滞后一个 TTL（默认 12h），不是 Python 的「立刻是新的」。
+            // 彻底对齐要把注入点改成 async（跨 `growth_runner` / `night_growth`
+            // / `claim_all` 三个模块的签名改造），留到后续关卡。
+            let mut credits_refresh =
+                || local_credits_snapshot(&task.accounts_dir, &ra.state.credential_file);
             let res = build_cat_travel_refreshing(
                 &task.client,
                 &runner_acc,
@@ -555,9 +672,9 @@ impl CycleExecutor for ProductionExecutor {
                 clock: task.clock.as_ref(),
             };
             // 积分刷新注入：Python 在领奖成功后调 `account.fetch_credits()`。
-            // Rust 侧 M5 的 `CreditsRefresher`（后台刷新 + 快照存储）尚未落地，
-            // 此刻回填 `None`（= 刷新失败不抛），**这是已知缺口**，不是等价实现。
-            let mut credits_refresh = || None::<Value>;
+            // 同上，**有意差异（D36-b）**：读本地已存快照，不是即时抓上游。
+            let mut credits_refresh =
+                || local_credits_snapshot(&task.accounts_dir, &ra.state.credential_file);
             let outcome: NightGrowthOutcome = run_night_growth(
                 &task.client,
                 &runner_acc,
@@ -1056,7 +1173,10 @@ pub async fn route_tasks_run(task: &TaskRuntime, payload: &Value) -> Value {
         let deps = RunnerDeps {
             sleeper: &task.sleeper,
             clock: task.clock.as_ref(),
-            credits_refresh: Box::new(|| None),
+            // 同上，**有意差异（D36-b）**：读本地已存快照，不是即时抓上游。
+            credits_refresh: Box::new(|| {
+                local_credits_snapshot(&task.accounts_dir, &ra.state.credential_file)
+            }),
             cat_travel: CatTravel::Disabled,
             gap: 1.0,
         };
@@ -1344,6 +1464,72 @@ pub fn route_scheduler_toggle(task: &TaskRuntime) -> Value {
     task.scheduler()
         .map(|s| s.toggle_enabled())
         .unwrap_or_else(|| json!({"ok": false, "msg": "调度器未初始化"}))
+}
+
+/// 后台定价刷新器的状态（关卡 4.19）。
+///
+/// Python 侧对应 `PRICING.status()`（`wb_pricing.py:2511-2554`）。
+/// 未装配时返回同形状的「未运行」视图。
+pub fn route_pricing_status(task: &TaskRuntime) -> Value {
+    task.price_refresher
+        .get()
+        .map(|r| r.status())
+        .unwrap_or_else(|| {
+            json!({
+                "interval_minutes": 0,
+                "enabled": false,
+                "master_enabled": false,
+                "last_run": null,
+                "last_error": null,
+                "logs": [],
+            })
+        })
+}
+
+/// 后台更新检查器的状态（关卡 4.19）。
+///
+/// Python 侧对应 `UPDATES.status()`（`wb_updates.py:257-271`），十键。
+/// 未装配时返回同形状的「未运行」视图。
+pub fn route_updates_status(task: &TaskRuntime) -> Value {
+    task.update_checker
+        .get()
+        .map(|c| c.status())
+        .unwrap_or_else(|| {
+            json!({
+                "current_version": crate::update_checker::HUB_VERSION,
+                "latest_version": null,
+                "update_available": false,
+                "enabled": false,
+                "checking": false,
+                "last_attempt": null,
+                "last_success": null,
+                "last_error": null,
+                "release_url": null,
+                "published_at": null,
+            })
+        })
+}
+
+/// 后台积分刷新器的状态（关卡 4.18）。
+///
+/// Python 侧对应 `CreditsRefresher.status()`（`wb_accounts.py:2578-2586`），
+/// 六个键 `ttl_hours / interval_seconds / last_run / last_uid / last_error /
+/// logs` 的**键名与顺序逐字一致**。刷新器未装配时返回同一形状的「未运行」
+/// 视图，而不是 404 —— 面板上要能区分「没跑」与「跑过」。
+pub fn route_credits_refresher_status(task: &TaskRuntime) -> Value {
+    task.credits_refresher
+        .get()
+        .map(|r| r.status())
+        .unwrap_or_else(|| {
+            json!({
+                "ttl_hours": 0.0,
+                "interval_seconds": crate::credits_refresher::INTERVAL_SECONDS,
+                "last_run": null,
+                "last_uid": null,
+                "last_error": null,
+                "logs": [],
+            })
+        })
 }
 
 // SnapshotCache invalidate helper trait not needed; call directly.

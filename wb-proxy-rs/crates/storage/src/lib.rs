@@ -101,6 +101,21 @@ pub struct PoolAccount {
     pub realm: String,
     /// 账号所属产品线（Python `Account.product`；缺省为空串）。
     pub product: String,
+    /// 账号凭据**文件名**（不含目录），写回时按它定位同一个文件。
+    ///
+    /// 闸门 0 的 G0-3：`account_entries` 丢弃了 `PathBuf`，导致写回 API
+    /// 只能靠重拼文件名。Python 的 `Account` 自带 `self.path`（`wb_accounts.py:2560`），
+    /// `save()` 写回的就是同一个文件 ⇒ 这里必须把真实文件名带出来。
+    pub file_name: String,
+    /// 账号是否启用（Python `Account.enabled`）。
+    ///
+    /// 池装载**不做** enabled/cooldown 过滤（那是运行期状态），但后台刷新器
+    /// 需要它做候选筛选（Python `CreditsRefresher` 过滤 `enabled`）。
+    pub enabled: bool,
+    /// 账号文件里已存的积分快照（Python `Account.credits`）。
+    ///
+    /// `None` = 从未抓过 ⇒ 后台刷新器把它当作「无限旧」，优先刷新。
+    pub credits: Option<serde_json::Value>,
     pub has_token: bool,
     pub access_token: String,
 }
@@ -111,7 +126,7 @@ pub struct PoolAccount {
 /// 持有 enabled/cooldown_until），Python 也是全部载入后由 `ready()` 判。
 pub fn pool_accounts(accounts_dir: &Path) -> Result<Vec<PoolAccount>, StorageError> {
     let mut out = Vec::new();
-    for (_, doc) in account_entries(accounts_dir)?
+    for (name, doc) in account_entries(accounts_dir)?
         .into_iter()
         .map(AccountEntry::name_and_doc)
     {
@@ -136,6 +151,12 @@ pub fn pool_accounts(accounts_dir: &Path) -> Result<Vec<PoolAccount>, StorageErr
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            file_name: name,
+            enabled: doc
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            credits: doc.get("credits").cloned(),
             has_token: !access_token.is_empty(),
             access_token,
         });
@@ -275,8 +296,20 @@ pub fn write_idempotent_fields(
     fields.apply(&mut map);
     strip_runtime_only(&mut map);
 
-    let text = serde_json::to_string_pretty(&serde_json::Value::Object(map))
-        .map_err(|err| StorageError::Json(path.clone(), err))?;
+    write_json_atomic(&path, serde_json::Value::Object(map))
+}
+
+/// 把一个 JSON 文档原子落盘（同目录 temp + rename + `indent(2)`）。
+///
+/// 写回路径的**唯一**实现：`write_idempotent_fields`（账号幂等字段）、
+/// `write_account_credits`（积分快照）、`write_settings`（settings.json）
+/// 共用它，避免三处各写一遍 temp/rename 而漂移。
+///
+/// 失败语义：任何一步失败都清理临时文件并返回错误，**不留下半个文件**
+/// （`rename` 之前目标文件保持原样）。
+fn write_json_atomic(path: &Path, value: serde_json::Value) -> Result<(), StorageError> {
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|err| StorageError::Json(path.to_path_buf(), err))?;
     let tmp = path.with_file_name(format!(
         "{}.{}.{}.tmp",
         path.file_name()
@@ -286,11 +319,102 @@ pub fn write_idempotent_fields(
         thread_token()
     ));
     fs::write(&tmp, text).map_err(|err| StorageError::Io(tmp.clone(), err))?;
-    if let Err(err) = fs::rename(&tmp, &path) {
+    if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(StorageError::Io(path, err));
+        return Err(StorageError::Io(path.to_path_buf(), err));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// settings.json 通用读写（M5 接线层）
+// ---------------------------------------------------------------------------
+
+/// 读 `<accounts_dir>/settings.json`。
+///
+/// 文件缺失 / 内容为空 / 不是一个 JSON 对象 / **JSON 损坏** ⇒ 一律返回
+/// **空对象**（不报错）：Python 侧 `wb_settings` 在文件缺失或读不出来时用
+/// 内置默认值继续跑，Rust 侧不能因为缺一个可选文件、或文件被写坏，
+/// 就让整个服务起不来。
+pub fn read_settings(accounts_dir: &Path) -> Result<serde_json::Value, StorageError> {
+    Ok(match read_json(&accounts_dir.join("settings.json")) {
+        Ok(Some(doc)) if doc.is_object() => doc,
+        _ => serde_json::json!({}),
+    })
+}
+
+/// 把 `patch` 的**顶层键**合并进 settings.json 并原子落盘。
+///
+/// 合并语义是**浅合并**（顶层键覆盖，未提到的键原样保留）——与 Python
+/// `wb_settings` 的保存口径一致；`patch` 里非对象的值按整体替换处理。
+///
+/// 与 `read_settings` 的**宽容度相反**：settings.json 已存在但 JSON 损坏时
+/// **报错、不写**——否则这一写就会把用户其余设置连同损坏内容一起抹掉。
+pub fn write_settings(accounts_dir: &Path, patch: &serde_json::Value) -> Result<(), StorageError> {
+    let path = accounts_dir.join("settings.json");
+    let mut map = match read_json(&path)? {
+        Some(serde_json::Value::Object(map)) => map,
+        // 文件不存在，或内容不是对象（整体替换）
+        _ => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(patch_map) = patch {
+        for (key, value) in patch_map {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    write_json_atomic(&path, serde_json::Value::Object(map))
+}
+
+// ---------------------------------------------------------------------------
+// 账号文件里的积分快照（M5 积分刷新器的落点）
+// ---------------------------------------------------------------------------
+
+/// 读账号文件里的积分快照（Python `Account.credits`）。
+///
+/// 账号文件缺失 / 没有 `credits` 键 ⇒ `Ok(None)`（= 从未抓过）。
+pub fn read_account_credits(
+    accounts_dir: &Path,
+    name: &str,
+) -> Result<Option<serde_json::Value>, StorageError> {
+    let path = account_path(accounts_dir, name)?;
+    let Some(doc) = read_json(&path)? else {
+        return Ok(None);
+    };
+    Ok(doc.get("credits").cloned())
+}
+
+/// 把积分快照写回账号文件的 `credits` 键（原子读改写）。
+///
+/// 语义对齐 `write_idempotent_fields`：读**磁盘上的最新内容**再合并，
+/// 其余键（含未知键）原样保留，落盘前剥离 `RUNTIME_ONLY_FIELDS`。
+/// 账号文件不存在 ⇒ 报错（不静默新建一个空壳账号文件）。
+pub fn write_account_credits(
+    accounts_dir: &Path,
+    name: &str,
+    credits: &serde_json::Value,
+) -> Result<(), StorageError> {
+    let path = account_path(accounts_dir, name)?;
+    let Some(doc) = read_json(&path)? else {
+        return Err(StorageError::Io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::NotFound, "account file not found"),
+        ));
+    };
+    let mut map = match doc {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            return Err(StorageError::Json(
+                path,
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "account file is not a JSON object",
+                )),
+            ))
+        }
+    };
+    map.insert("credits".to_string(), credits.clone());
+    strip_runtime_only(&mut map);
+    write_json_atomic(&path, serde_json::Value::Object(map))
 }
 
 /// 临时文件名的唯一后缀（仅需「同进程内多次写不同名」）。
