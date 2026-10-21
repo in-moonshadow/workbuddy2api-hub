@@ -87,7 +87,13 @@ pub struct AccountState {
     pub unscoped_streak: i64,
     /// 免费模型额度窗口 `{模型名: ModelCap}`（note_model_cap 写，M3 仅承载）。
     pub model_caps: HashMap<String, ModelCap>,
-    /// 免费模型集合（note_model_cap 判定用；M5 按 realm 从 FREE_CAP_MODELS 填充）。
+    /// 运行时「免费模型」目录（Python `Account.free_models`）。
+    ///
+    /// ⚠️ **不是** `note_model_cap` 的门控：那条用静态表
+    /// `crate::cap::is_free_cap_model(realm, model)`（Python :953）。
+    /// 本字段对应 Python 的 `model_is_free()`（每日额度守卫），由
+    /// `apply_daily_credit_limit()` 从**模型目录**按 realm 填充 —— 与静态表
+    /// 是两套数据源。M5 的每日额度守卫尚未落地 ⇒ 目前**无消费者**、恒空。
     pub free_models: HashSet<String>,
     /// 最近一次错误消息（note_* 写，日志/诊断用）。
     pub last_error: String,

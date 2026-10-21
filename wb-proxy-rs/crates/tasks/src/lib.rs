@@ -29,6 +29,20 @@
 use serde_json::{json, Value};
 
 pub mod checkin;
+// 关卡 4.19（M5 数据侧）：面板/设置/用量这三条线的数据与纯逻辑。
+//   `credits`  积分快照的形状、解析与两条聚合口径（HTTP 那一半在
+//               `wb_gateway::credits`）；
+//   `activity` 账号每日活动的结构化历史（JSONL 投影、筛选、保留策略）；
+//   `cap`      模型额度 cap（code 6004）的判定层；
+//   `price`    定价快照与等价成本估算（OpenRouter 价目）；
+//   `update`   更新发现（只发现，不安装）。
+// 权威源分别是 Python `wb_accounts.py` / `wb_activity.py` / `wb_pricing.py` /
+// `wb_updates.py`。
+pub mod activity;
+pub mod cap;
+pub mod credits;
+pub mod price;
+pub mod update;
 // 关卡 4.9：claim-all 编排（`_route_tasks_claim_all`）。步骤全部经
 // [`scheduler::CycleExecutor`] 与 `growth_tasks` 接缝注入，测试不发真实请求。
 pub mod api_routes;
@@ -41,7 +55,16 @@ pub mod growth_api;
 pub mod growth_runner;
 pub mod scheduler;
 pub mod snapshot_cache;
+// 关卡 4.18：夜猫子任务（night_growth）——Python `wb_tasks.run_night_growth`
+// 的逐分支移植：夜间窗口判定 → 接取 → 上报夜间事件 → 轮询进度 → 达标领奖。
+// 权威源是 `wb_tasks.py:712-770`。
+pub mod night_growth;
 pub mod summary;
+// 关卡 4.17：连登管家（streak_bonus）——Python `wb_tasks.run_streak_bonus`
+// 的四步移植：补签保连登 → 礼包/补偿 → 7d/14d/28d 档位兑换 → 自动抽奖闭环。
+// 权威源是 `wb_tasks.py:771-879`；旧的 Rust 实现调的是上游不存在的
+// `POST /activity/growth/streak/claim`（Python 全仓 0 命中），本模块取代之。
+pub mod streak_bonus;
 
 // ---------------------------------------------------------------------------
 // 契约 2：growth task 的 12 字段归一化

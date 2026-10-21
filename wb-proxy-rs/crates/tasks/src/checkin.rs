@@ -32,6 +32,7 @@
 //! 活动历史；Rust 侧没有活动历史子系统，本模块不写该记录，也不改变返回形状。
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -44,6 +45,16 @@ use wb_storage::{write_idempotent_fields, IdempotentFields};
 use crate::events::{build_event, report_events};
 use crate::growth_api::TaskEndpoints;
 use crate::growth_runner::{Clock, RunnerAccount};
+
+/// 每日签到的 HTTP 超时（秒）。
+///
+/// 对齐 Python `wb_accounts.py:1683` 的 `http_json(..., timeout=15)`。
+const CHECKIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 连签天数的 HTTP 超时（秒）。
+///
+/// 对齐 Python `wb_tasks.py:156`（`fetch_streak_days`）的 `timeout=10`。
+const STREAK_DAYS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `CHECKIN_PATH`（`wb_accounts.py:211`）：拼在 `billing_upstream` 之后。
 pub const CHECKIN_PATH: &str = "/v2/billing/meter/daily-checkin";
@@ -277,7 +288,10 @@ pub async fn checkin(
         device_token: ctx.device_token,
     });
 
-    let resp = match client.post(&url, &headers, &json!({})).await {
+    let resp = match client
+        .post_with_timeout(&url, &headers, &json!({}), CHECKIN_TIMEOUT)
+        .await
+    {
         Ok(r) => r,
         // 网络 / 超时：不写盘
         Err(e) => return CheckinOutcome::failure(e.to_string()),
@@ -338,7 +352,10 @@ pub async fn fetch_streak_days(
     headers: &std::collections::HashMap<String, String>,
 ) -> Option<i64> {
     let url = format!("{chat_base}/activity/growth/streak");
-    let resp = client.get(&url, headers).await.ok()?;
+    let resp = client
+        .get_with_timeout(&url, headers, STREAK_DAYS_TIMEOUT)
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }

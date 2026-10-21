@@ -198,6 +198,7 @@ fn streak_account(uid: &str, token: &str, realm: &str, enabled: bool) -> ReadyAc
         uid: uid.into(),
         token: token.into(),
         enterprise_id: "".into(),
+        realm: realm.into(),
         chat_headers,
     };
     ReadyAccount {
@@ -223,11 +224,14 @@ fn streak_runtime(
         chat_base,
         web_base: chat_base,
     };
+    // `billing_base` 必须与 `chat_base` 同指 mock server：连登管家的
+    // 「新手礼包 / 活动补偿」两步走的是 billing 域（Python 的 `BILL_BASE`），
+    // 若指向别处，这两个请求会绕过 mock 打向真实上游。
     let task = TaskRuntime::new(
         dir.path(),
         Arc::new(ApiPanelSink),
         endpoints,
-        "http://127.0.0.1".to_string(),
+        chat_base.to_string(),
         None,
     );
     // SAFETY: strong_count == 1，同一线程内独占访问，无并发数据竞争。
@@ -249,6 +253,118 @@ fn streak_req(uid: Option<&str>) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
+}
+
+/// 挂上 Python `run_streak_bonus` 四步用到的**全部**上游端点。
+///
+/// 口径逐字对齐 `wb_tasks.py:771-866`：
+/// - `GET /activity/growth/heatmap`：`cells` 为空 ⇒ 找不到昨天的格子 ⇒
+///   不算漏签 ⇒ **不**查补签卡、**不**发 `makeup-cards/use`；
+/// - `GET /activity/growth/streak`：`redemption_status.tiers` 为空 ⇒ 不兑换；
+/// - `POST /billing/meter/claim-gift` / `claim-compensation`：`code != 0` ⇒ 不记日志；
+/// - `GET /activity/growth/lottery/summary`：`chances = 0` ⇒ 不抽奖。
+///
+/// 于是「什么都没做」⇒ `msg` = 「连登状态正常（无需兑换/无抽奖次数）」。
+async fn mount_streak_bonus_steps(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/activity/growth/heatmap"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "data": {"cells": []}})),
+        )
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/activity/growth/streak"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "data": {
+                "makeup_cards": {"balance": 0},
+                "redemption_status": {"tiers": []}
+            }
+        })))
+        .mount(server)
+        .await;
+
+    // Python：两个 billing 端点各 POST 一个空对象 `{}`。
+    Mock::given(method("POST"))
+        .and(path("/billing/meter/claim-gift"))
+        .and(body_json(json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 1, "msg": "已领取"})))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/billing/meter/claim-compensation"))
+        .and(body_json(json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 1, "msg": "无补偿"})))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/activity/growth/lottery/summary"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "data": {"chances": 0}})),
+        )
+        .mount(server)
+        .await;
+}
+
+/// 让**指定 token** 的那几步上游全部返回 500。
+///
+/// 优先级设为 1（wiremock：`1` 最高，同优先级按挂载顺序），确保它压过
+/// [`mount_streak_bonus_steps`] 挂的通用 mock。
+async fn mount_streak_bonus_failures(server: &MockServer, token: &str) {
+    for (m, p) in [
+        (method("GET"), "/activity/growth/heatmap"),
+        (method("GET"), "/activity/growth/streak"),
+        (method("GET"), "/activity/growth/lottery/summary"),
+        (method("POST"), "/billing/meter/claim-gift"),
+        (method("POST"), "/billing/meter/claim-compensation"),
+    ] {
+        Mock::given(m)
+            .and(path(p))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+}
+
+/// 造一个**状态与凭据 realm 不一致**的账号。
+///
+/// 生产上账号池的 `state.realm` 与 `creds.realm` 同源，不会不一致；这个构造
+/// 只为锁定路由的**聚合分支**：任一账号 `ok == false` ⇒ 整体 `ok == false`
+/// 且 `msg` 变为「streak bonus partially failed」（`dashboard.html` 据
+/// `r.ok` 显示失败态）。
+fn streak_account_split_realm(
+    uid: &str,
+    token: &str,
+    state_realm: &str,
+    creds_realm: &str,
+    enabled: bool,
+) -> ReadyAccount {
+    let mut state = AccountState::new(uid, state_realm);
+    state.access_token = token.into();
+    state.enabled = enabled;
+    let view = AccountView::from_state(&state).with_last_records(None, None, None, false);
+    let mut chat_headers = HashMap::new();
+    chat_headers.insert("Authorization".into(), format!("Bearer {token}"));
+    let creds = PooledTaskAccount {
+        uid: uid.into(),
+        token: token.into(),
+        enterprise_id: "".into(),
+        realm: creds_realm.into(),
+        chat_headers,
+    };
+    ReadyAccount {
+        state,
+        view,
+        creds,
+        nickname: None,
+        device_token: None,
+    }
 }
 
 /// 空账号池（ready 为空）：未找到已启用的国内版账号，accounts_count 为 0。
@@ -306,17 +422,15 @@ async fn streak_bonus_route_uid_not_found() {
 }
 
 /// uid 过滤：只选 realm=cn 且 enabled 的账号；intl 与 cn 禁用账号均被排除。
+///
+/// ⚠️ mock 的是 Python `wb_tasks.run_streak_bonus` 的**四步**端点
+/// （`wb_tasks.py:771-866`），不是旧实现那个上游不存在的
+/// `POST /activity/growth/streak/claim`。
 #[tokio::test]
 async fn streak_bonus_route_uid_filters_cn_enabled() {
     let server = MockServer::start().await;
     let base: &'static str = Box::leak(server.uri().into_boxed_str());
-    Mock::given(method("POST"))
-        .and(path("/activity/growth/streak/claim"))
-        .and(body_json(json!({})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 0})))
-        .expect(1)
-        .mount(&server)
-        .await;
+    mount_streak_bonus_steps(&server).await;
 
     let dir = TempDir::new().unwrap();
     let ready = vec![
@@ -342,26 +456,29 @@ async fn streak_bonus_route_uid_filters_cn_enabled() {
     assert_eq!(results[0]["uid"], "u-cn");
     assert_eq!(results[0]["nickname"], uid8("u-cn"));
     assert_eq!(results[0]["ok"], true);
-    assert_eq!(results[0]["msg"], "");
+    // Python `run_streak_bonus` 的 `msg` 是**日志拼接**（无日志时是
+    // 「连登状态正常（无需兑换/无抽奖次数）」），不是空串。
+    assert_eq!(results[0]["msg"], "连登状态正常（无需兑换/无抽奖次数）");
+    // 只应向选中的 cn 启用账号发请求（intl / 停用账号零请求）。
     let reqs = server.received_requests().await.expect("requests");
-    assert_eq!(reqs.len(), 1, "只应向选中的 cn 启用账号发 1 次上游请求");
+    assert!(!reqs.is_empty(), "选中的 cn 启用账号应当有上游请求");
+    for r in &reqs {
+        assert!(
+            r.headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap_or_default() == "Bearer cn-tok")
+                .unwrap_or(false),
+            "intl / 停用账号不应有上游请求：{r:?}"
+        );
+    }
 }
 
-/// 单账号成功：上游 code=0 带 logs，路由透传 ok 与 msg。
+/// 单账号成功：走完四步，路由透传 ok 与 msg。
 #[tokio::test]
 async fn streak_bonus_route_single_success() {
     let server = MockServer::start().await;
     let base: &'static str = Box::leak(server.uri().into_boxed_str());
-    Mock::given(method("POST"))
-        .and(path("/activity/growth/streak/claim"))
-        .and(body_json(json!({})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "code": 0,
-            "data": {"logs": ["连登 +1", "当前连续 5 天"]},
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    mount_streak_bonus_steps(&server).await;
 
     let dir = TempDir::new().unwrap();
     let task = streak_runtime(
@@ -385,35 +502,72 @@ async fn streak_bonus_route_single_success() {
     assert_eq!(v["results"][0]["uid"], "u-streak");
     assert_eq!(v["results"][0]["nickname"], uid8("u-streak"));
     assert_eq!(v["results"][0]["ok"], true);
-    assert_eq!(v["results"][0]["msg"], "");
+    // 本 mock 下：昨天没漏签（不补签）、无兑换档位、无抽奖次数 ⇒ 无日志 ⇒
+    // `msg` 是 Python 的「连登状态正常（无需兑换/无抽奖次数）」。
+    assert_eq!(
+        v["results"][0]["msg"],
+        "连登状态正常（无需兑换/无抽奖次数）"
+    );
 }
 
-/// 多账号部分失败：一个成功一个失败，路由 ok=false 且 msg 为部分失败，各自结果透传。
+/// 上游整片失败**不改 ok**：Python 的 `run_streak_bonus` 里各步失败只跳过
+/// 该步、整体仍 `ok: true`（失败原因进 `_log`，返回体里看不到）。
+///
+/// Rust 侧对应的是 `StreakBonusOutcome.warnings`（**不进 `to_json()`**），
+/// 所以路由结果里既不该出现 `ok:false`，也不该泄漏 `warnings`。
 #[tokio::test]
-async fn streak_bonus_route_partial_failure() {
+async fn streak_bonus_route_upstream_failure_keeps_ok_true() {
     let server = MockServer::start().await;
     let base: &'static str = Box::leak(server.uri().into_boxed_str());
-    Mock::given(method("POST"))
-        .and(path("/activity/growth/streak/claim"))
-        .and(body_json(json!({})))
-        .and(header("authorization", "Bearer ok-tok"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 0})))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/activity/growth/streak/claim"))
-        .and(body_json(json!({})))
-        .and(header("authorization", "Bearer fail-tok"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 1, "msg": "已领取"})))
-        .expect(1)
-        .mount(&server)
-        .await;
+    mount_streak_bonus_steps(&server).await;
+    mount_streak_bonus_failures(&server, "fail-tok").await;
 
     let dir = TempDir::new().unwrap();
     let ready = vec![
         streak_account("u-ok", "ok-tok", "cn", true),
         streak_account("u-fail", "fail-tok", "cn", true),
+    ];
+    let task = streak_runtime(&dir, base, true, ready);
+    let app = app_with(
+        make_cfg(&dir),
+        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
+        task,
+    );
+    let resp = app.oneshot(streak_req(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["ok"], true, "上游失败不改整体 ok（与 Python 一致）：{v}");
+    assert_eq!(v["msg"], "streak bonus completed");
+    assert_eq!(v["accounts_count"], 2);
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["uid"], "u-ok");
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[1]["uid"], "u-fail");
+    assert_eq!(results[1]["ok"], true, "该账号的上游全 500，但账号级仍 ok");
+    // 失败原因不落在返回体里（Python 写 `_log`，Rust 写 `warnings`）。
+    assert!(results[1].get("warnings").is_none(), "{results:?}");
+    assert!(results[1].get("logs").is_none(), "{results:?}");
+}
+
+/// 路由的**聚合分支**：任一账号 `ok:false` ⇒ 整体 `ok:false` +
+/// 「streak bonus partially failed」。
+///
+/// 唯一能产出账号级 `ok:false` 的是连登管家的**国际版门禁**，而路由筛选
+/// 只放 `realm == "cn"` 的账号——生产上两者同源、不会同时发生，所以这里用
+/// `state.realm` 与 `creds.realm` 不一致的构造来锁定聚合分支本身。
+#[tokio::test]
+async fn streak_bonus_route_partial_failure() {
+    let server = MockServer::start().await;
+    let base: &'static str = Box::leak(server.uri().into_boxed_str());
+    mount_streak_bonus_steps(&server).await;
+
+    let dir = TempDir::new().unwrap();
+    let ready = vec![
+        streak_account("u-ok", "ok-tok", "cn", true),
+        // 状态是 cn（能过路由筛选），但凭据是 intl ⇒ 撞上国际版门禁。
+        streak_account_split_realm("u-gate", "gate-tok", "cn", "intl", true),
     ];
     let task = streak_runtime(&dir, base, true, ready);
     let app = app_with(
@@ -432,9 +586,18 @@ async fn streak_bonus_route_partial_failure() {
     assert_eq!(results.len(), 2);
     assert_eq!(results[0]["uid"], "u-ok");
     assert_eq!(results[0]["ok"], true);
-    assert_eq!(results[1]["uid"], "u-fail");
+    assert_eq!(results[1]["uid"], "u-gate");
+    // 国际版门禁：`{"ok": false, "msg": "连登管家仅限国内版账号"}`（无 logs 键）。
     assert_eq!(results[1]["ok"].as_bool(), Some(false));
-    assert_eq!(results[1]["msg"], "已领取");
+    assert_eq!(results[1]["msg"], "连登管家仅限国内版账号");
+    // 门禁早退 ⇒ 不发任何上游请求。
     let reqs = server.received_requests().await.expect("requests");
-    assert_eq!(reqs.len(), 2);
+    assert!(
+        reqs.iter().all(|r| r
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap_or_default())
+            != Some("Bearer gate-tok")),
+        "撞门禁的账号不该有上游请求：{reqs:?}"
+    );
 }

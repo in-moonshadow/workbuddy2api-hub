@@ -143,9 +143,18 @@ pub fn app_with(
         .route("/health", get(health))
         .route("/", get(dashboard))
         .route("/realm", get(realm_get).post(realm_post))
+        .route("/panel/status", get(panel_status).options(preflight))
         .route(
             "/accounts/checkin",
             post(accounts_checkin).options(preflight),
+        )
+        .route(
+            "/accounts/daily-chat",
+            post(accounts_daily_chat).options(preflight),
+        )
+        .route(
+            "/accounts/daily-chat-web",
+            post(accounts_daily_chat_web).options(preflight),
         )
         .route("/tasks", get(tasks_get).options(preflight))
         .route("/tasks/run", post(tasks_run).options(preflight))
@@ -771,6 +780,58 @@ impl PanelSink for ApiPanelSink {
 }
 
 // ---------------------------------------------------------------------------
+// 面板状态（对齐 Python `wb_proxy.py:15781 _get_panel_status`）
+// ---------------------------------------------------------------------------
+
+/// 面板状态：面板靠它决定是否显示登录闸门。
+///
+/// 这条**不在** Python 的面板路由前缀表里（`_is_panel_route` 不含 `/panel`），
+/// 所以不需要会话就能问。返回里没有秘密——只有「有没有设 key」「密码是不是默认
+/// 值」这类布尔（Python 注释同义）。
+async fn panel_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let token = headers
+        .get("x-panel-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let api_key_set =
+        wb_storage::effective_api_key(&state.cfg.accounts_dir, state.cfg.api_key.as_deref())
+            .is_some();
+    Json(json!({
+        "panel_password_required": true,
+        "panel_password_is_default": panel_password_is_default(&state.cfg.accounts_dir),
+        "authenticated": state.panels.valid(&token),
+        "api_key_set": api_key_set,
+    }))
+    .into_response()
+}
+
+/// 面板密码是否还是默认值（对齐 Python `wb_settings.panel_password_is_default`）。
+///
+/// settings.json 里没有 `panel_password_hash` ⇒ 从没改过 ⇒ 仍是默认值；改过之后
+/// 只有 `panel_password_default == true` 才算「还是默认」。
+fn panel_password_is_default(accounts_dir: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(accounts_dir.join("settings.json")) else {
+        return true;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return true;
+    };
+    let Some(obj) = doc.as_object() else {
+        return true;
+    };
+    let hash = obj
+        .get("panel_password_hash")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if hash.is_empty() {
+        return true;
+    }
+    obj.get("panel_password_default").and_then(Value::as_bool) == Some(true)
+}
+
+// ---------------------------------------------------------------------------
 // 任务路由 handlers（关卡 4.10）
 // ---------------------------------------------------------------------------
 
@@ -794,6 +855,56 @@ async fn accounts_checkin(
         return openai_error(400, "expected a JSON object", "invalid_request_error");
     }
     let res = task_routes::route_accounts_checkin(&state.task, &payload).await;
+    Json(res).into_response()
+}
+
+/// 手动每日活跃打卡（对齐 Python `_route_accounts_daily_chat`）：完整打卡，
+/// 桌面腿 + 按设置决定要不要再跑网页腿。
+async fn accounts_daily_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let payload = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if !payload.is_object() {
+        return openai_error(400, "expected a JSON object", "invalid_request_error");
+    }
+    let res = task_routes::route_accounts_daily_chat(&state.task, &payload).await;
+    Json(res).into_response()
+}
+
+/// 手动**网页通道**打卡（对齐 Python `_route_accounts_daily_chat_web`）：只建
+/// 网页端会话，**不写** `lastDailyChat`。
+async fn accounts_daily_chat_web(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if unauthorized(&headers, &HashMap::new(), &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let payload = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if !payload.is_object() {
+        return openai_error(400, "expected a JSON object", "invalid_request_error");
+    }
+    let res = task_routes::route_accounts_daily_chat_web(&state.task, &payload).await;
     Json(res).into_response()
 }
 

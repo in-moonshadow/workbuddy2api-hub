@@ -137,13 +137,19 @@ pub fn note_error(
     }
 }
 
-/// note_model_cap（wb_accounts.py:927-959）：code 6004「额度用满」日额度。
-/// 仅 free_models 内的模型记 model_caps（重复撞同 reset 不算新记）；
-/// model_cooldowns[model] = max(旧, reset_at)。free_models 为空（M5 填充）
-/// 时只挂冷却不记 caps。
+/// note_model_cap（wb_accounts.py:941-973）：code 6004「额度用满」日额度。
+///
+/// **范围门控按静态表** `is_free_cap_model(account.realm, model)`
+/// （Python :953）——不是按 `account.free_models`。两者是 Python 里并存的
+/// 两套机制：静态表管「6004 要不要写进 `model_caps`」（跨重启持久禁用），
+/// `free_models` 管「这个模型算不算免费」（每日额度守卫 `model_is_free`）。
+/// Rust 侧 `free_models` 目前恒空（M5 的每日额度守卫尚未落地），用它当门控
+/// 会让 6004 永远不落 `model_caps`。
+///
+/// 重复撞同 reset 不算新记；`model_cooldowns[model] = max(旧, reset_at)`。
 pub fn note_model_cap(account: &mut AccountState, model: &str, reset_at: Option<f64>, now: f64) {
     if let Some(reset) = reset_at {
-        if account.free_models.contains(model) {
+        if crate::cap::is_free_cap_model(&account.realm, model) {
             let fresh = account
                 .model_caps
                 .get(model)
@@ -447,8 +453,8 @@ mod tests {
 
     #[test]
     fn note_model_cap_marks_cap_and_cooldown() {
+        // acc() 是 realm="intl"：hy3 在 intl 的限额联动范围内。
         let mut a = acc("u1");
-        a.free_models.insert("hy3".into());
         note_model_cap(&mut a, "hy3", Some(NOW + 3600.0), NOW);
         assert!(a.model_caps.contains_key("hy3"));
         assert_eq!(a.model_cooldowns.get("hy3"), Some(&(NOW + 3600.0)));
@@ -459,6 +465,27 @@ mod tests {
         note_model_cap(&mut a, "other", Some(NOW + 500.0), NOW);
         assert!(!a.model_caps.contains_key("other"));
         assert_eq!(a.model_cooldowns.get("other"), Some(&(NOW + 500.0)));
+    }
+
+    /// D36：门控按**静态表 × realm**，不按 `free_models`。
+    ///
+    /// `deepseek-v4.1-flash` 在 intl 表内、在 cn 表外 —— 同一次 6004，
+    /// 两个 region 的结论必须不同。旧实现查 `free_models`（Rust 侧恒空），
+    /// 会两边都不记 cap。
+    #[test]
+    fn note_model_cap_gates_on_the_realm_scoped_static_table() {
+        let mut intl = acc("u-intl");
+        note_model_cap(&mut intl, "deepseek-v4.1-flash", Some(NOW + 100.0), NOW);
+        assert!(intl.model_caps.contains_key("deepseek-v4.1-flash"));
+
+        let mut cn = AccountState::new("u-cn", "cn");
+        note_model_cap(&mut cn, "deepseek-v4.1-flash", Some(NOW + 100.0), NOW);
+        assert!(!cn.model_caps.contains_key("deepseek-v4.1-flash"));
+        // 范围外的模型仍然挂冷却
+        assert_eq!(
+            cn.model_cooldowns.get("deepseek-v4.1-flash"),
+            Some(&(NOW + 100.0))
+        );
     }
 
     #[test]

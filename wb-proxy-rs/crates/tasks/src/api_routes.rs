@@ -22,16 +22,22 @@ use wb_storage::read_idempotent_fields;
 use crate::checkin::production_billing_base;
 use crate::claim_all::{self, route_claim_all, uid8, ClaimAllDeps, ClaimAllRequest};
 use crate::daily_chat::{
-    daily_chat as run_daily_chat, DailyChatAccount, DailyChatConfig, DailyChatCtx,
+    daily_chat as run_daily_chat, daily_chat_web as run_daily_chat_web, DailyChatAccount,
+    DailyChatConfig, DailyChatCtx,
 };
-use crate::growth_api::{accept_tasks, claim_task, fetch_growth_tasks, TaskAccount, TaskEndpoints};
+use crate::growth_api::{TaskAccount, TaskEndpoints};
 use crate::growth_runner::{
-    build_cat_travel, run_growth_tasks, CatTravel, RunnerAccount, RunnerCtx, RunnerDeps, RunnerEnv,
+    build_cat_travel_refreshing, run_growth_tasks, CatTravel, RunnerAccount, RunnerCtx, RunnerDeps,
+    RunnerEnv,
 };
 use crate::growth_runner::{Clock, LocalClock, RealSleeper, Sleeper};
+use crate::night_growth::{run_night_growth, NightGrowthOutcome};
 use crate::scheduler::AccountView;
 use crate::scheduler::{CycleExecutor, LocalScheduleClock, PanelSink, Scheduler};
 use crate::snapshot_cache::{cache_ttl_from_env, growth_snapshot, SnapshotCache};
+use crate::streak_bonus::{
+    run_streak_bonus, StreakBonusAccount, StreakBonusConfig, StreakBonusCtx,
+};
 use crate::GrowthSummary;
 use crate::GrowthTask;
 
@@ -44,6 +50,11 @@ pub struct PooledTaskAccount {
     pub uid: String,
     pub token: String,
     pub enterprise_id: String,
+    /// 账号区域（`cn` / `intl`）。
+    ///
+    /// billing 用途的出站头要用它选 realm 口径（UA / Origin / X-Domain /
+    /// Accept-Language），chat 用途的头不依赖它——故此前不在本结构里。
+    pub realm: String,
     pub chat_headers: HashMap<String, String>,
 }
 
@@ -55,6 +66,25 @@ impl PooledTaskAccount {
             enterprise_id: &self.enterprise_id,
             chat_headers: &self.chat_headers,
         }
+    }
+
+    /// billing 用途的出站头（对齐 Python `Account.headers(purpose="billing")`）。
+    ///
+    /// 与 chat 头**不是同一套**：计费端点不吃 X-IDE-* / X-Agent-* 身分头，
+    /// User-Agent 是轻量 `WorkBuddy/x.y.z`。`domain` 传空串 ——
+    /// `billing_request_headers` 会回落到 realm 规范域名（Python 侧
+    /// `self.domain` 为空时同样回落 `cfg["domain"]`）。`device_token` 传
+    /// `None`：Rust 侧尚未实现 Python 的设备令牌文件读取
+    /// （`resolve_device_token`），该头缺失不改变请求成败。
+    pub fn billing_headers(&self, device_token: Option<&str>) -> HashMap<String, String> {
+        wb_gateway::headers::billing_request_headers(&wb_gateway::headers::BillingHeadersParams {
+            uid: &self.uid,
+            token: &self.token,
+            realm: &self.realm,
+            domain: "",
+            enterprise_id: &self.enterprise_id,
+            device_token,
+        })
     }
 }
 
@@ -105,7 +135,12 @@ pub struct TaskRuntime {
     /// 不用国内版常量。契约测试把它换成 mock base。
     pub daily_chat_config: DailyChatConfig,
     pub client: UpstreamClient,
-    pub clock: LocalClock,
+    /// 本地时钟（夜猫子窗口判定、签到日期都依赖它）。
+    ///
+    /// 做成 `Arc<dyn Clock>` 而不是具体的 `LocalClock`：夜猫子的「23:00-08:00
+    /// 窗口」判定会让**执行器层**的契约测试只在真实夜间才跑得动。契约测试
+    /// 用 `test_with_ready_and_clock` 注入固定时钟，让断言与真实时间无关。
+    pub clock: Arc<dyn Clock>,
     pub schedule_clock: LocalScheduleClock,
     pub sleeper: RealSleeper,
     pub panel: Arc<dyn PanelSink>,
@@ -151,6 +186,7 @@ impl TaskRuntime {
                 uid: st.uid.clone(),
                 token: st.access_token.clone(),
                 enterprise_id: st.enterprise_id.clone(),
+                realm: st.realm.clone(),
                 chat_headers,
             };
             ready.push(ReadyAccount {
@@ -176,7 +212,7 @@ impl TaskRuntime {
         );
 
         let client = UpstreamClient::new();
-        let clock = LocalClock;
+        let clock: Arc<dyn Clock> = Arc::new(LocalClock);
         let schedule_clock = LocalScheduleClock;
         let sleeper = RealSleeper;
 
@@ -277,6 +313,45 @@ impl TaskRuntime {
         accounts_dir: PathBuf,
         panel: Arc<dyn PanelSink>,
     ) -> Arc<dyn CycleExecutor> {
+        Self::test_with_ready_and_clock_dir(
+            ready,
+            endpoints,
+            daily_chat_config,
+            accounts_dir,
+            panel,
+            Arc::new(LocalClock),
+        )
+    }
+
+    /// 仅供契约测试：与 [`Self::test_with_ready`] 相同，但**注入固定时钟**。
+    ///
+    /// 夜猫子任务只在 23:00-08:00 的窗口内执行，窗口判定读的是
+    /// `TaskRuntime` 的时钟——不注入固定时钟的话，执行器层的夜猫子断言只在
+    /// 真实夜间成立（白天跑必然挂）。
+    pub fn test_with_ready_and_clock(
+        ready: Vec<ReadyAccount>,
+        endpoints: TaskEndpoints<'static>,
+        panel: Arc<dyn PanelSink>,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<dyn CycleExecutor> {
+        Self::test_with_ready_and_clock_dir(
+            ready,
+            endpoints,
+            DailyChatConfig::default(),
+            PathBuf::new(),
+            panel,
+            clock,
+        )
+    }
+
+    fn test_with_ready_and_clock_dir(
+        ready: Vec<ReadyAccount>,
+        endpoints: TaskEndpoints<'static>,
+        daily_chat_config: DailyChatConfig,
+        accounts_dir: PathBuf,
+        panel: Arc<dyn PanelSink>,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<dyn CycleExecutor> {
         let runtime = Arc::new(TaskRuntime {
             accounts_dir,
             pool: vec![],
@@ -287,7 +362,7 @@ impl TaskRuntime {
             endpoints,
             daily_chat_config,
             client: UpstreamClient::new(),
-            clock: LocalClock,
+            clock,
             schedule_clock: LocalScheduleClock,
             sleeper: RealSleeper,
             panel,
@@ -331,7 +406,7 @@ impl CycleExecutor for ProductionExecutor {
             let ctx = CnStepCtx {
                 dir: &task.accounts_dir,
                 account_name: &ra.state.credential_file,
-                clock: &task.clock as &dyn Clock,
+                clock: task.clock.as_ref(),
                 device_token: ra.device_token.as_deref(),
                 billing_base: &task.billing_base,
                 account: runner_acc,
@@ -362,7 +437,7 @@ impl CycleExecutor for ProductionExecutor {
             let ctx = CnStepCtx {
                 dir: &task.accounts_dir,
                 account_name: &ra.state.credential_file,
-                clock: &task.clock as &dyn Clock,
+                clock: task.clock.as_ref(),
                 device_token: ra.device_token.as_deref(),
                 billing_base: &task.billing_base,
                 account: runner_acc,
@@ -397,10 +472,22 @@ impl CycleExecutor for ProductionExecutor {
             let mut logs = Vec::new();
             let ctx = RunnerCtx {
                 sleeper: &task.sleeper,
-                clock: &task.clock,
+                clock: task.clock.as_ref(),
             };
-            let res =
-                build_cat_travel(&task.client, &runner_acc, &task.endpoints, &mut logs, &ctx).await;
+            // 领奖成功后刷新积分余额 —— Python `do_cat_travel` 的
+            // `account.fetch_credits()`（`wb_tasks.py:478`）。Rust 侧 M5 的
+            // `CreditsRefresher`（后台刷新 + 快照存储）尚未落地，此刻回填
+            // `None`（= 刷新失败不抛），**这是已知缺口**，不是等价实现。
+            let mut credits_refresh = || None::<Value>;
+            let res = build_cat_travel_refreshing(
+                &task.client,
+                &runner_acc,
+                &task.endpoints,
+                &mut logs,
+                &ctx,
+                &mut credits_refresh,
+            )
+            .await;
             json!({"ok": true, "credit": res.get("credit").and_then(Value::as_i64)})
         })
     }
@@ -417,53 +504,30 @@ impl CycleExecutor for ProductionExecutor {
                     return json!({"ok": false, "error": "account not found"});
                 }
             };
-            let runner_acc = ra.runner_account();
-            let url = format!("{}/activity/growth/streak/claim", task.endpoints.chat_base);
-            let empty = json!({});
-            match task
-                .client
-                .post(&url, runner_acc.api.chat_headers, &empty)
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-                    Ok(d) if d.get("code").and_then(Value::as_i64) == Some(0) => {
-                        let data = d.get("data").cloned().unwrap_or(json!({}));
-                        let logs = data
-                            .get("logs")
-                            .and_then(Value::as_array)
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(str::to_string))
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
-                        json!({"ok": true, "logs": logs})
-                    }
-                    Ok(d) => {
-                        let msg = d
-                            .get("msg")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "code={}",
-                                    d.get("code").map(|c| c.to_string()).unwrap_or_default()
-                                )
-                            });
-                        json!({"ok": false, "error": msg})
-                    }
-                    Err(e) => json!({"ok": false, "error": format!("streak bonus failed: {e}")}),
-                },
-                Ok(resp) => {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    json!({
-                        "ok": false,
-                        "error": format!("HTTP {}: {}", status.as_u16(), text)
-                    })
-                }
-                Err(e) => json!({"ok": false, "error": format!("streak bonus failed: {e}")}),
-            }
+            // 此前这里打的是 `POST {chat_base}/activity/growth/streak/claim`
+            // ——该端点 Python 全仓 0 命中（上游不存在），**连登管家从来没
+            // 真正工作过**。现改接 `crate::streak_bonus`（Python
+            // `wb_tasks.run_streak_bonus` 的四步移植）。
+            let billing_headers = ra.creds.billing_headers(ra.device_token.as_deref());
+            let account = StreakBonusAccount {
+                realm: &ra.creds.realm,
+                enterprise_id: &ra.creds.enterprise_id,
+                chat_headers: &ra.creds.chat_headers,
+                billing_headers: &billing_headers,
+            };
+            let mut cfg = StreakBonusConfig {
+                chat_base: task.endpoints.chat_base,
+                bill_base: &task.billing_base,
+                timeout: crate::streak_bonus::STREAK_BONUS_TIMEOUT,
+                draw_interval: crate::streak_bonus::STREAK_BONUS_DRAW_INTERVAL,
+                client_token: Box::new(crate::streak_bonus::default_client_token),
+            };
+            let ctx = StreakBonusCtx {
+                sleeper: &task.sleeper,
+                clock: task.clock.as_ref(),
+            };
+            let outcome = run_streak_bonus(&task.client, &account, &mut cfg, &ctx).await;
+            outcome.to_json()
         })
     }
     fn night_growth<'a>(
@@ -476,44 +540,33 @@ impl CycleExecutor for ProductionExecutor {
             let ra = match ra {
                 Some(r) => r,
                 None => {
+                    // 账号不在 ready 池里：Rust 侧特有的情况（Python 的
+                    // `run_night_growth(account)` 由调度器逐账号调用，没有这个
+                    // 分支）。保留既有的 `error` 形状。
                     return json!({"ok": false, "error": "account not found", "logs": []});
                 }
             };
-            let account = ra.creds.as_task_account();
-            let ep = &task.endpoints;
-            let mut logs: Vec<String> = Vec::new();
-            let mut credit: i64 = 0;
-
-            let tasks = fetch_growth_tasks(&task.client, &account, ep).await;
-            let night_tasks: Vec<&GrowthTask> = tasks
-                .iter()
-                .filter(|t| crate::NIGHT_TASK_CODES.contains(&t.task_code.as_str()))
-                .collect();
-
-            if night_tasks.is_empty() {
-                return json!({"ok": true, "logs": [], "credit": 0});
-            }
-
-            for nt in night_tasks {
-                if nt.status == "not_accepted" {
-                    let codes = vec![nt.task_code.clone()];
-                    accept_tasks(&task.client, &account, &codes, 20, ep).await;
-                    let tasks2 = fetch_growth_tasks(&task.client, &account, ep).await;
-                    if let Some(nt2) = tasks2.iter().find(|t| t.task_code == nt.task_code) {
-                        if nt2.status == "completed" {
-                            let claim = claim_task(&task.client, &account, &nt.task_code, ep).await;
-                            if claim.ok {
-                                credit += claim.credit;
-                                logs.push("领奖成功".into());
-                            } else {
-                                logs.push(format!("领奖失败: {}", claim.msg.unwrap_or_default()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            json!({"ok": true, "logs": logs, "credit": credit})
+            // 改接 `crate::night_growth`（Python `wb_tasks.run_night_growth`
+            // 的逐分支移植）。返回体按 Python 权威：`ok` / `earned_credit` /
+            // `logs`，且 `msg` 键**只在**国际版 / 企业版两档出现。
+            let runner_acc = ra.runner_account();
+            let ctx = RunnerCtx {
+                sleeper: &task.sleeper,
+                clock: task.clock.as_ref(),
+            };
+            // 积分刷新注入：Python 在领奖成功后调 `account.fetch_credits()`。
+            // Rust 侧 M5 的 `CreditsRefresher`（后台刷新 + 快照存储）尚未落地，
+            // 此刻回填 `None`（= 刷新失败不抛），**这是已知缺口**，不是等价实现。
+            let mut credits_refresh = || None::<Value>;
+            let outcome: NightGrowthOutcome = run_night_growth(
+                &task.client,
+                &runner_acc,
+                &task.endpoints,
+                &ctx,
+                &mut credits_refresh,
+            )
+            .await;
+            outcome.to_json()
         })
     }
     fn daily_chat<'a>(
@@ -538,7 +591,7 @@ impl CycleExecutor for ProductionExecutor {
             let ctx = DailyChatCtx {
                 dir: &task.accounts_dir,
                 account_name: &ra.state.credential_file,
-                clock: &task.clock as &dyn Clock,
+                clock: task.clock.as_ref(),
             };
             let outcome =
                 run_daily_chat(&task.client, &account, &task.daily_chat_config, &ctx, None).await;
@@ -692,7 +745,7 @@ pub async fn route_accounts_checkin(task: &TaskRuntime, payload: &Value) -> Valu
         let ctx = CnStepCtx {
             dir: &task.accounts_dir,
             account_name: &ra.state.credential_file,
-            clock: &task.clock as &dyn Clock,
+            clock: task.clock.as_ref(),
             device_token: ra.device_token.as_deref(),
             billing_base: &task.billing_base,
             account: runner_acc,
@@ -729,6 +782,177 @@ pub async fn route_accounts_checkin(task: &TaskRuntime, payload: &Value) -> Valu
         .map(|r| public_view(&r.state, &r.nickname, &task.accounts_dir))
         .collect();
     json!({"results": results, "accounts": accounts})
+}
+
+// ---------------------------------------------------------------------------
+// 手动每日活跃（两个端点）
+//
+// Python 真源：
+// - `wb_proxy.py:17549 _route_accounts_daily_chat`（完整打卡：桌面腿 + 网页腿）
+// - `wb_proxy.py:17568 _route_accounts_daily_chat_web`（**只**网页腿）
+// ---------------------------------------------------------------------------
+
+/// Python 的真值判断（`if uid:` / `if res.get("ok")` 这类）。
+fn json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Python `str(value)` 的近似：只用于面板日志里的会话号。
+///
+/// 上游返回的会话号可能是数字（Python 侧 `conversation` 是原值），f-string 会
+/// 打成 `123`；字符串原样输出，缺字段打成 `None`。
+fn py_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_string(),
+        Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 手动端点的目标账号选择（对齐 Python :17551-17554 / :17575-17578）。
+///
+/// - 给了 `uid` ⇒ 只打这一个（Python `POOL.get(uid)`；找不到就是空结果）。
+///   uid 的真值判断跟 Python 一致：空串 / 0 / false 都算「没给」。
+/// - 没给 ⇒ 所有 `realm == "intl" && enabled` 的账号（国内版与停用账号跳过）。
+fn manual_daily_chat_targets<'a>(task: &'a TaskRuntime, payload: &Value) -> Vec<&'a ReadyAccount> {
+    match payload.get("uid") {
+        Some(uid) if json_truthy(uid) => match uid.as_str() {
+            Some(want) => task
+                .ready
+                .iter()
+                .find(|r| r.state.uid == want)
+                .into_iter()
+                .collect(),
+            // 非字符串 uid：Python 的 `POOL.get(123)` 找不到 ⇒ 空结果。
+            None => Vec::new(),
+        },
+        _ => task
+            .ready
+            .iter()
+            .filter(|r| r.state.realm == "intl" && r.state.enabled)
+            .collect(),
+    }
+}
+
+/// 账号显示名（无昵称时退回 uid 前 8 位，对齐 Python `nickname or uid[:8]`）。
+fn manual_nickname(ra: &ReadyAccount) -> String {
+    ra.nickname
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uid8(&ra.state.uid))
+}
+
+/// 把上游结果并进 `{"uid", "nickname"}` 外壳（对齐 Python `{"uid": …, "nickname": …, **res}`）。
+fn manual_result(ra: &ReadyAccount, nick: &str, res: &Value) -> Value {
+    let mut out = json!({"uid": ra.state.uid, "nickname": nick});
+    if let Some(obj) = res.as_object() {
+        for (k, v) in obj {
+            out[k.clone()] = v.clone();
+        }
+    }
+    out
+}
+
+/// 面板要看的账号清单（对齐 Python `account_views()`）。
+fn manual_account_views(task: &TaskRuntime) -> Vec<Value> {
+    task.ready
+        .iter()
+        .map(|r| public_view(&r.state, &r.nickname, &task.accounts_dir))
+        .collect()
+}
+
+/// 面板日志里的结果摘要（对齐 Python
+/// `res.get('msg') if res.get('ok') else res.get('error')`；网页通道那条取
+/// `res.get('conversation')`）。
+fn manual_log_detail(res: &Value, ok_key: &str) -> String {
+    let ok = res.get("ok").map(json_truthy).unwrap_or(false);
+    let picked = if ok {
+        res.get(ok_key)
+    } else {
+        res.get("error")
+    };
+    picked.map(py_repr).unwrap_or_else(|| "None".to_string())
+}
+
+/// 手动触发每日活跃打卡（对齐 Python `wb_proxy.py:17549 _route_accounts_daily_chat`）。
+///
+/// 走**完整的 daily_chat**（桌面腿 + 按设置决定要不要再跑网页腿），语义与
+/// Python 一致：网页腿成功才写 `lastDailyChat`；桌面腿被渠道校验（11128）拦下
+/// 时降级到网页腿。
+///
+/// 与网页通道那条（[`route_accounts_daily_chat_web`]）的差别正是「写不写
+/// `lastDailyChat`」——那条刻意不写。
+pub async fn route_accounts_daily_chat(task: &TaskRuntime, payload: &Value) -> Value {
+    let mut results: Vec<Value> = Vec::new();
+    for ra in manual_daily_chat_targets(task, payload) {
+        let account = DailyChatAccount {
+            uid: &ra.creds.uid,
+            token: &ra.creds.token,
+            realm: &ra.state.realm,
+            product: &ra.state.product,
+            chat_headers: &ra.creds.chat_headers,
+        };
+        let ctx = DailyChatCtx {
+            dir: &task.accounts_dir,
+            account_name: &ra.state.credential_file,
+            clock: task.clock.as_ref(),
+        };
+        let outcome =
+            run_daily_chat(&task.client, &account, &task.daily_chat_config, &ctx, None).await;
+        let mut body = outcome.body.as_object().cloned().unwrap_or_default();
+        if let Some(err) = &outcome.persist_error {
+            body.insert("persist_error".to_string(), json!(err));
+        }
+        let res = Value::Object(body);
+        let nick = manual_nickname(ra);
+        let detail = manual_log_detail(&res, "msg");
+        task.panel.add_log_entry(
+            &format!("[任务福利] 账号 [{}] 每日活跃打卡: {}", nick, detail),
+            "tasks",
+        );
+        results.push(manual_result(ra, &nick, &res));
+    }
+    json!({"results": results, "accounts": manual_account_views(task)})
+}
+
+/// 手动触发**网页通道**打卡（对齐 Python `wb_proxy.py:17568
+/// `_route_accounts_daily_chat_web`）。
+///
+/// Python 的 docstring 写明「刻意不写 lastDailyChat——那是『今天已经打过卡』的
+/// 闸门，手动补一次不该让定时巡检跳过当天的正常流程」。
+///
+/// Rust 侧天然满足这个不变量：网页腿入口 [`crate::daily_chat::daily_chat_web`]
+/// **不收** `DailyChatCtx`，全程不碰账号文件；`lastDailyChat` 只在
+/// [`crate::daily_chat::daily_chat`] 内部由 `persist_last_daily_chat` 写入。
+pub async fn route_accounts_daily_chat_web(task: &TaskRuntime, payload: &Value) -> Value {
+    let mut results: Vec<Value> = Vec::new();
+    for ra in manual_daily_chat_targets(task, payload) {
+        let account = DailyChatAccount {
+            uid: &ra.creds.uid,
+            token: &ra.creds.token,
+            realm: &ra.state.realm,
+            product: &ra.state.product,
+            chat_headers: &ra.creds.chat_headers,
+        };
+        let res = run_daily_chat_web(&task.client, &task.daily_chat_config, &account, None).await;
+        let nick = manual_nickname(ra);
+        let detail = manual_log_detail(&res, "conversation");
+        task.panel.add_log_entry(
+            &format!("[任务福利] 账号 [{}] 网页通道打卡: {}", nick, detail),
+            "tasks",
+        );
+        results.push(manual_result(ra, &nick, &res));
+    }
+    json!({"results": results, "accounts": manual_account_views(task)})
 }
 
 pub async fn route_tasks_get(task: &TaskRuntime, uid: Option<&str>) -> Value {
@@ -831,7 +1055,7 @@ pub async fn route_tasks_run(task: &TaskRuntime, payload: &Value) -> Value {
         let env = RunnerEnv { ep: task.endpoints };
         let deps = RunnerDeps {
             sleeper: &task.sleeper,
-            clock: &task.clock as &dyn Clock,
+            clock: task.clock.as_ref(),
             credits_refresh: Box::new(|| None),
             cat_travel: CatTravel::Disabled,
             gap: 1.0,
@@ -906,10 +1130,21 @@ pub async fn route_tasks_travel(task: &TaskRuntime, payload: &Value) -> Value {
         let mut logs = Vec::new();
         let ctx = RunnerCtx {
             sleeper: &task.sleeper,
-            clock: &task.clock as &dyn Clock,
+            clock: task.clock.as_ref(),
         };
-        let res =
-            build_cat_travel(&task.client, &runner_acc, &task.endpoints, &mut logs, &ctx).await;
+        // 领奖成功后刷新积分余额（Python `do_cat_travel` 的
+        // `account.fetch_credits()`）。M5 的 `CreditsRefresher` 未落地 ⇒
+        // 回填 `None`（已知缺口）。
+        let mut credits_refresh = || None::<Value>;
+        let res = build_cat_travel_refreshing(
+            &task.client,
+            &runner_acc,
+            &task.endpoints,
+            &mut logs,
+            &ctx,
+            &mut credits_refresh,
+        )
+        .await;
         let action = res.get("action").cloned().unwrap_or(Value::Null);
         let msg = res
             .get("msg")
@@ -1044,11 +1279,7 @@ pub async fn route_tasks_claim_all(task: &TaskRuntime, payload: &Value) -> Value
             &'static dyn crate::growth_runner::Sleeper,
         >(&task.sleeper as &dyn crate::growth_runner::Sleeper)
     };
-    let mut deps = ClaimAllDeps::new(
-        exec_ref,
-        &task.clock as &dyn crate::growth_runner::Clock,
-        sleeper_ref,
-    );
+    let mut deps = ClaimAllDeps::new(exec_ref, task.clock.as_ref(), sleeper_ref);
     deps.credits_refresh = Arc::new(|| None) as crate::claim_all::CreditRefreshFn;
     deps.growth_tasks = None;
     deps.client = task.client.clone();

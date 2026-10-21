@@ -9,6 +9,10 @@ rust-version.workspace = true
 serde_json.workspace = true
 # 幂等日期字段的本地时间格式化（"%Y-%m-%d %H:%M:%S"）；契约 12-17 依赖本地时区
 chrono.workspace = true
+# M5：活动历史的消息脱敏（wb_activity._SECRET_PATTERNS 的 6 条正则）。
+# regex 已在 workspace 里（wb-gateway 在用），这里只复用同一个 workspace 依赖，
+# 不引入新的第三方 crate。
+regex.workspace = true
 # 账号池与出站头（chat_request_headers / load_account_pool / UpstreamClient）
 wb-gateway = { path = "../gateway" }
 # 幂等字段读写（闸门 0 产出的 read/write_idempotent_fields）

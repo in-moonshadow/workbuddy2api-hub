@@ -831,4 +831,206 @@ passed=552 failed=0
 - **S4 与 D24 明确留到 M5 / M7 前处理**，不在本关扩散改动。
 - 未提交；按计划约束「commit 与推送逐次确认」，由用户逐次批准后再提交。
 
+### 关卡 4.17：M4-b 剩余 + M5（并行四条实现线）— 已完成（2026-10-20，集成收口见本节末）
+
+**授权**：用户 2026-10-20 指示「并行做」——在推送 M4-b 收口提交（`a05e57bc`，已推 `origin/feat/rust-m2`）的同时，四条实现线并行推进。
+
+| 线 | 范围 | 独占文件 |
+|---|---|---|
+| A | M4-b 剩余①：`run_streak_bonus` 内部 4 步 | 新建 `tasks/src/streak_bonus.rs`、重写 `tests/contract_streak_bonus.rs` |
+| B | M4-b 剩余②：`do_cat_travel` + `run_night_growth` | 新建 `tasks/src/night_growth.rs`、改 `tasks/src/growth_runner.rs` |
+| C | M5 数据侧：积分(D16) / 活动历史(D17) / 模型 cap(D18) / 价格 / 更新检查 | 新建 `tasks/src/{credits,activity,cap,price,update}.rs` |
+| D | M5 端点侧：S4 两个手动 daily_chat 端点 + 面板/设置/用量路由 | 改 `tasks/src/api_routes.rs`、`api/src/routes.rs` |
+
+防冲突设计：`lib.rs` 的模块声明各用**不同锚点行**；`api_routes.rs` 只有 D 可写，A/B/C 只读；C 的新模块 D **不调用**（避免编译期依赖）；各线禁止 `cargo fmt --all`（会格式化他人半成品），只许 `rustfmt` 自己的文件。
+
+#### 线 A：连登管家四步移植 — 已完成（待集成接线）
+
+**1. 产出物**
+
+| 产出物 | 位置 | 复核方式 |
+|---|---|---|
+| 连登管家四步实现 | `crates/tasks/src/streak_bonus.rs`（新建，约 640 行含单测） | 8 passed / 0 failed（**隔离 crate** 内，见下） |
+| 契约测试 | `crates/tasks/tests/contract_streak_bonus.rs`（整份重写，13 条） | 13 passed / 0 failed（隔离 crate） |
+| 模块声明 | `crates/tasks/src/lib.rs`：`pub mod summary;` 之后插入 `pub mod streak_bonus;` | 锚点唯一，未碰他人锚点 |
+
+⚠️ **验证方式的例外（必须如实记）**：A 线收工时仓库内 `cargo test -p wb-tasks` 被并行代理 C 的半成品编译错误挡住（`tasks/src/{activity,credits,price}.rs`），A 线按分工不代劳修别人的文件，改在 `~/scratch/streak-bonus-verify/` 建隔离 crate（`#[path]` 直接引用仓库里的 `streak_bonus.rs` 原文）验证：`FMT_OK`、8 passed、13 passed、clippy 零警告。**仓库内复跑是集成关卡 4.17 的必过项**（隔离 crate 的数字不能替代仓库内实测）。
+
+**2. 重要发现：旧实现的端点上游根本不存在**
+
+旧 Rust 实现在 `api_routes::streak_bonus` 里打 `POST {chat_base}/activity/growth/streak/claim`；`grep -rn "streak/claim" --include=*.py .` **0 命中** —— Python 的连登管家是四步，从不调该端点。**⇒ Rust 侧连登管家从来没真正工作过**（不是语义差距，是功能从未生效）。
+
+**3. 四步与 Python 的逐条对应**（Python `wb_tasks.py:771-879`）
+
+| 步 | 端点 | 关键语义 |
+|---|---|---|
+| 0 补签 | `GET /activity/growth/heatmap` → `GET /activity/growth/streak` → `POST /activity/growth/makeup-cards/use` | 昨天格子 `score==0` 才查卡；`balance>0` 才用卡；body `{"target_date":"YYYY-MM-DD"}`；**2xx 即记日志，不看 `code`** |
+| 1 礼包/补偿 | `POST {bill base}/billing/meter/claim-gift` / `claim-compensation` | body 字面量 `{}`；`code==0` 才记 `领取{name} +{cr}积分` |
+| 2 档位兑换 | `GET /activity/growth/streak` → `POST /activity/growth/redeem` | body `{"tier":…,"client_token":…}`；只跳过 `locked`/`claimed`；单档失败**不**中断整步 |
+| 3 抽奖 | `GET /activity/growth/lottery/summary` → `POST /activity/growth/lottery/draw` | `chances` 次全抽；**每次迭代末尾都 sleep 1.0（含最后一次）**；抽失败 `break` 且不再 sleep |
+
+门禁逐字一致：`realm != "cn"` → `{"ok":false,"msg":"连登管家仅限国内版账号"}`；`enterprise_id` 非空 → `{"ok":true,"msg":"企业版账号无成长体系，跳过"}`——**这两个返回体没有 `logs` 键**（故 `logs: Option<Vec<String>>`）。
+
+**4. 差异清单（线 A 新增）**
+
+| # | 差异 | 影响 | 处理 |
+|---|---|---|---|
+| D29 | 异常可见性：Python 各步异常写 `_log`（应用日志），返回体看不到；Rust 收进 `StreakBonusOutcome.warnings`，**不进 `to_json()`** | 返回体形状与 Python 逐字相同 | 有意差异 |
+| D30 | 补签的「昨天」：Python 是 `localtime(time.time()-86400)`（夏令时切换日可能差一天）；Rust 是「今天本地日期减一天」 | 极端日期边界 | 有意：Rust 更稳 |
+| D31 | 类型宽容：上游把 `score`/`balance`/`chances` 给成非预期类型时，Python 抛异常中止该步，Rust 降级为「跳过 + warning」 | 不崩、不误判 | 有意 |
+| D32 | `client_token`：Python 用 `uuid.uuid4()`；Rust 未新增生产依赖，用「时钟+计数器+哈希播种」拼 uuid4 形状并做成注入点 | 令牌形态 | 有意（测试可确定性） |
+
+**5. 线 A 留给集成的待办（主会话负责）**
+
+1. `api_routes::streak_bonus` 仍是打空端点的旧实现 → 改接 `tasks::streak_bonus`（A 线重写测试时移除了旧端点的 5 条 api_routes 层用例，接线后要补回）。
+2. **集成缝隙**：`PooledTaskAccount` 只有 `chat_headers`、**没有 billing 头**；第 1 步需要 `billing_request_headers(&BillingHeadersParams{uid,token,realm,domain,enterprise_id,device_token})` 现算（`ReadyAccount` 里有 `device_token`）。
+3. 跨代理 API 名漂移风险：B 线一度 import 不存在的 `post_with_timeout_call`/`get_with_timeout_call`（真实名是 `post_with_timeout`/`get_with_timeout`），B 已自行修掉；集成时**全仓再核一遍**这类名字漂移。
+
+#### 线 B：猫猫旅行 + 夜猫子移植 — 已完成（待集成接线）
+
+**1. 产出物**
+
+| 产出物 | 位置 | 复核方式 |
+|---|---|---|
+| 夜猫子实现 | `crates/tasks/src/night_growth.rs`（新建） | `contract_night_growth_task.rs` 14 passed / 0 failed |
+| 旅行路径修正 + 超时 | `crates/tasks/src/growth_runner.rs`（改） | `cargo test -p wb-tasks --lib growth_runner` 40 passed |
+| 契约测试 | `crates/tasks/tests/contract_night_growth_task.rs`（新建，14 条） | 14 passed / 0 failed |
+
+⚠️ 文件名偏离原定：原定的 `contract_night_growth.rs` **已被关卡 4.10 占用**（那是 `api_routes::ProductionExecutor::night_growth` 路由层的契约测试），故新建 `contract_night_growth_task.rs`，未覆盖既有文件。
+
+**2. 关键发现：R1 路径 bug（真实功能失效）**
+
+Rust 原实现打 `GET /activity/growth/travel/status`，Python 权威是 `GET /activity/growth/buddy/travel/status`（`wb_tasks.py:412`，**无** `/v2`）——**漏了 `/buddy/`**。上游不存在该路径 ⇒ 猫猫旅行整个功能在 Rust 侧从未生效。更严重的是：旧单测把错误路径当期望值（9 处断言），**测试跟着实现一起错，等于没测**。B 线已改正断言并新增一条「断言 wiremock 实际收到的路径」的测试。
+
+**3. 出站超时**：`growth_runner.rs` 新增 `TRAVEL_TIMEOUT = 10s`（Python 四处 `timeout=10`），状态 GET / config GET / depart POST / claim POST 全部改为 `get_with_timeout` / `post_with_timeout`。
+
+**4. 差异清单（线 B 新增）**
+
+| # | 差异 | 影响 | 处理 |
+|---|---|---|---|
+| D33 | 积分刷新：Python 领奖成功后调 `account.fetch_credits()`（`wb_tasks.py:478`）；Rust 原实现完全不刷 | 面板积分余额不更新 | B 线加了 `build_cat_travel_refreshing`（闭包注入）；**路由层尚未改接**（归主会话） |
+| D34 | `msg` 键只出现在「国际版 / 企业版」两档（Python 字面量如此），其余档没有 | 返回体键序 | Rust `to_json` 做**两套键序**，与 Python 逐字一致 |
+| D35 | `earned_credit` 反推：Python 逐行 `re.search(r"\+(\d+) 积分", line)`，**后一行覆盖前一行** | 取最终累计值 | Rust 手写同语义解析器（取最后一条），未新增 `regex` 依赖 |
+| D36 | `credits_refresh` 是**同步**闭包（`FnMut() -> Option<Value>`），而 Rust 侧无持久化积分快照存储点（M5 的 `CreditsRefresher` 未落地） | 接线时只能回填 `None` | **已知缺口**，接线时显式记入本账本，不假装等价 |
+
+**5. 线 B 留给集成的待办（主会话负责）**
+
+1. `api_routes::night_growth` 仍是占位实现 → 改接 `night_growth::run_night_growth`；**返回键要从 `credit` 改成 Python 的 `earned_credit`**。改完后关卡 4.10 的 `contract_night_growth.rs`（4 条，断言旧占位形状）需同步更新。
+2. `api_routes::cat_travel` 仍调不刷积分的 5 参版 → 改调 `build_cat_travel_refreshing`。
+
+#### 线 C：M5 数据侧（积分/活动历史/cap/价格/更新检查）— 已完成
+
+**1. 产出物**
+
+| 产出物 | 位置 | 行数 | 复核方式 |
+|---|---|---|---|
+| 积分包解析 + 12 键快照聚合 | `crates/tasks/src/credits.rs`（新建） | 838 | `contract_credits.rs` 9 passed |
+| 活动历史 JSONL 投影/筛选/脱敏/压实 | `crates/tasks/src/activity.rs`（新建） | 694 | 单测（lib 内） |
+| 模型 cap 判定层 | `crates/tasks/src/cap.rs`（新建） | 198 | 单测 |
+| 定价快照 + 等价成本估算 | `crates/tasks/src/price.rs`（新建） | 1039 | 单测 |
+| 更新发现（只发现不安装） | `crates/tasks/src/update.rs`（新建） | 423 | 单测 |
+| 积分抓取的 **HTTP 那一半** | `crates/gateway/src/credits.rs`（新建） | 459 | 单测 |
+| 契约测试 | `crates/tasks/tests/contract_credits.rs`（新建，9 条） | 389 | 9 passed / 0 failed |
+
+**2. 架构决策：为什么必须新增 wb-gateway 模块**
+
+`crates/tasks/Cargo.toml` 明文规定「契约类型全为 `serde_json::Value` / 纯数据；无任何 HTTP 依赖（HTTP 由 wb-gateway 提供）」，而积分抓取必须发 HTTP。故拆成两半：`wb_gateway::credits` 只取回上游原文（不塑形），`wb_tasks::credits` 负责解析与聚合（21 键 Package / 12 键 Credits / 排序 / 临期 / 百分比），由 `packages_from_accounts` + `aggregate_detailed` / `aggregate_fallback` 衔接。
+
+**3. 差异清单（线 C 新增）**
+
+| # | 差异 | 影响 | 处理 |
+|---|---|---|---|
+| D37 | Python `round(x,2)` 对精确二进制值做 round-half-even；Rust `f64::round` 是五入 | 百分比尾数 | 改为 `format!("{x:.2}").parse()`，用 7 个探针值对齐 CPython |
+| D38 | Python `http_json` 重试 3 次，触发条件是 SSL 错 / URLError / HTTP ≥500 | 退避行为 | Rust 对 timeout/connect/5xx 重试，退避同为 `1.0 × attempt` 秒；4xx 两边都立即失败 |
+| D39 | Python `range_cutoff` 内部自己读 `time.time()` | 时点 | Rust 把 `now` 作为入参（仅影响可测性，生产等价） |
+| D40 | Python `local_midnight` 用 `time.mktime(..., tm_isdst=-1)` | 夏令时 | Rust 用 `and_local_timezone`，`Ambiguous` 取第一个、`None` 回落当前偏移 |
+| D41 | `activity::value_text` 复刻 Python `str(x or "")`（0 / False / 空容器 ⇒ 空串） | 文本投影 | 逐条对齐 |
+| D42 | `price::compute_row` 的 `cached = min(cached_tokens, prompt)`、输出费率只作用于 completion_tokens | 成本估算 | reasoning token 不重复计费，与 Python 一致 |
+| D43 | Python 的 `wb_catalog`（`hub_model_ids()`）与运行时覆盖表（文件支撑）在 Rust 侧不存在 | 价格快照的输入 | `build_snapshot` 改由调用方传 `hub_ids` / `runtime_overrides` |
+| D44 | Python band 的 `days` 未设时是 `null` | 形状 | Rust `Option<Vec<String>>` 区分 `None`（未设）与 `Some(vec![])` |
+| D45 | Python `http_json` 遇非 JSON body 抛异常（由调用方 catch） | 错误路径 | Rust 返回 `Err("响应不是 JSON")` |
+
+**4. D36 裁决（cap 门控口径）— 主会话裁定**
+
+C 线提出「静态表 vs 运行时目录哪个权威」。**核实 Python 后澄清：这是两套并存机制，不是二选一。**
+
+| | Python | 作用 | Rust 落点（裁决后） |
+|---|---|---|---|
+| 静态表 | `is_free_cap_model(realm, model)`（`wb_accounts.py:281-287`） | 决定 6004 **要不要写进 `model_caps`**（跨重启持久禁用） | **新建 `crates/gateway/src/cap.rs`**（权威定义）；`wb_tasks::cap` 改为 `pub use` re-export，消除双份定义 |
+| 运行时目录 | `account.free_models`（由 `apply_daily_credit_limit()` 从模型目录按 realm 填充） | 决定「这个模型算不算免费」（每日额度守卫 `model_is_free`） | `AccountState::free_models` 字段保留，注释已更正；M5 每日额度守卫未落地 ⇒ 目前**无消费者**、恒空 |
+
+裁决的必要性：Rust 侧 `note_model_cap` 原用 `account.free_models.contains(model)` 当门控，而该字段恒空 ⇒ **6004 永远不落 `model_caps`**（面板显示失败、模型却不被跨重启禁用）。Python 权威是静态表按 `realm` 判定（`wb_accounts.py:953`）。
+
+**产出物**：
+- `crates/gateway/src/cap.rs`（新建）：`FREE_CAP_MODELS` + `is_free_cap_model` + 1 条单测。
+- `crates/gateway/src/notes.rs`：`note_model_cap` 门控改为 `crate::cap::is_free_cap_model(&account.realm, model)`；原单测的 `free_models.insert` 已失效故删除；新增 1 条「同一次 6004，intl 记 cap、cn 不记」的跨 realm 区分用例。
+- `crates/gateway/src/pool.rs`：`free_models` 字段注释更正（不再声称是 `note_model_cap` 门控）。
+- `crates/tasks/src/cap.rs`：静态表改为 `pub use wb_gateway::cap::…`（**签名与路径不变**，不构成第二份定义）。
+- 验证：`cargo test -p wb-gateway` = **235 passed / 0 failed**（原 233，新增 2）。
+
+**5. 线 C 留给集成的待办（主会话负责）**
+
+1. `CreditsRefresher` / `PriceRefresher` / `UpdateChecker` 的**后台线程与调度**未实现 —— 只有纯判定层；线程模型属主会话/D 线。
+2. `price` 无策略库（Python 的 policies / timeline 文件）、`update` 无 GitHub HTTP 抓取 —— 留给主会话。
+3. `activity` 的「压实触发」（2 MB 体积阈值 / 6 小时间隔）只暴露为 `compact_rows`，**未接调度**。
+4. 企业版积分路径（`_fetch_credits_enterprise`）未移植（C 线任务书只覆盖国内版详细口径 + 兜底口径）。
+
+#### D24：出站 HTTP 超时缺口（主会话，非代理范围）— 已完成
+
+账本早前记的「M7 切流前必须处理」的出站超时缺口，涉及 4 个**无代理拥有**的文件，主会话统一处理完毕。
+
+| 文件 | 常量 | Python 权威 | 转换的调用点 |
+|---|---|---|---|
+| `crates/tasks/src/growth_api.rs` | `GROWTH_API_TIMEOUT = 15s` | `wb_tasks.py:114`（任务清单 GET）、`:224`（接取）、`:274`/`:305`（领奖） | 4 处 |
+| `crates/tasks/src/checkin.rs` | `CHECKIN_TIMEOUT = 15s` / `STREAK_DAYS_TIMEOUT = 10s` | `wb_accounts.py:1683` / `wb_tasks.py:156` | 2 处 |
+| `crates/tasks/src/events.rs` | `REPORT_TIMEOUT = 15s` / `TRAVEL_STATUS_TIMEOUT = 10s` | `wb_tasks.py:404` / `:414`、`:181` | 3 处 |
+| `crates/tasks/src/summary.rs` | `SUMMARY_TIMEOUT = 10s` | `wb_tasks.py:148`（能量）、`:156`（连登）、`:173`（抽奖）、`:181`（旅行） | `get_json` 辅助函数（4 段共用） |
+
+**超时语义差异（有意）**：Python `urlopen(timeout=N)` 是**单次 socket 读超时**；reqwest 的 `RequestBuilder::timeout(N)` 是**总截止时间**（连接 → 响应体读完），方向更严，对几 KB JSON 无实质差别。
+
+**保留无超时的调用点（有意，共 3 处）**：`outbound.rs:39/56`（plain `post`/`get` 的定义本身）、`acp.rs:139`（SSE 首包等待，已被 `tokio::time::timeout` 包裹；响应体长连不设限）、`retry.rs:364`（**M3 流式路径**——响应体要流给用户，设总时限会截断流）。
+
+**全仓核验**：`grep -rnE "client\s*\.\s*(get|post)\s*\("` 结果与上述 3 处完全一致；API 名漂移扫描（`post_with_timeout_call` / `get_with_timeout_call` 等错误名）**0 命中**。
+
+#### 集成收口（主会话）— 已完成（2026-10-20）
+
+四线合并后的**主会话改动**（A/B/C/D 各自只交付模块与测试，接线归主会话）：
+
+| # | 接线点 | 改了什么 |
+|---|---|---|
+| 1 | `api_routes::streak_bonus` | 旧实现打的是上游**不存在**的 `POST /activity/growth/streak/claim` ⇒ 改接 `tasks::streak_bonus`（四步移植） |
+| 2 | `PooledTaskAccount::billing_headers()` | **集成缝隙**：原结构只有 `chat_headers`，第 1 步（礼包/补偿）需要 billing 域的出站头 ⇒ 新增现算（`billing_request_headers`，带 `device_token`） |
+| 3 | `api_routes::night_growth` | 占位实现 ⇒ 改接 `night_growth::run_night_growth`；返回键从 `credit` 改为 Python 的 **`earned_credit`**，`msg` 只在「国际版 / 企业版」两档出现 |
+| 4 | `api_routes::cat_travel` | 改调 `build_cat_travel_refreshing`（领奖后刷积分，D33） |
+| 5 | D 线端点 | 两个手动 daily_chat 端点 + 面板/设置/用量路由（`api/src/routes.rs`） |
+
+**本关修复的三处测试缺陷**（前两处是旧用例断言了**上游不存在的端点**与**旧占位形状**）：
+
+1. `crates/api/tests/contract_task_routes.rs` 的 3 条 streak_bonus 用例：旧断言打的是 `POST /activity/growth/streak/claim`（Python 全仓 0 命中）⇒ 重写为 Python 四步口径；新增 `mount_streak_bonus_steps` 助手（heatmap / streak / claim-gift / claim-compensation / lottery-summary 全集）；**并修掉一个会打真实上游的隐患**：原 `streak_runtime` 把 `billing_base` 指向 `http://127.0.0.1`（非 mock），礼包/补偿两步会绕过 mock ⇒ 改指 mock base。
+2. 「部分失败」用例在 Python 口径下**不可达**：各步失败只跳过该步、账号级仍 `ok:true`；唯一能产出 `ok:false` 的国际版门禁又被路由的 `realm=="cn"` 筛选挡掉 ⇒ 拆成两条真实用例：① 上游整片 500 仍 `ok:true`（Python 语义，且 `warnings` 不泄漏进返回体）；② 聚合分支用 `state.realm` / `creds.realm` 不一致的构造锁定（**生产不可达**，仅锁 `ok:false` + "partially failed" 这条分支）。
+3. `crates/tasks/tests/contract_night_growth.rs` 的 4 条用例：断言旧占位形状（`credit` 键）⇒ 重写为 Python 的 `ok` / `earned_credit` / `logs`；且旧用例**依赖真实时间**（夜猫子窗口 23:00-08:00，判定读 `TaskRuntime` 的时钟）⇒ 给 `TaskRuntime` 注入可替换时钟（见 D46），6 条用例与真实时间无关。
+
+**本关验证数字（仓库内实测，非隔离 crate）**
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --workspace` | **673 passed / 0 failed** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 零警告 |
+| `cargo fmt --all -- --check` | FMT_OK |
+
+**新增差异条目**
+
+| # | 差异 | 影响 | 处理 |
+|---|---|---|---|
+| D46 | `TaskRuntime.clock` 的类型由 `LocalClock` 改为 `Arc<dyn Clock>`（并新增 `test_with_ready_and_clock` 构造） | `wb-tasks` 的 **pub 字段类型**变了（crate 内部 API，非对外协议） | 有意：夜猫子的窗口判定若不可注入时钟，执行器层契约测试就只在真实夜间成立（白天必挂）。`schedule_clock`（调度器用）未动 |
+| D47 | `/tasks/streak-bonus` 返回体形状与 Python 不同：Rust 是 `{"ok": all_ok, "msg": "streak bonus completed"\|"partially failed", "results": [对象], "accounts_count": N}`；Python 是 `{"ok": true, "msg": "<换行拼接的 nick: msg>"}` | 面板上看到的文案不同 | **既有差异**（`git show HEAD:crates/tasks/src/api_routes.rs` 与本关改动后逐字相同 ⇒ 不是本关引入）。`dashboard.html:4863` 的 `triggerStreakBonus` 只消费 `r.msg` / `r.ok` ⇒ 不破坏。**按「只动被要求动的地方」报告而不代劳**；是否对齐 Python 由用户定 |
+
+**本关遗留（未做，需用户决定）**
+
+- M5 的后台刷新线程（`CreditsRefresher` / `PriceRefresher` / `UpdateChecker`）未做——只有纯判定层。
+- D36 `credits_refresh` 仍回填 `None`（Rust 侧还没有持久化积分快照的存储点）。
+- 线 C 的第 2/3/4 项遗留：`price` 无策略库、`update` 无 GitHub HTTP 抓取、`activity` 的压实未接调度、企业版积分路径未移植。
+- M3-b（`/v1/responses` 翻译 + web-tools replay）、M6（影子回放）、M7（切流）未启动。
+
+
 

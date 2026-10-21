@@ -106,6 +106,7 @@ fn build_exec(server: &MockServer, uid: &str, realm: &str, dir: &Path) -> Arc<dy
         uid: uid.into(),
         token: format!("{uid}-tok"),
         enterprise_id: "".into(),
+        realm: realm.into(),
         chat_headers,
     };
     let ready = vec![ReadyAccount {

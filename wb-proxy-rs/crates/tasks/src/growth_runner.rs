@@ -19,9 +19,15 @@
 //! 与 [`LocalClock`]；测试用 [`NoopSleeper`]（只记录调用）与固定时钟。
 //!
 //! ## 两条旅行路径的 `/v2` 口径（R1）
-//! 本模块的 `_travel_status` 走 `{chat}/activity/growth/travel/status`（**无** `/v2`、
-//! **无** `/buddy/`），与 `events::growth_summary_travel` 的 `/v2/activity/...` 是两条
+//! 本模块的 `_travel_status` 走 `{chat}/activity/growth/buddy/travel/status`
+//! （**无** `/v2`），与 `events::growth_summary_travel` 的 `/v2/activity/...` 是两条
 //! 独立路径，各自带测试，不抽公共常量。
+//!
+//! ⚠️ 2026-10-20 修正：本模块此前误写成 `/activity/growth/travel/status`
+//! （**漏了 `/buddy/`**），与 Python `wb_tasks.py:412` 不符，且既有单测把同一
+//! 错误路径当作期望值。现已按 Python 逐字改正，测试断言同步更新。
+
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -29,6 +35,13 @@ use crate::events::{build_event, report_events, rotating_expert};
 use crate::growth_api::{accept_tasks, claim_task, fetch_growth_tasks, TaskAccount, TaskEndpoints};
 use crate::{in_night_window, task_spec, GrowthTask};
 use wb_gateway::outbound::UpstreamClient;
+
+/// 猫猫旅行四个出站调用的时限（Python `wb_tasks.py:414/443/450/481` 均为 `timeout=10`）。
+///
+/// ⚠️ reqwest 的 `RequestBuilder::timeout` 是**总时限**（连接 → 响应体读完），
+/// Python 的 `urlopen(timeout=N)` 是**逐次读**的 socket 超时。对几 KB 的 JSON
+/// 答复两者没有实质差别；总时限更严格（不会无限挂住）。
+pub const TRAVEL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 猫猫旅行的默认出发地 id（`config` 拿不到 `locations[0].id` 时回退 1）。
 fn default_location_id() -> Value {
@@ -305,17 +318,18 @@ fn as_text(v: &Value) -> String {
 // 猫猫旅行：`do_cat_travel`（wb_tasks.py:463-522）
 // ---------------------------------------------------------------------------
 
-/// `_travel_status`（`:411-416`）：`GET {chat}/activity/growth/travel/status`。
+/// `_travel_status`（`:411-416`）：`GET {chat}/activity/growth/buddy/travel/status`。
 ///
-/// **无 `/buddy/`、无 `/v2`**——与 `do_cat_travel` 里的 `buddy/travel/*` 是不同路径。
+/// **有 `/buddy/`、无 `/v2`**——与 `events::growth_summary_travel` 的
+/// `/v2/activity/growth/buddy/travel/status` 是两条独立路径（R1：不得合并）。
 async fn fetch_travel_state(
     client: &UpstreamClient,
     acc: &RunnerAccount<'_>,
     ep: &TaskEndpoints<'_>,
 ) -> Result<Value, String> {
-    let url = format!("{}/activity/growth/travel/status", ep.chat_base);
+    let url = format!("{}/activity/growth/buddy/travel/status", ep.chat_base);
     let resp = client
-        .get(&url, acc.api.chat_headers)
+        .get_with_timeout(&url, acc.api.chat_headers, TRAVEL_TIMEOUT)
         .await
         .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
@@ -335,7 +349,12 @@ async fn travel_depart(
 ) -> (Option<Value>, Option<String>) {
     let url = format!("{}/activity/growth/buddy/travel/depart", ep.chat_base);
     let resp = match client
-        .post(&url, acc.api.chat_headers, &json!({ "location_id": lid }))
+        .post_with_timeout(
+            &url,
+            acc.api.chat_headers,
+            &json!({ "location_id": lid }),
+            TRAVEL_TIMEOUT,
+        )
         .await
     {
         Ok(r) => r,
@@ -407,12 +426,43 @@ async fn ensure_buddy(
 }
 
 /// `do_cat_travel`（`:463-522`）：返回 `{ok, action, credit?, msg}`。
+///
+/// **不带积分刷新**：等价于 Python 侧的 `account.fetch_credits()` 被省略。
+/// 需要与 Python 完全一致的调用方请用 [`build_cat_travel_refreshing`]。
 pub async fn build_cat_travel(
     client: &UpstreamClient,
     acc: &RunnerAccount<'_>,
     ep: &TaskEndpoints<'_>,
     logs: &mut Vec<String>,
     ctx: &RunnerCtx<'_>,
+) -> Value {
+    build_cat_travel_inner(client, acc, ep, logs, ctx, &mut || None::<Value>).await
+}
+
+/// 与 [`build_cat_travel`] 同语义，但在**旅行领奖成功后**刷新一次积分余额
+/// —— 对齐 Python `do_cat_travel` 的 `account.fetch_credits()`（`:478`）。
+///
+/// 闭包形态而非直接调用：`wb-tasks → wb-api` 禁止依赖，积分形状属于 api 侧；
+/// 返回 `None` 表示刷新失败（Python 的 `fetch_credits` 失败也不抛）。
+pub async fn build_cat_travel_refreshing(
+    client: &UpstreamClient,
+    acc: &RunnerAccount<'_>,
+    ep: &TaskEndpoints<'_>,
+    logs: &mut Vec<String>,
+    ctx: &RunnerCtx<'_>,
+    credits_refresh: &mut (dyn FnMut() -> Option<Value> + Send),
+) -> Value {
+    build_cat_travel_inner(client, acc, ep, logs, ctx, credits_refresh).await
+}
+
+/// `do_cat_travel` 的实现体（[`build_cat_travel`] / [`build_cat_travel_refreshing`] 共用）。
+async fn build_cat_travel_inner(
+    client: &UpstreamClient,
+    acc: &RunnerAccount<'_>,
+    ep: &TaskEndpoints<'_>,
+    logs: &mut Vec<String>,
+    ctx: &RunnerCtx<'_>,
+    credits_refresh: &mut (dyn FnMut() -> Option<Value> + Send),
 ) -> Value {
     // 企业版无成长体系：直接 skip。注意 Python 这里仍带 `msg`，
     // 故 `run_growth_tasks` 第 3 步会记一行「猫猫日常: …」，本函数保持同一行为。
@@ -429,7 +479,10 @@ pub async fn build_cat_travel(
     // --- arrived：领奖 ---
     if state == "arrived" {
         let url = format!("{}/activity/growth/buddy/travel/claim", ep.chat_base);
-        let resp = match client.post(&url, acc.api.chat_headers, &json!({})).await {
+        let resp = match client
+            .post_with_timeout(&url, acc.api.chat_headers, &json!({}), TRAVEL_TIMEOUT)
+            .await
+        {
             Ok(r) => r,
             Err(e) => return json!({"ok": false, "msg": format!("领奖失败: {e}")}),
         };
@@ -447,6 +500,8 @@ pub async fn build_cat_travel(
                     .and_then(|d| d.get("reward_credit"))
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
+                // Python `:478` 的 `account.fetch_credits()`：领奖后刷新余额。
+                let _ = credits_refresh();
                 json!({
                     "ok": true,
                     "action": "claim",
@@ -469,7 +524,10 @@ pub async fn build_cat_travel(
         }
         let mut lid: Option<Value> = None;
         let url = format!("{}/activity/growth/buddy/travel/config", ep.chat_base);
-        match client.get(&url, acc.api.chat_headers).await {
+        match client
+            .get_with_timeout(&url, acc.api.chat_headers, TRAVEL_TIMEOUT)
+            .await
+        {
             Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
                 Ok(cfg) => {
                     // Python `locs = (cfg.get("data") or {}).get("locations") or []`
@@ -690,7 +748,10 @@ pub async fn progress_one(
 }
 
 /// 当前毫秒时间戳（事件 id 用）。
-fn now_ms() -> i64 {
+///
+/// `pub(crate)`：`night_growth` 模块的猫猫事件 id 复用同一时间源
+/// （Python `build_event` 的 `int(time.time() * 1000)`）。
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -2030,7 +2091,7 @@ mod tests {
     async fn cat_travel_status_failure_reports_message() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
@@ -2050,7 +2111,7 @@ mod tests {
     async fn cat_travel_idle_uses_first_config_location() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"code": 0, "data": {"state": "idle"}})),
@@ -2090,7 +2151,7 @@ mod tests {
     async fn cat_travel_idle_falls_back_to_location_one() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"code": 0, "data": {"state": "idle"}})),
@@ -2126,7 +2187,7 @@ mod tests {
     async fn cat_travel_missing_buddy_without_first_buddy_reports_actionable_msg() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"code": 0, "data": {"state": "idle"}})),
@@ -2173,7 +2234,7 @@ mod tests {
     async fn cat_travel_arrived_claims_and_reports_credit() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "code": 0, "data": {"state": "arrived"}
             })))
@@ -2201,11 +2262,99 @@ mod tests {
         assert_eq!(res["msg"], "旅行归来领奖成功！获得 30 积分");
     }
 
+    /// R1：`_travel_status` 的路径**逐字**必须是
+    /// `/activity/growth/buddy/travel/status`（**有** `/buddy/`、**无** `/v2`）。
+    ///
+    /// 此前本模块写成了 `/activity/growth/travel/status`（漏 `/buddy/`），
+    /// 且旧单测把同一错误路径当作期望值——**测试跟着实现错，等于没测**。
+    /// 这里直接断言 wiremock **实际收到的路径**，防止再漂。
+    #[tokio::test]
+    async fn travel_status_uses_the_exact_buddy_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activity/growth/buddy/travel/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": 0, "data": {"state": "traveling"}
+            })))
+            .mount(&server)
+            .await;
+        let ids = Ids::cn();
+        let acc = ids.acc();
+        let sleeper = NoopSleeper::default();
+        let clock = FixedClock(10);
+        let ctx = cat_ctx(&sleeper, &clock);
+        let mut logs = Vec::new();
+        let res =
+            build_cat_travel(&UpstreamClient::new(), &acc, &ep(&server), &mut logs, &ctx).await;
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["action"], "traveling");
+
+        let requests = server.received_requests().await.unwrap();
+        let paths: Vec<&str> = requests.iter().map(|r| r.url.path()).collect();
+        assert_eq!(
+            paths,
+            vec!["/activity/growth/buddy/travel/status"],
+            "旅行状态路径必须逐字等于 Python 的 /activity/growth/buddy/travel/status"
+        );
+    }
+
+    /// Python `do_cat_travel` 领奖成功后调 `account.fetch_credits()`（`:478`）。
+    /// [`build_cat_travel_refreshing`] 必须真的调一次刷新闭包。
+    #[tokio::test]
+    async fn cat_travel_refreshing_calls_credits_refresh_after_claim() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activity/growth/buddy/travel/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": 0, "data": {"state": "arrived"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/activity/growth/buddy/travel/claim"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": 0, "data": {"reward_credit": 12}
+            })))
+            .mount(&server)
+            .await;
+        let ids = Ids::cn();
+        let acc = ids.acc();
+        let sleeper = NoopSleeper::default();
+        let clock = FixedClock(10);
+        let ctx = cat_ctx(&sleeper, &clock);
+        let mut logs = Vec::new();
+        let mut refreshed = 0usize;
+        {
+            let mut refresh = || {
+                refreshed += 1;
+                Some(json!({"remain": 100}))
+            };
+            let res = build_cat_travel_refreshing(
+                &UpstreamClient::new(),
+                &acc,
+                &ep(&server),
+                &mut logs,
+                &ctx,
+                &mut refresh,
+            )
+            .await;
+            assert_eq!(res["ok"], true);
+            assert_eq!(res["credit"], 12);
+        }
+        assert_eq!(refreshed, 1, "领奖成功后必须刷新一次积分余额");
+    }
+
+    /// 旅行四个出站调用的时限常量：Python `wb_tasks.py` 四处均为 `timeout=10`。
+    #[test]
+    fn travel_timeout_matches_python_ten_seconds() {
+        assert_eq!(TRAVEL_TIMEOUT, std::time::Duration::from_secs(10));
+    }
+
     #[tokio::test]
     async fn cat_travel_idle_with_daily_limit_does_not_depart() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "code": 0, "data": {"state": "idle", "daily_limit_reached": true}
             })))
@@ -2227,7 +2376,7 @@ mod tests {
     async fn cat_travel_traveling_reports_in_transit() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             // R1：状态路径**无** /buddy/、**无** /v2
             .and(header("X-Domain", "copilot.tencent.com"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2271,7 +2420,7 @@ mod tests {
     async fn depart_unparsable_error_detail_is_inlined() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"code": 0, "data": {"state": "idle"}})),
@@ -2308,7 +2457,7 @@ mod tests {
     async fn cat_travel_unknown_state_passes_through() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/activity/growth/travel/status"))
+            .and(path("/activity/growth/buddy/travel/status"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"code": 0, "data": {"state": "sleeping"}})),

@@ -7,6 +7,8 @@
 pub mod acp;
 pub mod anthropic;
 pub mod body;
+pub mod cap;
+pub mod credits;
 pub mod egress;
 pub mod endpoints;
 pub mod forward;

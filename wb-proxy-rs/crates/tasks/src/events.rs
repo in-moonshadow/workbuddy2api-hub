@@ -17,9 +17,22 @@
 //! 因此本模块**刻意不抽公共路径常量**：两个函数各写各的字符串字面量，各自带一个
 //! 逐字断言 path 的用例。合并成常量后一旦「统一」就会静默打断其中一条。
 
+use std::time::Duration;
+
 use serde_json::json;
 
 use crate::{GrowthSummary, TravelStatus};
+
+/// 事件上报的 HTTP 超时（秒）。
+///
+/// 对齐 Python `wb_tasks.py:404` 的 `timeout=15`。
+const REPORT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 猫猫旅行状态的 HTTP 超时（秒）。
+///
+/// 对齐 Python `wb_tasks.py:414`（`/activity/growth/buddy/travel/status`）与
+/// `:181`（`/v2/activity/growth/buddy/travel/status`）的 `timeout=10`。
+const TRAVEL_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// chat 侧上游（`wb_tasks.CHAT_BASE`，:17）。
 pub const CHAT_BASE: &str = "https://copilot.tencent.com";
@@ -294,7 +307,10 @@ pub async fn report_events(
     let url = format!("{url_base}/v2/report");
     // Python `json.dumps(events)`：数组根，不是对象
     let body = serde_json::Value::Array(events.to_vec());
-    match client.post(&url, headers, &body).await {
+    match client
+        .post_with_timeout(&url, headers, &body, REPORT_TIMEOUT)
+        .await
+    {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(d) => d.get("code").and_then(serde_json::Value::as_i64) == Some(0),
             Err(_) => false,
@@ -313,7 +329,10 @@ pub async fn travel_status(
     headers: &std::collections::HashMap<String, String>,
 ) -> Result<TravelStatus, String> {
     let url = format!("{url_base}/activity/growth/buddy/travel/status");
-    match client.get(&url, headers).await {
+    match client
+        .get_with_timeout(&url, headers, TRAVEL_STATUS_TIMEOUT)
+        .await
+    {
         Ok(resp) => {
             // Python `urlopen` 对非 2xx 抛 HTTPError；这里对齐为 Err
             if !resp.status().is_success() {
@@ -339,7 +358,10 @@ pub async fn growth_summary_travel(
     headers: &std::collections::HashMap<String, String>,
 ) -> Result<GrowthSummary, String> {
     let url = format!("{url_base}/v2/activity/growth/buddy/travel/status");
-    match client.get(&url, headers).await {
+    match client
+        .get_with_timeout(&url, headers, TRAVEL_STATUS_TIMEOUT)
+        .await
+    {
         Ok(resp) => {
             if !resp.status().is_success() {
                 return Err(format!("HTTP {}", resp.status().as_u16()));

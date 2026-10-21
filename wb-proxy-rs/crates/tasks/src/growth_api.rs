@@ -16,11 +16,19 @@
 //! 不同是 Python 原样，不归一化。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::events::{CHAT_BASE, WEB_BASE};
 use crate::TASK_SPECS;
+
+/// 成长任务三个端点的 HTTP 超时（秒）。
+///
+/// 对齐 Python `wb_tasks.py`：拉任务 `:114` / 接取 `:224` / 领奖 `:274`、`:305`
+/// 都是 `timeout=15`。Python 是逐次读的 socket 超时，Rust 侧用 reqwest 的总
+/// 时限近似（见 `wb_gateway::outbound::UpstreamClient::post_with_timeout`）。
+const GROWTH_API_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// web 域降级领奖用的浏览器 UA（`wb_tasks.py:21` 的 `WEB_UA`，逐字）。
 pub const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -79,7 +87,10 @@ pub async fn fetch_growth_tasks(
         return Vec::new();
     }
     let url = format!("{}/v2/activity/growth/tasks", ep.chat_base);
-    let resp = match client.get(&url, acc.chat_headers).await {
+    let resp = match client
+        .get_with_timeout(&url, acc.chat_headers, GROWTH_API_TIMEOUT)
+        .await
+    {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -190,7 +201,10 @@ pub async fn accept_tasks(
     let step = chunk.max(1);
     for part in codes.chunks(step) {
         let body = json!({ "task_codes": part });
-        let resp = match client.post(&url, acc.chat_headers, &body).await {
+        let resp = match client
+            .post_with_timeout(&url, acc.chat_headers, &body, GROWTH_API_TIMEOUT)
+            .await
+        {
             Ok(r) => r,
             Err(_) => {
                 out.ok = false;
@@ -287,7 +301,10 @@ pub async fn claim_task(
 ) -> crate::ClaimOutcome {
     let url = format!("{}/activity/growth/tasks/{code}/claim", ep.chat_base);
     let empty = json!({});
-    let resp = match client.post(&url, acc.chat_headers, &empty).await {
+    let resp = match client
+        .post_with_timeout(&url, acc.chat_headers, &empty, GROWTH_API_TIMEOUT)
+        .await
+    {
         Ok(r) => r,
         Err(e) => return crate::ClaimOutcome::failure(format!("claim failed: {e}")),
     };
@@ -312,7 +329,10 @@ pub async fn claim_task(
     if status.as_u16() == 400 {
         let web_url = format!("{}/activity/growth/tasks/{code}/claim", ep.web_base);
         let web_hdrs = web_claim_headers(acc, ep.web_base);
-        match client.post(&web_url, &web_hdrs, &empty).await {
+        match client
+            .post_with_timeout(&web_url, &web_hdrs, &empty, GROWTH_API_TIMEOUT)
+            .await
+        {
             Ok(r2) if r2.status().is_success() => match r2.json::<Value>().await {
                 // 降级分支的「非 0 码」文案回退到原始 err_msg（Python 同）。
                 Ok(d2) => read_claim_body(&d2, Some(&err_msg)),

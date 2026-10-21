@@ -16,11 +16,18 @@
 //! Python 原样写字面量，避免「统一前缀」时静默打断另一条路。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::growth_api::{TaskAccount, TaskEndpoints};
 use crate::{default_tier_statuses, GrowthSummary, TravelStatus};
+
+/// 汇总四段的 HTTP 超时（秒）。
+///
+/// 对齐 Python `wb_tasks.py`：energy `:148`、streak `:156`、lottery `:173`、
+/// travel `:181` 四个 GET 都是 `timeout=10`。
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `fetch_growth_summary()`：汇总四段，失败段保持缺省值。
 pub async fn fetch_growth_summary(
@@ -128,7 +135,10 @@ async fn get_json(
     url: &str,
     headers: &HashMap<String, String>,
 ) -> Option<Value> {
-    let resp = client.get(url, headers).await.ok()?;
+    let resp = client
+        .get_with_timeout(url, headers, SUMMARY_TIMEOUT)
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
