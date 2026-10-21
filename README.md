@@ -131,7 +131,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 143 个套件：107 个 Python + 36 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 145 个套件：109 个 Python + 36 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -356,6 +356,8 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
 ### Unreleased
+
+- **修复：早间调度成片失败——网络类失败现在会自动延后补跑**（D48）：每天 08:2x 前后，国际版每日活跃与国内版签到会成片报 `<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1016)>`（偶发伴随 `<urlopen error [Errno -3] Try again>` 的 DNS 临时失败），当天的奖励就白丢、只能靠人手动补跑一遍。根因不在本服务：宿主机的 Clash Verge 每天 ~08:2x 自动更新订阅并重载代理 core，而本容器的出站被宿主机的 TUN 承载（`ip rule 9001: from all lookup 2022`），core 一重载 TUN 随之重建，**在途 TCP 被打断**，TLS 握手在握手中途被切断；国内版与国际版同时中招，正因为走的是同一条链路（Mihomo 连接表实证：`198.18.0.1 -> 221.180.213.10:443 | rule=GeoIP cn | chain=[DIRECT]`）。中断持续 1-3 分钟，而出站重试只有 3 次、合计约 3 秒（`wb_accounts.http_json` 的 `retries=3` + 1s×attempt 退避），调度器整点排程里离失败时刻最近的一次又在 21:00（12 小时后）——于是一次抖动就报废一整天。现在调度器对**网络类**失败单独安排延后补跑：等 5 分钟再试，最多 3 次（足够跨过 1-3 分钟的链路中断）；补跑前复查门禁（期间已被手动做过的、已停用的、已移出账号池的一律不再打），业务类错误（HTTP 400 `code 11128`、429 `code 6004`、「今日已做」）**不**补跑——重试它们只会白白发请求、吃上游限流，把一次失败放大成多次。`wb_scheduler.py` 新增 `_is_network_failure()` 与补跑队列（`_queue_retry` / `_run_due_retries` / `_run_one_retry`），Rust 侧 `crates/tasks/src/scheduler.rs` 同步同一套口径（`is_network_failure()` + `pending_retries` 队列 + `run_due_retries()`），两侧的补跑节奏一致（300 秒 / 3 次）。新增测试套件 `tests/_test_scheduler_retry.py`（11 项）与 `crates/tasks/tests/contract_scheduler_retry.rs`（11 项）。
 
 - **修复：模型以文本形式打印工具调用时自动恢复为标准结构化调用**（#297）：DeepSeek 等上游模型在工具调用时，有时不发结构化的 `tool_calls` 字典，而是直接在正文里吐文本标签（DSML / <function=...> 伪 XML），导致客户端认为调用提前结束或无法触发工具。现在流式层增加兜底解析器，将文本打印的工具标记自动恢复为标准的结构化事件并剥离正文噪音；新增 `tests/_test_dsml_chat_fallback.py`。
 

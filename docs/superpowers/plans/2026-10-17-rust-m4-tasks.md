@@ -1024,6 +1024,7 @@ C 线提出「静态表 vs 运行时目录哪个权威」。**核实 Python 后�
 |---|---|---|---|
 | D46 | `TaskRuntime.clock` 的类型由 `LocalClock` 改为 `Arc<dyn Clock>`（并新增 `test_with_ready_and_clock` 构造） | `wb-tasks` 的 **pub 字段类型**变了（crate 内部 API，非对外协议） | 有意：夜猫子的窗口判定若不可注入时钟，执行器层契约测试就只在真实夜间成立（白天必挂）。`schedule_clock`（调度器用）未动 |
 | D47 | `/tasks/streak-bonus` 返回体形状与 Python 不同：Rust 是 `{"ok": all_ok, "msg": "streak bonus completed"\|"partially failed", "results": [对象], "accounts_count": N}`；Python 是 `{"ok": true, "msg": "<换行拼接的 nick: msg>"}` | 面板上看到的文案不同 | **既有差异**（`git show HEAD:crates/tasks/src/api_routes.rs` 与本关改动后逐字相同 ⇒ 不是本关引入）。`dashboard.html:4863` 的 `triggerStreakBonus` 只消费 `r.msg` / `r.ok` ⇒ 不破坏。**按「只动被要求动的地方」报告而不代劳**；是否对齐 Python 由用户定 |
+| D48 | 调度器对**网络类**失败没有补跑：链路被掐断（宿主 Clash Verge 每天 08:2x 重载 core ⇒ 容器出站被 TUN 承载 ⇒ 在途 TCP 被打断 ⇒ `SSL: UNEXPECTED_EOF_WHILE_READING`；中断 1-3 分钟）时，出站重试只有 3 次、合计约 3 秒，整点排程最近的一次又在 21:00 ⇒ 一次抖动报废一整天 | 早间签到/每日活跃成片失败，奖励白丢、需人工补跑 | **已修（Python + Rust 两侧同口径）**：网络类失败延后 300 秒补跑、最多 3 次；补跑前复查门禁（已手动做过 / 已停用 / 已移出账号池 ⇒ 不打）；业务类错误（11128 / 6004）不补跑。Python `wb_scheduler.py`（`_is_network_failure` + `_queue_retry` / `_run_due_retries` / `_run_one_retry`），Rust `crates/tasks/src/scheduler.rs`（`is_network_failure` + `pending_retries` 队列 + `run_due_retries`）。测试：Python `tests/_test_scheduler_retry.py` 11 项、Rust `crates/tasks/tests/contract_scheduler_retry.rs` 11 项 |
 
 **本关遗留（未做，需用户决定）**
 

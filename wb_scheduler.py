@@ -13,7 +13,44 @@ import wb_tasks
 from wb_tasks import do_cat_travel
 
 
+# 网络类瞬时故障的特征串（TLS 握手被切断、DNS 临时失败、超时、连接被重置……）。
+#
+# 这类错误值得「隔几分钟再补跑一次」：根因通常是链路被掐断一小段时间
+# （2026-10-21 实测：宿主 Clash Verge 每天 08:2x 自动更新订阅并重载代理 core，
+# 容器出站被宿主的 TUN 承载，在途 TCP 被打断，中断持续 1-3 分钟），而不是
+# 账号本身或上游业务出了问题。
+#
+# 业务类错误（HTTP 400 code 11128、429 code 6004、「今日已做」）**不在**此列：
+# 重试它们只会白白发请求、吃上游限流，把一次失败放大成多次失败。
+_NETWORK_FAILURE_MARKERS = (
+    "urlopen error",                        # urllib 包出来的传输层错误
+    "ssl:", "sslerror", "eof occurred",     # SSL: UNEXPECTED_EOF_WHILE_READING 等
+    "errno -3", "errno -2",                 # DNS 临时失败 (EAI_AGAIN) / 名称未就绪
+    "name or service not known",
+    "temporary failure in name resolution",
+    "timed out", "timeout", "请求超时",
+    "connection reset", "connection aborted", "connection refused",
+    "remotedisconnected", "connectionerror",
+    "error sending request",                # Rust 侧同义文案
+    "broken pipe", "connection closed",
+)
+
+
+def _is_network_failure(text):
+    """错误串是否属于「网络类」瞬时故障（值得延后补跑）。"""
+    t = str(text or "").lower()
+    if not t:
+        return False
+    return any(m in t for m in _NETWORK_FAILURE_MARKERS)
+
+
 class Scheduler:
+    # 网络类失败后的补跑节奏：等 5 分钟再试，最多 3 次。
+    # 5 分钟能跨过「代理 core 重载」这类 1-3 分钟的中断；3 次足以覆盖更长的抖动，
+    # 又不至于在持续故障时无限打上游。
+    RETRY_DELAY_SECS = 300
+    RETRY_MAX_TRIES = 3
+
     def __init__(self, pool):
         self.pool = pool
         # 对齐 Sliverkiss/workbuddy2api 官方默认排程 (CST 24小时制)
@@ -28,6 +65,9 @@ class Scheduler:
         self.last_run_time = None
         self.next_run_time = None
         self.logs = []
+        # 网络类失败的延后补跑队列：[{uid, task, due, tries}, ...]
+        self._pending_retries = []
+        self._pending_lock = threading.Lock()
         # Guards against overlapping runs: trigger_now() spawns a thread per
         # click, and a manual trigger can also land on top of the hourly job.
         self._run_lock = threading.Lock()
@@ -68,6 +108,100 @@ class Scheduler:
         self._stop_event.set()
         self.log("后台定时调度器已暂停")
 
+    # ------------------------------------------------------------------
+    # 网络类失败的延后补跑（D48）
+    #
+    # 整点排程最早的一次在 09:00、离失败时刻可能隔 12 小时（21:00 才再跑），
+    # 所以链路类故障失败后如果只记一条日志就完事，奖励就白丢一天。
+    # 这里给「网络类」失败单独安排一次延后补跑：等 RETRY_DELAY_SECS 秒
+    # （跨过 1-3 分钟的链路中断）再打一次，最多 RETRY_MAX_TRIES 次。
+    # ------------------------------------------------------------------
+
+    def _queue_retry(self, uid, task):
+        """把一次网络类失败登记进延后补跑队列。"""
+        with self._pending_lock:
+            for item in self._pending_retries:
+                if item["uid"] == uid and item["task"] == task:
+                    # 同一账号同一任务只留一条：重复失败只推迟到期时间
+                    item["due"] = time.time() + self.RETRY_DELAY_SECS
+                    item["tries"] += 1
+                    return
+            self._pending_retries.append({
+                "uid": uid,
+                "task": task,
+                "due": time.time() + self.RETRY_DELAY_SECS,
+                "tries": 1,
+            })
+        self.log(f"账号 [{uid[:8]}] {task} 遇网络故障，"
+                 f"{self.RETRY_DELAY_SECS // 60} 分钟后自动补跑")
+
+    def _run_due_retries(self):
+        """执行到期的补跑项（由主循环每 30 秒调一次）。"""
+        now = time.time()
+        with self._pending_lock:
+            due = [it for it in self._pending_retries if it["due"] <= now]
+            for it in due:
+                self._pending_retries.remove(it)
+        if not due:
+            return
+        if self._run_lock.locked():
+            # 正在巡检就别撞车：放回队列，下一轮再来
+            with self._pending_lock:
+                for it in due:
+                    it["due"] = now + 60
+                    self._pending_retries.append(it)
+            return
+        for it in due:
+            self._run_one_retry(it)
+
+    def _run_one_retry(self, item):
+        """补跑一个账号的一项任务。"""
+        uid = item["uid"]
+        task = item["task"]
+        tries = item["tries"]
+        acc = None
+        for a in (self.pool.accounts if self.pool else []):
+            if a.uid == uid:
+                acc = a
+                break
+        if acc is None:
+            self.log(f"! 账号 [{uid[:8]}] 已不在账号池，取消补跑")
+            return
+        if not getattr(acc, "enabled", True):
+            self.log(f"! 账号 [{uid[:8]}] 已停用，取消补跑")
+            return
+        # 门禁复查：期间可能已被用户手动做过，别再打一次
+        if task == "checkin" and not acc.can_checkin():
+            self.log(f"账号 [{uid[:8]}] 签到已完成，取消补跑")
+            return
+        if task == "daily_chat" and not acc.can_daily_chat():
+            self.log(f"账号 [{uid[:8]}] 每日活跃已完成，取消补跑")
+            return
+        try:
+            if task == "checkin":
+                res = acc.checkin(trigger="scheduler")
+            else:
+                res = acc.daily_chat(trigger="scheduler")
+        except Exception as exc:
+            res = {"ok": False, "error": str(exc)}
+        detail = res.get("msg") if res.get("ok") else (res.get("error") or res.get("msg"))
+        if res.get("ok"):
+            self.log(f"✓ 账号 [{uid[:8]}] {task} 补跑成功: {detail}")
+            return
+        self.log(f"! 账号 [{uid[:8]}] {task} 补跑仍未成功: {detail}")
+        # 还是网络故障 ⇒ 按上限再排一次；业务类失败不再排（重试只会吃限流）
+        if tries < self.RETRY_MAX_TRIES and _is_network_failure(detail):
+            with self._pending_lock:
+                self._pending_retries.append({
+                    "uid": uid,
+                    "task": task,
+                    "due": time.time() + self.RETRY_DELAY_SECS,
+                    "tries": tries + 1,
+                })
+            self.log(f"账号 [{uid[:8]}] {task} 仍是网络故障，"
+                     f"{self.RETRY_DELAY_SECS // 60} 分钟后再试"
+                     f"（第 {tries + 1}/{self.RETRY_MAX_TRIES} 次）")
+
     def _run_loop(self):
         # 启动后先休眠 10 秒等待主服务就绪，然后执行初次检查
         time.sleep(10)
@@ -91,6 +225,12 @@ class Scheduler:
                     except Exception as exc:
                         self.log(f"排程执行异常: {exc}")
                     time.sleep(65) # 避开当前这一分钟重复触发
+            # 网络类失败的延后补跑：主循环每 30 秒醒一次，顺手看看有没有到期的
+            if self.enabled:
+                try:
+                    self._run_due_retries()
+                except Exception as exc:
+                    self.log(f"补跑异常: {exc}")
             self._stop_event.wait(30)
 
     def _calc_next_fire(self):
@@ -167,7 +307,11 @@ class Scheduler:
                         checkin_count += 1
                         self.log(f"✓ 账号 [{uid8}] 自动签到成功: {res.get('msg')}")
                     else:
-                        self.log(f"! 账号 [{uid8}] 自动签到未成功: {res.get('error') or res.get('msg')}")
+                        detail = res.get("error") or res.get("msg")
+                        self.log(f"! 账号 [{uid8}] 自动签到未成功: {detail}")
+                        # 链路类故障：等几分钟补跑一次，别让这一天的签到白丢
+                        if _is_network_failure(detail):
+                            self._queue_retry(acc.uid, "checkin")
                     time.sleep(1.0)
 
                 if acc.can_report_activity():
@@ -214,7 +358,11 @@ class Scheduler:
                         # 面板只显示「成功」，第二天才发现积分没到（issue #236）。
                         self.log(f"✓ 账号 [{uid8}] 每日活跃对话成功: {res.get('msg')}")
                     else:
-                        self.log(f"! 账号 [{uid8}] 每日活跃对话失败: {res.get('error') or res.get('msg')}")
+                        detail = res.get("error") or res.get("msg")
+                        self.log(f"! 账号 [{uid8}] 每日活跃对话失败: {detail}")
+                        # 同上：链路类故障稍后补跑
+                        if _is_network_failure(detail):
+                            self._queue_retry(acc.uid, "daily_chat")
                     time.sleep(1.5)
 
         self.log(f"巡检完成：Token保活 {refreshed_count} 个，国内签到 {checkin_count} 个，活跃上报 {report_count} 个，猫猫日常 {travel_count} 个，国际活跃 {daily_chat_count} 个")

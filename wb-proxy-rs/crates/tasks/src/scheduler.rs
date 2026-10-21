@@ -72,6 +72,52 @@ pub const LOG_RING_CAPACITY: usize = 60;
 /// `status()["logs"]` 只回末 20 条（`wb_scheduler.py:230`）。
 pub const STATUS_LOG_TAIL: usize = 20;
 
+/// 网络类失败后的补跑节奏：等 5 分钟再试，最多 3 次（D48）。
+///
+/// 与 Python `wb_scheduler.Scheduler.RETRY_DELAY_SECS` / `RETRY_MAX_TRIES` 同值。
+pub const RETRY_DELAY_SECS: i64 = 300;
+pub const RETRY_MAX_TRIES: u32 = 3;
+
+/// 网络类瞬时故障的特征串（与 Python `wb_scheduler._NETWORK_FAILURE_MARKERS` 同源）。
+///
+/// TLS 握手被切断、DNS 临时失败、超时、连接被重置——这类错误重试有意义：
+/// 根因通常是链路被掐断一小段时间（2026-10-21 实测：宿主 Clash Verge 每天
+/// 08:2x 自动更新订阅并重载代理 core，容器出站被宿主 TUN 承载，在途 TCP
+/// 被打断，中断持续 1-3 分钟），而不是账号或上游业务出了问题。
+///
+/// 业务类错误（HTTP 400 code 11128、429 code 6004、「今日已做」）**不在**此列：
+/// 重试它们只会白白发请求、吃上游限流。
+pub const NETWORK_FAILURE_MARKERS: &[&str] = &[
+    "urlopen error",
+    "ssl:",
+    "sslerror",
+    "eof occurred",
+    "errno -3",
+    "errno -2",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "timed out",
+    "timeout",
+    "请求超时",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remotedisconnected",
+    "connectionerror",
+    "error sending request",
+    "broken pipe",
+    "connection closed",
+];
+
+/// 错误串是否属于「网络类」瞬时故障（值得延后补跑）。
+pub fn is_network_failure(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    NETWORK_FAILURE_MARKERS.iter().any(|m| t.contains(m))
+}
+
 /// `last_run_time` 空值占位（`wb_scheduler.py:228` 的 `or "尚未运行"`）。
 pub const LAST_RUN_NEVER: &str = "尚未运行";
 /// `next_run_time` 空值占位（`wb_scheduler.py:229` 的 `or "待调度"`）。
@@ -453,11 +499,45 @@ impl CycleCounts {
 // 调度器
 // ---------------------------------------------------------------------------
 
+/// 需要延后补跑的任务种类（D48）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryTask {
+    /// 国内版每日签到。
+    Checkin,
+    /// 国际版每日活跃打卡。
+    DailyChat,
+}
+
+impl RetryTask {
+    /// 日志里的任务名（与 Python 侧 `task` 字段同词）。
+    pub fn label(self) -> &'static str {
+        match self {
+            RetryTask::Checkin => "checkin",
+            RetryTask::DailyChat => "daily_chat",
+        }
+    }
+}
+
+/// 一条待补跑的任务（纯内存，不落盘）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRetry {
+    /// 账号 uid。
+    pub uid: String,
+    /// 任务种类。
+    pub task: RetryTask,
+    /// 到期时刻（epoch 秒，取自 `ScheduleClock::epoch_secs`）。
+    pub due: i64,
+    /// 已经排过几轮（含首次登记）。
+    pub tries: u32,
+}
+
 struct State {
     enabled: bool,
     last_run_time: Option<String>,
     next_run_time: Option<String>,
     logs: Vec<String>,
+    /// 网络类失败的延后补跑队列。
+    pending_retries: Vec<PendingRetry>,
 }
 
 /// 后台定时调度器。
@@ -501,6 +581,7 @@ impl<'a> Scheduler<'a> {
                 last_run_time: None,
                 next_run_time: Some(next),
                 logs: Vec::new(),
+                pending_retries: Vec::new(),
             }),
             run_lock: AtomicBool::new(false),
             stop_event: AtomicBool::new(false),
@@ -631,7 +712,155 @@ impl<'a> Scheduler<'a> {
                     return;
                 }
             }
+            // 网络类失败的延后补跑：主循环每 30 秒醒一次，顺手看看有没有到期的
+            if self.is_enabled() {
+                self.run_due_retries().await;
+            }
             self.sleeper.sleep(POLL_SECS).await;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 网络类失败的延后补跑（D48）
+    //
+    // 整点排程里离失败时刻最近的一次可能隔 12 小时（21:00 才再跑），
+    // 所以链路类故障失败后只记一条日志，奖励就白丢一天。这里给「网络类」
+    // 失败单独安排一次延后补跑：等 RETRY_DELAY_SECS 秒（跨过 1-3 分钟的
+    // 链路中断）再打一次，最多 RETRY_MAX_TRIES 次。
+    // ------------------------------------------------------------------
+
+    /// 把一次网络类失败登记进延后补跑队列。
+    fn queue_retry(&self, uid: &str, task: RetryTask) {
+        let now = self.clock.epoch_secs() as i64;
+        let due = now + RETRY_DELAY_SECS;
+        let mut st = self.lock_state();
+        // 同一账号同一任务只留一条：重复失败只推迟到期时间
+        for item in st.pending_retries.iter_mut() {
+            if item.uid == uid && item.task == task {
+                item.due = due;
+                item.tries += 1;
+                return;
+            }
+        }
+        st.pending_retries.push(PendingRetry {
+            uid: uid.to_string(),
+            task,
+            due,
+            tries: 1,
+        });
+        drop(st);
+        self.log(&format!(
+            "账号 [{}] {} 遇网络故障，{} 分钟后自动补跑",
+            uid8(uid),
+            task.label(),
+            RETRY_DELAY_SECS / 60
+        ));
+    }
+
+    /// 当前待补跑队列（只读快照）。
+    pub fn pending_retries(&self) -> Vec<PendingRetry> {
+        self.lock_state().pending_retries.clone()
+    }
+
+    /// 执行到期的补跑项（由主循环每 30 秒调一次）。
+    pub async fn run_due_retries(&self) {
+        let now = self.clock.epoch_secs() as i64;
+        let due: Vec<PendingRetry> = {
+            let mut st = self.lock_state();
+            let mut due = Vec::new();
+            let mut keep = Vec::new();
+            for it in st.pending_retries.drain(..) {
+                if it.due <= now {
+                    due.push(it);
+                } else {
+                    keep.push(it);
+                }
+            }
+            st.pending_retries = keep;
+            due
+        };
+        if due.is_empty() {
+            return;
+        }
+        if self
+            .run_lock
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            // 正在巡检就别撞车：放回队列，下一轮再来
+            let mut st = self.lock_state();
+            for mut it in due {
+                it.due = now + 60;
+                st.pending_retries.push(it);
+            }
+            return;
+        }
+        let _guard = RunLockGuard(&self.run_lock);
+        for it in due {
+            self.run_one_retry(it).await;
+        }
+    }
+
+    /// 补跑一个账号的一项任务。
+    async fn run_one_retry(&self, item: PendingRetry) {
+        let id = uid8(&item.uid);
+        let accounts = self.executor.accounts();
+        let Some(acc) = accounts.iter().find(|a| a.uid == item.uid) else {
+            self.log(&format!("! 账号 [{id}] 已不在账号池，取消补跑"));
+            return;
+        };
+        if !acc.enabled {
+            self.log(&format!("! 账号 [{id}] 已停用，取消补跑"));
+            return;
+        }
+        let today = self.clock.local_now().date();
+        let res = match item.task {
+            RetryTask::Checkin => {
+                // 门禁复查：期间可能已被用户手动做过，别再打一次
+                if !acc.can_checkin(&today) {
+                    self.log(&format!("账号 [{id}] 签到已完成，取消补跑"));
+                    return;
+                }
+                self.executor.checkin(acc).await
+            }
+            RetryTask::DailyChat => {
+                if !acc.can_daily_chat(&today) {
+                    self.log(&format!("账号 [{id}] 每日活跃已完成，取消补跑"));
+                    return;
+                }
+                self.executor.daily_chat(acc).await
+            }
+        };
+        if truthy_ok(&res) {
+            self.log(&format!(
+                "✓ 账号 [{id}] {} 补跑成功: {}",
+                item.task.label(),
+                str_field(&res, "msg")
+            ));
+            return;
+        }
+        let detail = err_or_msg(&res);
+        self.log(&format!(
+            "! 账号 [{id}] {} 补跑仍未成功: {}",
+            item.task.label(),
+            detail
+        ));
+        // 还是网络故障 ⇒ 按上限再排一次；业务类失败不再排（重试只会吃限流）
+        if item.tries < RETRY_MAX_TRIES && is_network_failure(&detail) {
+            let due = self.clock.epoch_secs() as i64 + RETRY_DELAY_SECS;
+            self.lock_state().pending_retries.push(PendingRetry {
+                uid: item.uid.clone(),
+                task: item.task,
+                due,
+                tries: item.tries + 1,
+            });
+            self.log(&format!(
+                "账号 [{id}] {} 仍是网络故障，{} 分钟后再试（第 {}/{} 次）",
+                item.task.label(),
+                RETRY_DELAY_SECS / 60,
+                item.tries + 1,
+                RETRY_MAX_TRIES
+            ));
         }
     }
 
@@ -698,10 +927,12 @@ impl<'a> Scheduler<'a> {
                             str_field(&res, "msg")
                         ));
                     } else {
-                        self.log(&format!(
-                            "! 账号 [{id}] 自动签到未成功: {}",
-                            err_or_msg(&res)
-                        ));
+                        let detail = err_or_msg(&res);
+                        self.log(&format!("! 账号 [{id}] 自动签到未成功: {detail}"));
+                        // 链路类故障：等几分钟补跑一次，别让这一天的签到白丢
+                        if is_network_failure(&detail) {
+                            self.queue_retry(&acc.uid, RetryTask::Checkin);
+                        }
                     }
                     self.sleeper.sleep(CN_STEP_PAUSE_SECS).await;
                 }
@@ -765,10 +996,12 @@ impl<'a> Scheduler<'a> {
                         str_field(&res, "msg")
                     ));
                 } else {
-                    self.log(&format!(
-                        "! 账号 [{id}] 每日活跃对话失败: {}",
-                        err_or_msg(&res)
-                    ));
+                    let detail = err_or_msg(&res);
+                    self.log(&format!("! 账号 [{id}] 每日活跃对话失败: {detail}"));
+                    // 同上：链路类故障稍后补跑
+                    if is_network_failure(&detail) {
+                        self.queue_retry(&acc.uid, RetryTask::DailyChat);
+                    }
                 }
                 self.sleeper.sleep(INTL_STEP_PAUSE_SECS).await;
             }
