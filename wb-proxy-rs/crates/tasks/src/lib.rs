@@ -86,6 +86,9 @@ pub mod usage;
 // （HTTP 那一半）与 `crate::credits`（塑形那一半）接起来，并把快照原子
 // 写回账号文件。权威源是 Python `wb_accounts.Account.fetch_credits()`。
 pub mod credits_source;
+// 关卡 4.20（线 A）：hub 侧**静态模型目录**——Python `wb_catalog.py` 的
+// `STATIC_INTL_MODELS` / `STATIC_CN_MODELS` 的 id 清单移植（只搬 id）。
+pub mod catalog;
 
 // ---------------------------------------------------------------------------
 // 契约 2：growth task 的 12 字段归一化

@@ -45,13 +45,14 @@
 //!
 //! ## 与 Python 的已知差异（登记在案，不粉饰）
 //!
-//! 1. **取价输入清单目前是空的**：Python 的 `priced_model_ids()`
-//!    （`:1157-1192`）= 内置静态目录（`wb_catalog.STATIC_*_MODELS`）∪ 网关
-//!    live 目录新增。**Rust 侧这套模型目录尚未落地**，本模块把它做成
-//!    [`PriceSource::catalog`] 的返回值，默认**空清单**。⇒ 在目录落地之前，
-//!    抓回来的模型列表匹配不到任何 hub 模型，`build_snapshot` 会返回空
-//!    `models`，于是走到「一个都没匹配上」那条分支（不写盘）。**这是本线
-//!    最大的缺口，已登记在关卡 4.19 的差异清单里。**
+//! 1. **取价清单只覆盖静态目录，live 目录那一半仍缺**：Python 的
+//!    `priced_model_ids()`（`:1157-1192`）= 内置静态目录
+//!    （`wb_catalog.STATIC_*_MODELS`）∪ 网关 live 目录新增。**静态目录已于
+//!    关卡 4.20 落地**（[`crate::catalog`]：54 个 id，与 Python 逐字逐序
+//!    一致，有跨语言 parity 测试盯着）；**live 目录那一半仍缺**——它需要
+//!    「远端产品目录抓取 + `is_chat_model` 过滤 + 变体整理」整条链路，Rust
+//!    侧没有。按 Python 的语义，缺它只是**少覆盖**（那部分模型落进
+//!    `unpriced`），不会让覆盖变小。
 //! 2. **策略表的行粒度不同**：Python 的策略表是**一个价格一行**（按内容
 //!    哈希去重，`policy_id()`，`:1612-1622`），时间线只在**指派真的变了**时
 //!    才追加一行。本移植按关卡 4.19 的接口约定：策略表**每轮追加整份快照
@@ -112,8 +113,8 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// 取价输入清单（Python `priced_model_ids()` 的 Rust 侧等价物）。
 ///
 /// Python 的清单是「内置静态目录 ∪ 网关 live 目录新增」，去重保序、静态在前
-/// （`:1157-1192`）。**Rust 侧这套模型目录尚未落地**，故默认是空清单
-/// （见模块文档的差异 1）。
+/// （`:1157-1192`）。**静态目录已落地**（[`crate::catalog`]，54 个 id）；
+/// **live 目录那一半仍缺**（见模块文档的差异 1）⇒ 默认是空清单。
 #[derive(Debug, Clone)]
 pub struct PriceCatalog {
     /// 要取价的 hub 模型 id（去重保序）。
@@ -172,8 +173,10 @@ pub trait PriceSource: Send + Sync {
         true
     }
 
-    /// 取价输入清单。默认**空清单**（Rust 侧的模型目录尚未落地，见模块文档
-    /// 的差异 1）。
+    /// 取价输入清单。默认**空清单**——生产实现见
+    /// [`crate::price_source::SettingsPriceSource`]：静态目录已落地
+    /// （[`crate::catalog`]，54 个 id），live 目录那一半仍缺（模块文档的
+    /// 差异 1）。
     fn catalog(&self) -> PriceCatalog {
         PriceCatalog::default()
     }

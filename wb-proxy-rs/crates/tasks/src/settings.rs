@@ -98,6 +98,12 @@ pub const LEGACY_PRICING_REFRESH_HOURS_KEY: &str = "pricing_refresh_hours";
 /// 定价功能总开关的键名。Python `PRICING_ENABLED_KEY`（`:49`）。
 pub const PRICING_ENABLED_KEY: &str = "pricing_enabled";
 
+/// 定价「变体后缀继承」开关的键名。Python `PRICING_VARIANT_INHERIT_KEY`
+/// （`wb_settings.py:45`）。
+///
+/// 读的是 **accounts 目录的 settings.json**（与 `pricing_enabled` 同一个文件）。
+pub const PRICING_VARIANT_INHERIT_KEY: &str = "pricing_variant_inherit";
+
 /// 每日更新检查开关的键名。Python `UPDATE_CHECK_ENABLED_KEY`（`:94`）。
 pub const UPDATE_CHECK_ENABLED_KEY: &str = "update_check_enabled";
 
@@ -117,8 +123,24 @@ pub struct RefreshSettings {
     pub pricing_refresh_minutes: i64,
     /// 定价功能总开关。**缺键 = 开**（Python `wb_settings.py:988-989`）。
     pub pricing_enabled: bool,
+
     /// 每日更新检查开关。**缺键 = 关**（Python `wb_settings.py:1362`）。
     pub update_check_enabled: bool,
+}
+
+/// 定价「变体后缀继承」开关。**缺键 = 开**（Python
+/// `wb_settings.py:955-968` 的 `pricing_variant_inherit()`）。
+///
+/// 判定是**严格的 `is True`**：有键时只有布尔 `true` 算开，数字 `1` 与
+/// 字符串 `"true"` 都算关（与 Python 逐字一致）。
+///
+/// 本函数是这把键的**唯一一份定义**（键名 + 语义）——`price_source.rs` 走
+/// 它读，不再自带第二份 `match`，免得两边漂移。
+pub fn pricing_variant_inherit(data: &Value) -> bool {
+    match data.get(PRICING_VARIANT_INHERIT_KEY) {
+        None => true,
+        Some(value) => value.as_bool() == Some(true),
+    }
 }
 
 impl Default for RefreshSettings {
