@@ -196,6 +196,14 @@ async fn openai_paths_all_reach_upstream_and_aggregate() {
                 value.get("choices").is_none(),
                 "{uri} must NOT leak chat choices, got {value}"
             );
+            // 请求侧能力回显：本次请求没宣告 tools ⇒ 落成默认值
+            // （Python :17904-17908 的口径）。
+            assert_eq!(value["tools"], serde_json::json!([]), "{uri} tools");
+            assert_eq!(value["tool_choice"], "auto", "{uri} tool_choice");
+            assert_eq!(
+                value["parallel_tool_calls"], true,
+                "{uri} parallel_tool_calls"
+            );
         } else {
             // 其余 OpenAI 路由保持 chat 形状：必有 choices
             assert!(
@@ -449,4 +457,75 @@ async fn empty_pool_does_not_hang_and_returns_error_envelope() {
         value.get("error").is_some(),
         "empty pool must yield an error envelope, got {value}"
     );
+}
+
+// ---- 11. responses 路由：previous_response_id ⇒ 400 ----
+//
+// 网关是无状态的，不存上一次的回应。静默忽略 `previous_response_id` 会让
+// 追问变成「缺上下文的假回答」——比直接报错更不诚实（Python :17888-17895）。
+
+/// `previous_response_id` 的 400 文案（Python :17888-17895 逐字）。
+const PREVIOUS_RESPONSE_ID_MESSAGE: &str = concat!(
+    "previous_response_id is not supported: this gateway does not store response state. ",
+    "Send the full conversation in 'input' instead, or use a stateless client.",
+);
+
+#[tokio::test]
+async fn responses_previous_response_id_is_rejected_with_400() {
+    let (dir, server) = fixture("intl", 200).await;
+    let cfg = Arc::new(config(dir.path(), Some(&server.uri()), "intl"));
+    let (status, value) = post_json(
+        cfg,
+        "/v1/responses",
+        serde_json::json!({
+            "model": "hy4-preview",
+            "input": "hi",
+            "previous_response_id": "resp_abc",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {value}");
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert_eq!(value["error"]["code"], 400);
+    assert_eq!(
+        value["error"]["message"], PREVIOUS_RESPONSE_ID_MESSAGE,
+        "error wording must match the Python reference verbatim"
+    );
+    // 400 必须在触上游之前发生（别白花上游的 token）。
+    let received = server.received_requests().await.unwrap();
+    assert!(
+        received.is_empty(),
+        "rejection must happen before the upstream call, got {} requests",
+        received.len()
+    );
+}
+
+// ---- 12. responses 路由：回显客户端宣告的能力 ----
+//
+// Python :17904-17908：`request_meta` 从**原始** payload 取，原样回显。
+
+#[tokio::test]
+async fn responses_echoes_tools_choice_and_parallel_tool_calls() {
+    let (dir, server) = fixture("intl", 200).await;
+    let cfg = Arc::new(config(dir.path(), Some(&server.uri()), "intl"));
+    let (status, value) = post_json(
+        cfg,
+        "/v1/responses",
+        serde_json::json!({
+            "model": "hy4-preview",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup", "description": "d"}],
+            "tool_choice": "required",
+            "parallel_tool_calls": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {value}");
+    assert_eq!(value["object"], "response");
+    assert_eq!(
+        value["tools"][0]["name"], "lookup",
+        "tools must be echoed back, got {value}"
+    );
+    assert_eq!(value["tool_choice"], "required", "got {value}");
+    assert_eq!(value["parallel_tool_calls"], false, "got {value}");
 }

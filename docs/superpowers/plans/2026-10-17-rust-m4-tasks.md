@@ -1315,3 +1315,67 @@ D36 从「恒回填 `None`」改为「读账号文件里**本地已存**的快�
 - 企业版积分路径（`_fetch_credits_enterprise`）未移植。
 - M3-b（`/v1/responses` 翻译 + web-tools replay）、M6（影子回放）、M7（切流）未启动。
 - `ApiPanelSink::add_log_entry` 仍是 no-op ⇒ 三个后台线程的日志进不了面板日志页。
+
+---
+
+### 关卡 4.21：定价表接线（D68/D69）+ live 模型目录（D55 另一半）+ M3-b `/v1/responses` 流式与诚实性 — 已完成（2026-10-22）
+
+三条并行实现线 + 主会话集成收口。
+
+#### 线 A：定价策略库读取端 + 成本估算（解 D68 / D69）
+
+- **读端**（`crates/tasks/src/pricing_store.rs`）：读 `usage/pricing-policies.jsonl` 的**最后一份快照**。Rust 侧写端格式是「每轮追加整份快照一行」（D56，与 Python「一价格一行 + 内容哈希去重」不同）⇒ 读端**不能照抄 Python 的 `load_policies()`**。容错：文件不存在 / 空 / 全坏 ⇒ `None`（定价是锦上添花，读不到不该让面板挂掉）；**末行坏 ⇒ 退到上一份好快照**；IO 失败 ⇒ `None` + 一行 stderr 日志。文件只增不减 ⇒ 只读尾部 `TAIL_LIMIT = 8 MiB`，尾部没命中再全文件扫。
+- **计价**（`crates/tasks/src/price.rs`）：新增 `CostDetail` / `compute_row_detail` / `band_note`。
+  - **关键洞察**：Python 的 `entry_for`（`wb_pricing.py:1359-1364`）**落盘时**就写了 `via` / `inherited_from` / `override_from` ⇒ Rust 侧只需在 `PricingEntry::from_json` 里读出这 3 个字段，**不必移植策略表层**（条件档 / 策略表 / 剪枝逻辑）。
+- **接进用量路由**（`crates/api/src/routes.rs` 三处）：`/usage`、`/usage/recent`、`/usage/analytics` 改为读 `pricing_store::load_pricing(&state.task.usage_dir)` 并调用 `*_priced` 版本。**传 `None` ⇒ 与旧函数逐字节一致** ⇒ 未定价时整组明细为 `None`（不编 0、不给半截明细）。
+
+#### 线 B：live 模型目录（解 D55 的另一半）
+
+- **接缝**（`crates/tasks/src/live_catalog.rs`）：`LiveCatalogSource` trait（`fetch(realm)`）+ 筛选/合并（`is_chat_model` / 变体后缀 / 免费兄弟规则 / `merge_catalog`）+ `collect_live_ids`。两个 realm（`intl` 先、`cn` 后），**per-realm 失败只跳过它**，全失败 ⇒ 空列表（**少覆盖，不缩小覆盖**）。
+- **HTTP 那一半**（`crates/gateway/src/product_catalog.rs`）：拉 `<chat_upstream>/v3/config`，最多两次尝试（桌面 chat UA → 计费 UA），单次超时 10s；解析成 `(ids, credits)`。
+- **生产来源**（`crates/tasks/src/live_source.rs`，主会话补）：用账号池里的凭据拉远端目录 —— Python `POOL.representative(realm=...)`（`wb_accounts.py:3327-3332`）的口径是「先挑有 access_token 的候选，没有就挑第一个候选」。持 `Weak<TaskRuntime>`（不成环）。
+- **接进取价线程**（主会话补，`crates/tasks/src/price_refresher.rs` + `price_source.rs` + `api_routes.rs`）：
+  - `PriceSource` 新增 `live_ids()`（**带默认实现**返回空 ⇒ 既有测试替身零改动）；
+  - `run_once` 里取 live id，与 `catalog().hub_ids` 用 `merge_catalog` 合并（**静态在前、去重保序**，对齐 Python `priced_model_ids()`）；
+  - per-realm 失败原因带回线程写进日志环（对齐 Python `:2374` 那句「live 目录取不到（%s），该区域本轮只按内置目录：%s」）；
+  - `status()` 补 `last_extra` 键（Python `:2538` 有，Rust 侧原先缺）。
+- **跨语言 parity**（`crates/tasks/tests/contract_live_catalog.rs`）：读仓库里的 `wb_catalog.py`，把两段内嵌 JSON 的 credits 解析出来（国际版优先），与 Rust 的 `HUB_MODEL_CREDITS` 逐条比对。
+
+#### 线 C：M3-b `/v1/responses` 流式与诚实性修复
+
+- **流式**（`crates/gateway/src/responses.rs`，+1048 行）：`ResponsesStreamTranslator` 状态机 + `stream_responses_events` + `responses_sse_frame`，19 个事件名（`response.created` … `response.completed`），顺序照 Python `_finalize()`。
+- **诚实性**（`crates/api/src/routes.rs`）：
+  - `previous_response_id` **不再被静默丢弃** ⇒ 判 **400**，文案逐字照抄 Python `:17888-17895`（网关无状态，存不了上一次的回应；静默忽略会让追问的客户端拿到「看起来正常、但缺上下文」的回应）。
+  - responses 分支**保留原始 `stream` 标志**（之前被抹掉 ⇒ 流式请求走非流式路径）。
+  - `RequestMeta` 从**原始 payload** 构造（回显元数据不再全空）。
+- **依赖**：`crates/api/Cargo.toml` 加 `futures-core = "0.3"` —— **早已在依赖树里**（`axum::Body::from_stream` 需要 `futures_core::Stream`），只是提为直接依赖；`Cargo.lock` 只 +1 行、**无新包**。
+
+#### 差异清单（本关新增）
+
+| # | 差异 | 影响 | 处理 |
+|---|---|---|---|
+| **D76** | 定价快照**按发生时生效的策略**计价（历史价） | Python 面板历史金额**不随价格刷新而变**；Rust 只有最新快照 ⇒ **历史金额会变** | **本关最大的残留差异**。修它需要把策略表按行保留（Python 的「一价格一行」）并按行时间戳选策略 ⇒ 属策略表层移植，超出本关范围。登记待后续关卡 |
+| **D77** | `cost_source_at` / `cost_policy` 两个键未实现 | 行内少两个字段 | Python 的 `entry_for` 落盘时未写这两项（由 `record_policies` 侧补），Rust 侧快照结构对不上 ⇒ 省略而非写假值 |
+| **D78** | live 来源只移植了**第一级回落** | 远端产品目录挂掉时，Python 还能用**桌面端缓存文件**（`~/.workbuddy-ai/cache/acc-product-config-v3.json`）与**旧的窄端点**兜底；Rust 侧只剩静态目录 | **少覆盖**，不是错误覆盖。第 ② ③ 级依赖用户桌面端在本地写下的缓存，Rust 侧没有对应来源 ⇒ 移植成本高于收益，登记在案 |
+| **D79** | `/v1/responses` 的 **web-tools 代跑**未做 | 客户端声明的 `web_search` / `web_fetch` 工具不会被网关代跑 | **待用户拍板**：代跑会让网关主动出网、按客户端给的 URL fetch（等于对内网开放的 fetch 代理）。Python 专门写了 SSRF 防护（`_guard_url` / `_ip_is_public` / `_resolve_host_public` / `_SafeRedirectHandler`）⇒ 本关不做，建议单独成关 + 安全评审 |
+| **D80** | `/v1/responses` 的 **DSML tool calls 兜底**、**namespace 展开**、**引用注释**（`build_citations`）未做 | 文本里的 DSML 工具调用不解析（**原样下发**）；`annotations` 恒为 `[]` | Python 的这几段都在响应**改写**路径上，与本关的流式翻译正交 ⇒ 留给后续关卡 |
+| **D81** | `PricingEntry` 的 `via_derived` 恒为 `false` | 面板不能区分「策略表推断出来的 `via`」与「直接匹配」 | Rust 侧没有策略表层（见线 A 关键洞察）⇒ 恒 `false` 是**如实呈现**，不是假值 |
+
+#### 本关验证数字（仓库内实测）
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --workspace` | **923 passed / 0 failed**（上一关 832 ⇒ **+91**） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 零警告 |
+| `cargo fmt --all -- --check` | FMT_OK |
+
+#### 本关遗留（未做）
+
+- **D76 历史价**：按行发生时生效的策略计价（需要策略表层移植）。
+- **D79 web-tools 代跑**：待用户拍板（安全面大，建议单独成关 + SSRF 评审）。
+- **D80** DSML 兜底 / namespace / citations。
+- `/usage/remaining`（D72）、ETag/checkpoint（D73）、`trigger` 精确化（D67）。
+- `/settings`、`/settings/save`、`/panel/login|logout|password` 仍缺 ⇒ 面板登录页没通。
+- 企业版积分路径（`_fetch_credits_enterprise`）未移植。
+- `ApiPanelSink::add_log_entry` 仍是 no-op ⇒ 三个后台线程的日志进不了面板日志页。
+- M6（影子回放）、M7（切流）未启动。

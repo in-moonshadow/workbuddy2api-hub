@@ -17,7 +17,10 @@ use crate::Config;
 use wb_gateway::anthropic::{chat_to_messages, messages_to_chat};
 use wb_gateway::body::BodyOptions;
 use wb_gateway::pool::ConcurrencyGate;
-use wb_gateway::responses::{chat_to_response, responses_to_chat, RequestMeta};
+use wb_gateway::responses::{
+    chat_to_response, custom_tool_names, is_truthy, request_meta_from_payload, responses_sse_frame,
+    responses_to_chat, RequestMeta, ResponsesStreamTranslator,
+};
 use wb_gateway::retry::{anthropic_error_obj, Outcome};
 use wb_gateway::stream::{aggregate_stream, strip_data_prefix};
 use wb_tasks::api_routes as task_routes;
@@ -35,6 +38,15 @@ const CHAT_SLOT_WAIT_SECONDS: f64 = 30.0;
 
 /// 默认模型（Python `_dispatch_chat_post`：`payload.get("model") or "hy4-preview"`）。
 const DEFAULT_MODEL: &str = "hy4-preview";
+
+/// `previous_response_id` 不支持时的 400 文案（Python :17888-17895 **逐字**照抄）。
+///
+/// 网关是无状态的：不存上一次的回应。客户端拿 `previous_response_id` 来追问时，
+/// 静默忽略会得到一个「看着正常、其实缺了上下文」的回答 —— 比直接报错更不诚实。
+const PREVIOUS_RESPONSE_ID_UNSUPPORTED: &str = concat!(
+    "previous_response_id is not supported: this gateway does not store response state. ",
+    "Send the full conversation in 'input' instead, or use a stateless client.",
+);
 
 /// 带 CORS 头的响应路径前缀（Python `CORS_PATH_PREFIXES`）。
 /// 注意：Python 用 `startswith` 逐前缀判 `server_path`（已剥 query），
@@ -399,24 +411,7 @@ async fn aggregate_upstream(resp: reqwest::Response, model: &str, now: f64) -> C
 async fn outcome_to_response(outcome: Outcome, model: &str, now: f64) -> ChatReply {
     match outcome {
         Outcome::Served(resp, _) => aggregate_upstream(resp, model, now).await,
-        Outcome::Rejected { status, body } => {
-            let message = body
-                .get("error")
-                .and_then(|err| err.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("upstream rejected with status {status}"));
-            ChatReply {
-                response: (
-                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    Json(body),
-                )
-                    .into_response(),
-                usage: None,
-                status: Some(status),
-                message: Some(message),
-            }
-        }
+        Outcome::Rejected { status, body } => rejected_reply(status, body),
     }
 }
 
@@ -479,6 +474,33 @@ async fn chat_openai_entry(
         request_path(&headers).as_deref(),
         Some("/v1/responses") | Some("/responses")
     );
+    // 差距①（Python :17888-17895）：`previous_response_id` 直接 400。
+    //
+    // 判据用 Python 的真值口径（`payload.get("previous_response_id")`）：空串 /
+    // null / false 不算「带了 id」，不拦。
+    if is_responses && raw.get("previous_response_id").is_some_and(is_truthy) {
+        return openai_error(
+            400,
+            PREVIOUS_RESPONSE_ID_UNSUPPORTED,
+            "invalid_request_error",
+        );
+    }
+    // 差距③：`stream` 标志必须从**原始** payload 读 —— 翻译后的 chat body
+    // 不带它（Python 同样不复制，但 Python 从原始 payload 读，:17911）。
+    let want_stream = is_responses && raw.get("stream").is_some_and(is_truthy);
+    // 差距②：回显元数据从**原始** payload 取（翻译会把 tools 降级、丢掉
+    // tool_choice/parallel_tool_calls 的原样形状）。
+    let request_meta = if is_responses {
+        request_meta_from_payload(&raw)
+    } else {
+        RequestMeta::default()
+    };
+    // custom（freeform）工具名：从**原始** payload 取（Python :17892）。
+    let custom_names = if is_responses {
+        custom_tool_names(raw.get("tools"))
+    } else {
+        Vec::new()
+    };
     let payload = if is_responses {
         responses_to_chat(&raw, None)
     } else {
@@ -523,12 +545,57 @@ async fn chat_openai_entry(
     )
     .await;
 
+    // 差距③：流式分支。上游 chat SSE 逐帧翻译成 Responses 事件帧写回客户端。
+    //
+    // ⚠️ **记账在流任务内部做**：流式的 usage 只有流结束才知道（Python 侧同样
+    // 在 `_responses_stream_response` 结束后才 `record_usage(stream=True)`），
+    // 处理器这一刻拿不到 usage。
+    if want_stream {
+        return match outcome {
+            Outcome::Served(resp, _) => responses_sse_response(
+                state,
+                resp,
+                ResponsesStreamArgs {
+                    model,
+                    request_meta,
+                    custom_names,
+                    client_payload: raw,
+                    account_uid,
+                    now,
+                },
+            ),
+            Outcome::Rejected { status, body } => {
+                // 上游拒绝：没有流可推，但**照样要记一行**（对齐非流式路径与
+                // Python 的 `record_error`）。流式路径的记账在流任务内部做，
+                // 这条拒绝发生在流开始之前，故在这里记。
+                let reply = rejected_reply(status, body);
+                record_chat_usage(
+                    &state,
+                    UsageContext {
+                        model: &model,
+                        payload: &raw,
+                        usage: None,
+                        account: account_uid.as_deref(),
+                        realm: &state.cfg.realm,
+                        key: "",
+                        status: reply.status,
+                        message: reply.message.as_deref(),
+                        started: now,
+                    },
+                );
+                reply.response
+            }
+        };
+    }
+
     let reply = outcome_to_response(outcome, &model, now).await;
     record_chat_usage(
         &state,
         UsageContext {
             model: &model,
-            payload: &payload,
+            // responses 路由用**原始**请求体记账：`stream` 标志在原始体里，
+            // 翻译后的 chat body 不带它（否则流式请求会被记成非流式）。
+            payload: if is_responses { &raw } else { &payload },
             usage: reply.usage.as_ref(),
             account: account_uid.as_deref(),
             realm: &state.cfg.realm,
@@ -542,7 +609,7 @@ async fn chat_openai_entry(
     );
     let response = reply.response;
     if is_responses {
-        wrap_response_response(response).await
+        wrap_response_response(response, &custom_names, &request_meta).await
     } else {
         response
     }
@@ -552,7 +619,11 @@ async fn chat_openai_entry(
 ///
 /// 非流式：把上游聚合出的 chat JSON 转成 Responses 形状；错误信封原样返回
 /// （错误路径由上游状态决定，不再二次翻译）。失败时回落原响应。
-async fn wrap_response_response(response: Response) -> Response {
+async fn wrap_response_response(
+    response: Response,
+    custom_names: &[String],
+    request_meta: &RequestMeta,
+) -> Response {
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -570,10 +641,176 @@ async fn wrap_response_response(response: Response) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_MODEL)
         .to_string();
-    let meta = RequestMeta::default();
     let created = now_secs() as i64;
-    let out = chat_to_response(&chat_obj, &model, &[], &meta, created);
+    let out = chat_to_response(&chat_obj, &model, custom_names, request_meta, created);
     Response::from_parts(parts, axum::body::Body::from(out.to_string()))
+}
+
+/// 上游拒绝 ⇒ 透传其状态与信封（Python `Outcome::Rejected` 分支）。
+///
+/// 单独抽出来是为了让流式分支能复用同一条拒绝路径（流式与非流式的拒绝
+/// 响应必须一致）。
+fn rejected_reply(status: u16, body: Value) -> ChatReply {
+    let message = body
+        .get("error")
+        .and_then(|err| err.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("upstream rejected with status {status}"));
+    ChatReply {
+        response: (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(body),
+        )
+            .into_response(),
+        usage: None,
+        status: Some(status),
+        message: Some(message),
+    }
+}
+
+/// `/v1/responses` 流式分支需要的参数（打包成结构体，避免参数列表过长）。
+struct ResponsesStreamArgs {
+    /// 回显与翻译用的模型名。
+    model: String,
+    /// 回显元数据（从原始 payload 取）。
+    request_meta: RequestMeta,
+    /// custom（freeform）工具名。
+    custom_names: Vec<String>,
+    /// 客户端**原始**请求体（记账取 `stream` 标志用）。
+    client_payload: Value,
+    /// 服务本次请求的账号 uid（记账用）。
+    account_uid: Option<String>,
+    /// 请求开始时刻（epoch 秒，记账算耗时用）。
+    now: f64,
+}
+
+/// `/v1/responses` 的 `stream: true` 分支（Python `_responses_stream_response`
+/// :17970-18050 + `stream_responses_events` :14590-15085）。
+///
+/// 上游 chat SSE 逐行喂进 [`ResponsesStreamTranslator`]，产出的 Responses 事件
+/// 帧按 SSE 写回客户端（`event: <type>\ndata: <json>\n\n`）。
+///
+/// ⚠️ **记账在流任务收尾时做**：流式的 usage 只有流结束才知道（Python 侧同样
+/// 在流结束后才 `record_usage(..., stream=True)`）。
+fn responses_sse_response(
+    state: AppState,
+    mut resp: reqwest::Response,
+    args: ResponsesStreamArgs,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    let created = args.now as i64;
+    let model = args.model.clone();
+    let request_meta = args.request_meta;
+    let custom_names = args.custom_names;
+    let client_payload = args.client_payload;
+    let account_uid = args.account_uid;
+    let now = args.now;
+    let stream_model = model.clone();
+    tokio::spawn(async move {
+        let mut translator =
+            ResponsesStreamTranslator::new(&stream_model, &request_meta, &custom_names, created);
+        let mut buf = String::new();
+        let mut failure: Option<String> = None;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(bytes)) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    // SSE 以 \n 分行；\r\n 也要能切（上游偶有 CRLF）。
+                    while let Some(pos) = buf.find('\n') {
+                        let line = buf.drain(..=pos).collect::<String>();
+                        for event in translator.feed(line.trim_end_matches('\r')) {
+                            if tx
+                                .send(Ok(Bytes::from(responses_sse_frame(&event))))
+                                .await
+                                .is_err()
+                            {
+                                // 客户端断开：停止搬运（对齐 Python 的 BrokenPipe 分支）
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    failure = Some(format!("stream aborted: {err}"));
+                    break;
+                }
+            }
+        }
+        if failure.is_none() {
+            // 末尾没有换行符的残留行
+            if !buf.trim().is_empty() {
+                for event in translator.feed(buf.trim()) {
+                    if tx
+                        .send(Ok(Bytes::from(responses_sse_frame(&event))))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            for event in translator.finish() {
+                if tx
+                    .send(Ok(Bytes::from(responses_sse_frame(&event))))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        } else {
+            // Python 的流异常路径：补一个 [DONE] 收尾（:18030-18035）
+            let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
+        }
+        // 记账（流结束后才有 usage）
+        let usage = translator.usage();
+        record_chat_usage(
+            &state,
+            UsageContext {
+                model: &model,
+                payload: &client_payload,
+                usage: usage.as_ref(),
+                account: account_uid.as_deref(),
+                realm: &state.cfg.realm,
+                key: "",
+                status: failure.as_ref().map(|_| 502),
+                message: failure.as_deref(),
+                started: now,
+            },
+        );
+    });
+    let mut response = Response::new(axum::body::Body::from_stream(ReceiverStream { rx }));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+/// 把 tokio 的 mpsc 接收端包成 `futures_core::Stream`。
+///
+/// axum 的 `Body::from_stream` 要求流实现 `futures_core::Stream`，而 tokio 的
+/// `Receiver` 自己不实现它（tokio 有自己的 `tokio::stream::Stream`），故此处
+/// 手写一层薄适配（`Receiver::poll_recv` 是 tokio 1.x 的公开 API）。
+struct ReceiverStream {
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+impl futures_core::Stream for ReceiverStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        this.rx.poll_recv(cx)
+    }
 }
 
 /// Anthropic 侧入口（`/v1/messages`、`/messages`）：messages → chat → 回
@@ -1319,7 +1556,15 @@ async fn usage_get(
         .filter(|row| wb_tasks::usage::row_in_window(row, since, until))
         .collect();
     let decor = snapshot_decor(&state, &realm, now).await;
-    Json(wb_tasks::usage::build_usage_snapshot_with(&rows, &decor)).into_response()
+    // 定价表（关卡 4.21 线 A）：读策略库里的最新一份快照。读不到 ⇒ 传
+    // `None` ⇒ 成本相关的键**整键省略**（不是 0），与「无定价表」的口径一致。
+    let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
+    Json(wb_tasks::usage::build_usage_snapshot_with_priced(
+        &rows,
+        &decor,
+        pricing.as_ref(),
+    ))
+    .into_response()
 }
 
 /// 快照的装饰键（Python `_usage_snapshot_uncached` 追加的那一组）。
@@ -1436,8 +1681,13 @@ async fn usage_recent_get(
         .map(|value| value.max(1))
         .unwrap_or(1);
     let rows = read_usage_rows(&state);
-    Json(wb_tasks::usage::build_usage_recent(
-        &rows, &realm, page, limit,
+    let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
+    Json(wb_tasks::usage::build_usage_recent_priced(
+        &rows,
+        &realm,
+        page,
+        limit,
+        pricing.as_ref(),
     ))
     .into_response()
 }
@@ -1578,7 +1828,12 @@ async fn usage_analytics(
         .into_iter()
         .filter(|row| wb_tasks::usage::realm_matches(row, &realm))
         .collect();
-    Json(wb_tasks::usage::build_usage_analytics(&rows)).into_response()
+    let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
+    Json(wb_tasks::usage::build_usage_analytics_priced(
+        &rows,
+        pricing.as_ref(),
+    ))
+    .into_response()
 }
 
 /// 解析 realm 过滤条件（Python 的 `realm_scope` 语义）。

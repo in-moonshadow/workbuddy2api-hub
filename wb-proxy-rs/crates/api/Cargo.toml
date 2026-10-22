@@ -12,6 +12,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "
 serde_json.workspace = true
 base64.workspace = true
 getrandom = "0.2"
+# SSE 响应体：axum 的 `Body::from_stream` 要求流实现 `futures_core::Stream`，
+# 而 tokio 的 mpsc `Receiver` 不实现它（tokio 有自己的 `tokio::stream::Stream`），
+# 故本 crate 需要能**具名**该 trait 才能手写一层薄适配。
+# futures-core 已在依赖树里（axum-core 依赖它），此处只把它提为直接依赖，
+# 不引入新的第三方 crate。
+futures-core = "0.3"
 # 非流式路径要读上游 SSE body 再聚合（对齐 Python _chat_nonstream_response）：
 # Outcome::Served 带的是 reqwest::Response，api 层需能具名其类型。
 reqwest = { version = "0.12", default-features = false }
