@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use wb_tasks::live_catalog::LiveCollect;
 use wb_tasks::price_refresher::{
     PriceCatalog, PriceRefresher, PriceSource, POLICIES_FILE, TIMELINE_FILE,
 };
@@ -51,6 +52,10 @@ struct FakeSource {
     master_enabled: AtomicBool,
     /// 取价输入清单。
     catalog: Mutex<PriceCatalog>,
+    /// live 目录新增的 id（Python `live_ids()` 的返回）。
+    live: Mutex<Vec<String>>,
+    /// live 目录各 realm 的失败原因。
+    live_errors: Mutex<Vec<(String, String)>>,
     /// 上游原文（OpenRouter 的 `/api/v1/models` 响应）。
     raw: Mutex<Value>,
 }
@@ -68,6 +73,8 @@ impl FakeSource {
                 runtime_overrides: Default::default(),
                 variants: true,
             }),
+            live: Mutex::new(Vec::new()),
+            live_errors: Mutex::new(Vec::new()),
             raw: Mutex::new(json!({
                 "data": [{
                     "id": "openai/gpt-4o",
@@ -119,6 +126,13 @@ impl PriceSource for FakeSource {
 
     fn catalog(&self) -> PriceCatalog {
         self.catalog.lock().unwrap().clone()
+    }
+
+    /// live 目录新增的 id（Python `live_ids()`）。
+    fn live_ids(&self) -> BoxFut<'_, LiveCollect> {
+        let ids = self.live.lock().unwrap().clone();
+        let errors = self.live_errors.lock().unwrap().clone();
+        Box::pin(async move { LiveCollect { ids, errors } })
     }
 }
 
@@ -323,6 +337,72 @@ async fn status_exposes_the_expected_keys() {
     assert_eq!(status["last_run"], Value::Null);
     assert_eq!(status["last_error"], Value::Null);
     assert!(status["logs"].is_array());
+}
+
+// ---------------------------------------------------------------------------
+// 6.5 live 目录：新增 id 进取价清单；取不到不缩小覆盖（关卡 4.21）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn live_ids_join_the_price_input_list() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = FakeSource::new(tmp.path().to_path_buf());
+
+    // 上游认识 gpt-4o，也认识那个只有 live 目录里才有的模型。
+    *source.raw.lock().unwrap() = json!({
+        "data": [
+            {"id": "openai/gpt-4o", "pricing": {"prompt": "0.0000025"}},
+            {"id": "vendor/brand-new", "pricing": {"prompt": "0.000001"}},
+        ]
+    });
+    *source.live.lock().unwrap() = vec!["brand-new".to_string()];
+
+    let refresher = PriceRefresher::new(source.clone(), 300.0);
+    let result = refresher.run_once().await;
+    assert_eq!(result, Some(String::new()), "成功 ⇒ 空文案");
+
+    let policies = read_lines(&policies_path(tmp.path()));
+    assert_eq!(policies.len(), 1, "策略表追加一行快照");
+    let models = policies[0]["models"].as_object().expect("models 是对象");
+    assert!(
+        models.contains_key("brand-new"),
+        "live 目录的新模型必须进取价清单：{models:?}"
+    );
+    assert_eq!(
+        models["brand-new"]["or_id"],
+        json!("vendor/brand-new"),
+        "live 模型也要拿到价格条目"
+    );
+
+    assert_eq!(
+        refresher.status()["last_extra"],
+        json!(1),
+        "last_extra 报告 live 新增了几个"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_live_catalog_does_not_shrink_the_coverage() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = FakeSource::new(tmp.path().to_path_buf());
+
+    // 两个 realm 都取不到 ⇒ live 为空，但静态目录的 gpt-4o 照样取到价。
+    *source.live_errors.lock().unwrap() = vec![
+        ("intl".to_string(), "没有可用的 intl 账号".to_string()),
+        ("cn".to_string(), "没有可用的 cn 账号".to_string()),
+    ];
+
+    let refresher = PriceRefresher::new(source.clone(), 300.0);
+    let result = refresher.run_once().await;
+    assert_eq!(result, Some(String::new()), "live 失败不该让整轮失败");
+
+    let policies = read_lines(&policies_path(tmp.path()));
+    let models = policies[0]["models"].as_object().expect("models 是对象");
+    assert!(
+        models.contains_key("gpt-4o"),
+        "live 挂掉时静态目录必须照样取价：{models:?}"
+    );
+    assert_eq!(refresher.status()["last_extra"], json!(0));
 }
 
 // ---------------------------------------------------------------------------

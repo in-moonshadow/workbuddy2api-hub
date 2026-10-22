@@ -77,6 +77,14 @@ pub mod settings;
 // `wb_updates.UpdateChecker` 的移植，`usage` 是用量落盘与聚合
 // （Python `wb_proxy.record_usage` 与 `usage_snapshot` 等）。
 pub mod price_refresher;
+// 关卡 4.21：`pricing_store` 是定价策略库的**读取端**（写端在
+// `price_refresher`）；`live_catalog` 是取价清单的 live 目录那一半
+// （静态目录在 `catalog`）；`live_source` 是 live 目录的**生产来源**
+// （用账号池凭据拉远端产品目录）。三个模块的声明一次性加好，避免并行线抢
+// `lib.rs`。
+pub mod live_catalog;
+pub mod live_source;
+pub mod pricing_store;
 // 关卡 4.19（主会话）：`price_refresher` 的**生产数据源**——settings 读总
 // 开关（缺键=开）、`usage/` 写盘、OpenRouter 取价。
 pub mod price_source;

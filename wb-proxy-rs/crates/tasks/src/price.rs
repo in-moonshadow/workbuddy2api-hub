@@ -13,6 +13,15 @@
 //!
 //! 所有价格都是「每 100 万 token」的美元价，结算货币是 CNY（按快照里的
 //! `usd_cny` 折算）。
+//!
+//! ## 关卡 4.21 新增
+//!
+//! - [`CostDetail`] / [`compute_row_detail`]：一行的成本**明细**（Python
+//!   `cost_for_row(details=True)` 的等价物）——面板的悬停气泡要的那一组键。
+//! - [`band_note`]：命中条件档的中文说明（Python `band_note`）。
+//! - [`PricingEntry::via`] / `inherited_from` / `override_from`：这条价**怎么
+//!   匹配来的**（快照落盘时就记下来了，读取端不必再猜）。
+//! - [`round6`]：Python `round(x, 6)`（成本金额按 Python 的口径取整）。
 
 use chrono::{Datelike, Timelike};
 use serde_json::{json, Map, Value};
@@ -149,6 +158,16 @@ pub struct PricingEntry {
     pub or_id: String,
     pub flat: RateTable,
     pub bands: Vec<Band>,
+    /// 这条价**怎么匹配来的**（Python `entry["via"]`）：`"variant"`（剥后缀
+    /// 继承）/ `"override"`（人工映射表）。
+    ///
+    /// **缺键 = 直接匹配**（Python `match_source` 的 `direct` 兜底）——
+    /// 快照落盘时（[`entry_for`]）就把命中方式写下来了，读取端不必再猜。
+    pub via: Option<String>,
+    /// 变体继承的基准模型名（Python `entry["inherited_from"]`）。
+    pub inherited_from: Option<String>,
+    /// 人工映射命中的来源模型名（Python `entry["override_from"]`）。
+    pub override_from: Option<String>,
 }
 
 impl PricingEntry {
@@ -191,8 +210,20 @@ impl PricingEntry {
                 .to_string(),
             flat,
             bands,
+            via: nonempty(value.get("via")),
+            inherited_from: nonempty(value.get("inherited_from")),
+            override_from: nonempty(value.get("override_from")),
         }
     }
+}
+
+/// 取一个非空字符串字段（空串当缺键）。
+fn nonempty(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 /// 解析一条 band。
@@ -305,7 +336,7 @@ pub fn per_million(value: &Value) -> Option<f64> {
 }
 
 /// Python `round(x, 6)`。
-fn round6(x: f64) -> f64 {
+pub fn round6(x: f64) -> f64 {
     let scaled = x * 1_000_000.0;
     let floor = scaled.floor();
     let diff = scaled - floor;
@@ -546,6 +577,148 @@ pub fn sum_rows(rows: &[Value], pricing: &Pricing) -> Totals {
         priced,
         missing,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 关卡 4.21：成本明细（Python `cost_for_row(details=True)` 的等价物）
+// ---------------------------------------------------------------------------
+
+/// 一行成本的**完整明细**（Python `wb_pricing.cost_for_row(details=True)`）。
+///
+/// Python 把「这一行用的是哪份价、哪一档、单价多少」摊成一组键给面板的悬停
+/// 气泡用。Rust 侧能算出来的都在这里；**算不出来的字段一律不存在**
+/// （不是 `None`、不是空串）——本仓库的口径是「省略胜过编 0」。
+///
+/// ⚠️ 与 Python 的差异（Python 的「策略表层」Rust 侧没有）：
+/// - 没有 `policy_id` / `source_at` / `backfilled`：Python 的策略表是
+///   「一个价格一行 + 首次取到时刻」，Rust 侧的策略库是「每轮追加整份快照
+///   一行」，没有「这一行当时适用哪一版价」的概念。
+/// - `via_derived` 恒为 `false`：Python 要在策略行早于 `via` 字段时按当前
+///   映射表反推；Rust 侧 `via` 落盘时即记录，**没有推断这回事**。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostDetail {
+    /// 折算后的人民币金额。
+    pub cny: f64,
+    /// 命中的条件档序号（`None` = 走模型自身的基础价）。
+    pub band: Option<usize>,
+    /// 命中的那档单价表（`None` = 未定价）。
+    pub rates: Option<RateTable>,
+    /// 单价的计价单位（每 `unit` 个 token 一个价）。
+    pub unit: f64,
+    /// 价目货币（`"USD"` / `"CNY"`）。
+    pub currency: String,
+    /// 快照里的美元兑人民币汇率（非 USD 货币时不参与折算）。
+    pub usd_cny: f64,
+    /// OpenRouter 的模型 id。
+    pub or_id: String,
+    /// 价目来源（快照落盘时写死 `"openrouter"`）。
+    pub source: String,
+    /// 这条价怎么匹配来的：`"variant"` / `"override"`；`None` = 直接匹配。
+    pub via: Option<String>,
+    /// 变体继承的基准模型名。
+    pub inherited_from: Option<String>,
+    /// 人工映射命中的来源模型名。
+    pub override_from: Option<String>,
+    /// 命中的条件档的中文说明（没有档位 ⇒ `None`）。
+    pub band_note: Option<String>,
+    /// `via` 是不是推断出来的（Rust 侧恒 `false`）。
+    pub via_derived: bool,
+}
+
+/// 一行的成本明细；**未定价 ⇒ `None`**（不编 0、不给半截明细）。
+///
+/// Python 同款：未定价时整组明细都是 `None`。
+pub fn compute_row_detail(row: &Value, pricing: &Pricing) -> Option<CostDetail> {
+    let cost = compute_row(row, pricing);
+    if !cost.known {
+        return None;
+    }
+    let model = row.get("model").and_then(Value::as_str)?;
+    let entry = pricing.models.get(model)?;
+    Some(CostDetail {
+        cny: cost.cny,
+        band: cost.band,
+        rates: cost.rates,
+        unit: entry.unit,
+        currency: entry.currency.clone(),
+        usd_cny: pricing.usd_cny,
+        or_id: entry.or_id.clone(),
+        source: entry.source.clone(),
+        via: entry.via.clone(),
+        inherited_from: entry.inherited_from.clone(),
+        override_from: entry.override_from.clone(),
+        band_note: band_note(entry, cost.band),
+        via_derived: false,
+    })
+}
+
+/// 星期缩写 → 中文（Python `wb_pricing._WEEKDAY_CN`）。
+pub const WEEKDAY_CN: [(&str, &str); 7] = [
+    ("mon", "周一"),
+    ("tue", "周二"),
+    ("wed", "周三"),
+    ("thu", "周四"),
+    ("fri", "周五"),
+    ("sat", "周六"),
+    ("sun", "周日"),
+];
+
+/// 命中条件档的中文说明（Python `wb_pricing.band_note`）。
+///
+/// - 长度档：`输入长度 ≥ 272,000 tokens`
+/// - 时段档：`每天 16:00–24:00 UTC` / `每周 周一/周三 16:00–24:00 UTC`
+///
+/// 没有档位、或档位索引越界 ⇒ `None`。
+pub fn band_note(entry: &PricingEntry, index: Option<usize>) -> Option<String> {
+    let index = index?;
+    let band = entry.bands.get(index)?;
+    if let Some(threshold) = band.min_prompt_tokens {
+        return Some(format!("输入长度 ≥ {} tokens", thousands(threshold as i64)));
+    }
+    let window = format!("{}–{} UTC", hhmm(band.start), hhmm(band.end));
+    let days: Vec<&str> = band
+        .days
+        .as_ref()
+        .map(|list| {
+            list.iter()
+                .filter_map(|day| {
+                    WEEKDAY_CN
+                        .iter()
+                        .find(|(abbr, _)| abbr == day)
+                        .map(|(_, cn)| *cn)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if days.is_empty() {
+        Some(format!("每天 {window}"))
+    } else {
+        Some(format!("每周 {} {window}", days.join("/")))
+    }
+}
+
+/// `1600` → `16:00`（Python `wb_pricing._hhmm`）。
+fn hhmm(value: f64) -> String {
+    let minutes = value as i64;
+    format!(
+        "{:02}:{:02}",
+        minutes.div_euclid(100),
+        minutes.rem_euclid(100)
+    )
+}
+
+/// 千分位（Python `format(int(x), ",")`）。
+fn thousands(value: i64) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    format!("{sign}{out}")
 }
 
 /// 名字归一化：小写、去掉所有非字母数字。
@@ -1035,5 +1208,92 @@ mod tests {
         let (day, hhmm) = utc_parts(ts);
         assert!(WEEKDAY_SHORT.contains(&day));
         assert!((0..2400).contains(&hhmm));
+    }
+
+    // -----------------------------------------------------------------
+    // 关卡 4.21：成本明细
+    // -----------------------------------------------------------------
+
+    /// 带 `via` / `inherited_from` / 时段档的快照。
+    fn detailed_snapshot() -> Value {
+        json!({
+            "meta": {"base_currency": "CNY", "usd_cny": 7.1},
+            "models": {
+                "demo-lkeap": {
+                    "display": "demo-lkeap",
+                    "source": "openrouter",
+                    "currency": "USD",
+                    "unit": 1000000,
+                    "or_id": "vendor/demo",
+                    "via": "variant",
+                    "inherited_from": "demo",
+                    "flat": {"input_cache_hit": 0.01, "input_cache_miss": 0.03, "output": 0.5},
+                    "bands": [
+                        {"flat": {"input_cache_miss": 0.02, "output": 0.4},
+                         "days": ["mon", "wed"], "start": 1600, "end": 2400}
+                    ]
+                },
+                "plain": {
+                    "currency": "USD", "unit": 1000000,
+                    "flat": {"input_cache_miss": 0.03, "output": 0.5},
+                    "bands": [{"flat": {"output": 1.0}, "min_prompt_tokens": 272000}]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn the_entry_keeps_how_the_price_was_matched() {
+        let pricing = Pricing::from_json(&detailed_snapshot());
+        let entry = pricing.models.get("demo-lkeap").unwrap();
+        assert_eq!(entry.via.as_deref(), Some("variant"));
+        assert_eq!(entry.inherited_from.as_deref(), Some("demo"));
+        assert_eq!(entry.override_from, None);
+        // 没有 `via` ⇒ 直接匹配。
+        assert_eq!(pricing.models.get("plain").unwrap().via, None);
+    }
+
+    #[test]
+    fn band_note_explains_the_conditional_band() {
+        let pricing = Pricing::from_json(&detailed_snapshot());
+        // 长度档。
+        let plain = pricing.models.get("plain").unwrap();
+        assert_eq!(
+            band_note(plain, Some(0)).as_deref(),
+            Some("输入长度 ≥ 272,000 tokens")
+        );
+        // 时段档 + 星期。
+        let demo = pricing.models.get("demo-lkeap").unwrap();
+        assert_eq!(
+            band_note(demo, Some(0)).as_deref(),
+            Some("每周 周一/周三 16:00–24:00 UTC")
+        );
+        // 没有档位 / 索引越界 ⇒ None。
+        assert_eq!(band_note(plain, None), None);
+        assert_eq!(band_note(plain, Some(7)), None);
+    }
+
+    #[test]
+    fn cost_detail_carries_the_hover_card_fields() {
+        let pricing = Pricing::from_json(&detailed_snapshot());
+        let row = json!({
+            "model": "demo-lkeap", "at": 1_800_000_000.0,
+            "prompt_tokens": 1000, "completion_tokens": 0
+        });
+        let detail = compute_row_detail(&row, &pricing).expect("demo-lkeap 有价");
+        assert_eq!(detail.currency, "USD");
+        assert_eq!(detail.unit, 1_000_000.0);
+        assert_eq!(detail.or_id, "vendor/demo");
+        assert_eq!(detail.source, "openrouter");
+        assert_eq!(detail.via.as_deref(), Some("variant"));
+        assert_eq!(detail.inherited_from.as_deref(), Some("demo"));
+        assert!(!detail.via_derived);
+        // 没有命中时段档 ⇒ band 为 None。
+        assert_eq!(detail.band, None);
+        assert_eq!(detail.band_note, None);
+
+        // 未定价 ⇒ 没有明细。
+        let unknown = json!({"model": "who-knows", "prompt_tokens": 1});
+        assert!(compute_row_detail(&unknown, &pricing).is_none());
     }
 }

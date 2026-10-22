@@ -24,6 +24,9 @@ pub mod responses;
 // `wb_updates.fetch_releases`）。本 crate 只取回原文，不塑形。
 pub mod github;
 pub mod pricing;
+// 关卡 4.21（线 C）：**远端产品目录**的 HTTP 那一半——拉 `<chat_upstream>/v3/config`
+// 并解析成 (ids, credits)（Python `wb_proxy.fetch_remote_product_config`）。
+pub mod product_catalog;
 pub mod retry;
 pub mod sanitize;
 pub mod stream;

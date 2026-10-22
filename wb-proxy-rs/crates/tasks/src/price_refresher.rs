@@ -45,13 +45,15 @@
 //!
 //! ## 与 Python 的已知差异（登记在案，不粉饰）
 //!
-//! 1. **取价清单只覆盖静态目录，live 目录那一半仍缺**：Python 的
+//! 1. **取价清单 = 静态目录 ∪ live 目录新增**（关卡 4.21 补齐）：Python 的
 //!    `priced_model_ids()`（`:1157-1192`）= 内置静态目录
 //!    （`wb_catalog.STATIC_*_MODELS`）∪ 网关 live 目录新增。**静态目录已于
 //!    关卡 4.20 落地**（[`crate::catalog`]：54 个 id，与 Python 逐字逐序
-//!    一致，有跨语言 parity 测试盯着）；**live 目录那一半仍缺**——它需要
-//!    「远端产品目录抓取 + `is_chat_model` 过滤 + 变体整理」整条链路，Rust
-//!    侧没有。按 Python 的语义，缺它只是**少覆盖**（那部分模型落进
+//!    一致，有跨语言 parity 测试盯着）；**live 目录那一半于关卡 4.21 落地**
+//!    ——[`crate::live_catalog`]（筛选/合并）+ [`crate::live_source`]（生产
+//!    来源）+ [`PriceSource::live_ids`]（接缝）。残余差异：Python 的 live
+//!    来源有三级回落（远端 → 桌面端缓存文件 → 旧窄端点），Rust 侧只有第 ①
+//!    级 ⇒ 远端挂掉时 Rust 侧只剩静态目录。这是**少覆盖**（那部分模型落进
 //!    `unpriced`），不会让覆盖变小。
 //! 2. **策略表的行粒度不同**：Python 的策略表是**一个价格一行**（按内容
 //!    哈希去重，`policy_id()`，`:1612-1622`），时间线只在**指派真的变了**时
@@ -84,6 +86,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
+
+use crate::live_catalog::LiveCollect;
 
 /// 策略表文件名。Python `wb_pricing.py:1457`（`_data_paths()` 的第一个返回值）。
 pub const POLICIES_FILE: &str = "pricing-policies.jsonl";
@@ -175,10 +179,27 @@ pub trait PriceSource: Send + Sync {
 
     /// 取价输入清单。默认**空清单**——生产实现见
     /// [`crate::price_source::SettingsPriceSource`]：静态目录已落地
-    /// （[`crate::catalog`]，54 个 id），live 目录那一半仍缺（模块文档的
-    /// 差异 1）。
+    /// （[`crate::catalog`]，54 个 id），live 目录那一半见
+    /// [`Self::live_ids`]。
     fn catalog(&self) -> PriceCatalog {
         PriceCatalog::default()
+    }
+
+    /// live 目录里**静态目录之外**的新增模型 id。
+    ///
+    /// Python `PriceRefresher.live_ids()`（`wb_pricing.py:2353-2387`）：问两个
+    /// realm（`intl` 先、`cn` 后）的 live 目录，只收静态目录里没有的 id。
+    ///
+    /// 返回 [`LiveCollect`]（id + 每个 realm 的失败原因）——失败**不抛错**：
+    /// live 出问题只能留下缺口，不能缩小覆盖，静态目录必须照样取价。失败原因
+    /// 带回给线程，由它写进自己的日志环（对齐 Python `:2374` 那句
+    /// "live 目录取不到（%s），该区域本轮只按内置目录：%s"）。
+    ///
+    /// 默认实现返回**空结果**（= 没有 live 目录这一层）⇒ 测试替身不必实现它。
+    ///
+    /// 生产实现见 [`crate::price_source::SettingsPriceSource`]。
+    fn live_ids(&self) -> BoxFut<'_, LiveCollect> {
+        Box::pin(async { LiveCollect::default() })
     }
 }
 
@@ -196,6 +217,9 @@ struct State {
     last_error: Option<String>,
     /// 上次成功取价时定价到的模型数。Python `:2329`。
     last_models: usize,
+    /// 上次取价时 live 目录贡献的**新增**模型数。Python `self.last_extra`
+    /// （`:2425`）。
+    last_extra: usize,
     /// 上次没匹配到价格的模型 id。Python `:2331`。
     last_unpriced: Vec<String>,
     /// 上次命中人工覆盖表的模型 id。Python `:2431` 的 `overridden`。
@@ -384,9 +408,19 @@ impl PriceRefresher {
         // 塑形（Python `build_snapshot()`，`:1368-1408`）。
         let table = openrouter_table(&raw);
         let catalog = self.source.catalog();
+        // live 目录（Python `live_ids()`，`:2368-2387`）：静态目录之外的新增 id。
+        // 失败只留缺口、不缩小覆盖 ⇒ 清单照样能用静态目录。
+        let live = self.source.live_ids().await;
+        for (realm, reason) in live.errors.iter() {
+            self.log(&format!(
+                "live 目录取不到（{realm}），该区域本轮只按内置目录：{reason}"
+            ));
+        }
+        // 合并：静态在前、live 在后、去重保序（Python `priced_model_ids()`）。
+        let hub_ids = crate::live_catalog::merge_catalog(&catalog.hub_ids, &live.ids);
         let built = crate::price::build_snapshot(
             Some(&table),
-            &catalog.hub_ids,
+            &hub_ids,
             None,
             &catalog.runtime_overrides,
             catalog.variants,
@@ -421,13 +455,19 @@ impl PriceRefresher {
             state.last_run = Some(now);
             state.last_error = None;
             state.last_models = models;
+            state.last_extra = live.ids.len();
             state.last_unpriced = built.unpriced.clone();
             state.last_overridden = built.overridden.clone();
         }
         self.log(&format!(
-            "已取价：{models} 个模型（人工覆盖 {}，未定价 {}）",
+            "已取价：{models} 个模型（人工覆盖 {}，未定价 {}{}）",
             built.overridden.len(),
-            built.unpriced.len()
+            built.unpriced.len(),
+            if live.ids.is_empty() {
+                String::new()
+            } else {
+                format!("，live 新增 {}", live.ids.len())
+            }
         ));
         Some(String::new())
     }
@@ -630,6 +670,7 @@ impl PriceRefresher {
             "next_run_label": state.next_run.map(local_label),
             "last_error": state.last_error,
             "last_models": state.last_models,
+            "last_extra": state.last_extra,
             "last_unpriced": state.last_unpriced,
             "last_overridden": state.last_overridden,
             "policies": count_lines(&self.policies_path()),

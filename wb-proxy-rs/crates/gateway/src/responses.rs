@@ -7,21 +7,30 @@
 //! - `_responses_usage`（:14481-14495）
 //! - `chat_to_response`（:14496-14589）
 //!
-//! M3 范围（用户 2026-10-16 裁决「结构翻译进 M3，流式推 M3-b」）：只做**非流式
-//! 结构翻译**。以下支线推迟 M3-b，本模块不实现、也不假装实现：
+//! M3 范围（用户 2026-10-16 裁决「结构翻译进 M3，流式推 M3-b」）：结构翻译 +
+//! 流式事件翻译。以下支线推迟，本模块不实现、也不假装实现：
 //! - namespace 工具展开/还原（:13175-13300 的 `expand_namespace_tools` /
 //!   `apply_namespace_to_calls`）——需 `_namespace_map` 贯穿请求与响应两侧；
 //! - web-tools 注入与代跑（`wb_webtools.install_tool_defs`、`web_tools_active`）；
 //! - DSML tool calls 兜底（:11205 `parse_dsml_tool_calls`）；
-//! - 引用注释（`build_citations`）；
-//! - 流式 `stream_responses_events`（:14590-15085，496 行）。
+//! - 引用注释（`build_citations`）。
 //!
 //! custom（freeform）工具的降级与重膨胀**在 M3 范围内**：它只依赖请求自身的
 //! `tools` 声明，无外部状态。
+//!
+//! **关卡 4.21（线 B）补齐的三条差距**（与 Python `wb_proxy.py` 逐条对齐）：
+//! 1. `previous_response_id` 不再被静默丢弃 —— 路由层判 400（见 api 层）；
+//! 2. 回显元数据（`tools` / `tool_choice` / `parallel_tool_calls`）从**原始**
+//!    Responses 请求体取（`request_meta_from_payload`），不再是空默认值；
+//! 3. 支持 `stream: true` —— 上游 chat SSE → Responses 事件帧
+//!    （`ResponsesStreamTranslator` / `stream_responses_events`）。
+
+use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
 use crate::anthropic::{anthropic_json_text, new_id};
+use crate::stream::{estimate_tokens, is_truncated_arguments, strip_data_prefix};
 
 // ---------------------------------------------------------------------------
 // _flatten_content（:13025-13057）
@@ -541,7 +550,9 @@ pub fn tools_for_chat(tools: &Value) -> Vec<Value> {
 }
 
 /// Python 真值判断的近似：None/False/空串/空数组/空对象/0 为假。
-fn is_truthy(v: &Value) -> bool {
+///
+/// pub：api 层判 `previous_response_id` / `stream` 标志时要用同一套口径。
+pub fn is_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -663,6 +674,31 @@ pub struct RequestMeta {
     pub parallel_tool_calls: Option<Value>,
     pub tool_choice: Option<Value>,
     pub tools: Option<Value>,
+}
+
+/// `request_meta`（Python :17904-17908）：从**原始** Responses 请求体取客户端
+/// 宣告的能力，原样回显在响应对象上。
+///
+/// ⚠️ 必须从**原始 payload** 取，不能从翻译后的 chat body 取：翻译会把
+/// `tools` 降级（custom → 单参 `input` 的函数工具）、会丢掉 `stream`，回显
+/// 出来就不是客户端发的东西了。
+///
+/// 口径与 Python 逐字对齐：
+/// - `tools`：`payload.get("tools") or []` —— 缺省/空 ⇒ `[]`，否则**原样**
+///   （custom 工具也保持 Responses 形状，不降级）；
+/// - `tool_choice`：`payload.get("tool_choice", "auto")` —— 键缺省 ⇒ `None`
+///   （`chat_to_response` 落成 `"auto"`），键存在但为 null ⇒ `Some(null)`
+///   （回显 null，与 Python 一致）；
+/// - `parallel_tool_calls`：`payload.get("parallel_tool_calls", True)` —— 同上口径。
+pub fn request_meta_from_payload(payload: &Value) -> RequestMeta {
+    RequestMeta {
+        parallel_tool_calls: payload.get("parallel_tool_calls").cloned(),
+        tool_choice: payload.get("tool_choice").cloned(),
+        tools: Some(match payload.get("tools") {
+            Some(tools) if is_truthy(tools) => tools.clone(),
+            _ => json!([]),
+        }),
+    }
 }
 
 /// `chat_to_response`：Chat Completions 响应体 → Responses 响应体。
@@ -821,6 +857,716 @@ pub fn unwrap_custom_input(args: &str) -> String {
         Value::String(s) => s,
         _ => args.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 流式：stream_responses_events（:14590-15085）
+// ---------------------------------------------------------------------------
+
+/// 一次流式工具调用（Python `tool_calls_map` 的 entry）。
+#[derive(Debug, Clone)]
+struct ToolEntry {
+    /// 在 `outputs` 里的下标（= Responses 的 `output_index`）。
+    output_index: usize,
+    /// 上游给的 tool call id（回显为 `call_id`）。
+    call_id: String,
+    /// 工具名。
+    name: String,
+    /// 累积的 arguments（上游分片，字符串拼接）。
+    arguments: String,
+    /// 是否是本请求里声明为 custom（freeform）的工具。
+    custom: bool,
+    /// 本地生成的 item id（`fc_` / `ctc_` 前缀）。
+    item_id: String,
+}
+
+/// `stream_responses_events`（:14590-15085）的状态机。
+///
+/// 上游 chat SSE 逐行喂进 [`ResponsesStreamTranslator::feed`]，产出 Responses
+/// 事件（`Value`，含 `type` + `sequence_number`）；流结束时调
+/// [`ResponsesStreamTranslator::finish`] 取收尾帧（含 `response.completed`）。
+///
+/// **本移植覆盖的事件**（与 Python 逐字对齐的字段名与顺序）：
+/// - 生命周期：`response.created` / `response.in_progress` / `response.completed`；
+/// - 文本：`response.output_item.added` / `response.content_part.added` /
+///   `response.output_text.delta`，收尾 `response.output_text.done` /
+///   `response.content_part.done` / `response.output_item.done`；
+/// - 推理：`response.reasoning_summary_part.added` /
+///   `response.reasoning_summary_text.delta`，收尾
+///   `response.reasoning_summary_text.done` /
+///   `response.reasoning_summary_part.done` / `response.output_item.done`；
+/// - 工具调用：`response.output_item.added` +
+///   `response.function_call_arguments.delta`（custom 工具则是
+///   `response.custom_tool_call_input.delta`），收尾
+///   `response.function_call_arguments.done`（custom 则是
+///   `response.custom_tool_call_input.done`）+ `response.output_item.done`。
+///
+/// **不在本移植范围**（与本关卡的账本一致，**不假装实现**）：
+/// - namespace 工具展开/还原（`expand_namespace_tools` / `apply_namespace_to_calls`）；
+/// - DSML tool calls 兜底（`parse_dsml_tool_calls`）⇒ 文本**原样**下发，
+///   模型把调用打印在正文里时不会被还原成 `function_call`；
+/// - 引用注释（`build_citations`）⇒ `annotations` 恒为 `[]`；
+/// - web-tools 代跑（`wb_webtools`）⇒ 上游的 web_search / web_fetch 呼叫
+///   **原样**转成 `function_call` 交给客户端，网关不主动出网。
+pub struct ResponsesStreamTranslator {
+    resp_id: String,
+    msg_id: String,
+    rs_id: String,
+    created_at: i64,
+    seq: i64,
+    model: String,
+    meta: RequestMeta,
+    custom_names: Vec<String>,
+    text_parts: Vec<String>,
+    reason_parts: Vec<String>,
+    /// 输出项列表；`None` = 占位（还没填内容）。
+    outputs: Vec<Option<Value>>,
+    reason_index: Option<usize>,
+    msg_index: Option<usize>,
+    finish: String,
+    usage: Option<Value>,
+    saw_done: bool,
+    tool_calls: BTreeMap<i64, ToolEntry>,
+    lifecycle_sent: bool,
+}
+
+impl ResponsesStreamTranslator {
+    /// 建一个翻译器。`created_at` 是秒级时间戳（由调用方注入，便于测试固定）。
+    pub fn new(
+        model: &str,
+        request_meta: &RequestMeta,
+        custom_names: &[String],
+        created_at: i64,
+    ) -> Self {
+        Self {
+            resp_id: new_id("resp_"),
+            msg_id: new_id("msg_"),
+            rs_id: new_id("rs_"),
+            created_at,
+            seq: 0,
+            model: model.to_string(),
+            meta: request_meta.clone(),
+            custom_names: custom_names.to_vec(),
+            text_parts: Vec::new(),
+            reason_parts: Vec::new(),
+            outputs: Vec::new(),
+            reason_index: None,
+            msg_index: None,
+            finish: "stop".into(),
+            usage: None,
+            saw_done: false,
+            tool_calls: BTreeMap::new(),
+            lifecycle_sent: false,
+        }
+    }
+
+    /// 上游 usage（chat 形状），供 api 层记账。
+    pub fn usage(&self) -> Option<Value> {
+        self.usage.clone()
+    }
+
+    /// 造一个事件（Python `ev()` :14637-14641）：`type` + `sequence_number` +
+    /// 负载。序号从 1 开始（Python 是 `seq += 1` 后再用）。
+    fn ev(&mut self, etype: &str, payload: Value) -> Value {
+        self.seq += 1;
+        let mut data = Map::new();
+        data.insert("type".into(), Value::String(etype.to_string()));
+        data.insert("sequence_number".into(), Value::Number(self.seq.into()));
+        if let Value::Object(p) = payload {
+            for (k, v) in p {
+                data.insert(k, v);
+            }
+        }
+        Value::Object(data)
+    }
+
+    /// 响应对象（Python `resp_obj()` :14612-14633）。
+    fn resp_obj(&self, status: &str) -> Value {
+        let mut obj = Map::new();
+        obj.insert("id".into(), Value::String(self.resp_id.clone()));
+        obj.insert("object".into(), Value::String("response".into()));
+        obj.insert("created_at".into(), json!(self.created_at));
+        obj.insert("status".into(), Value::String(status.to_string()));
+        obj.insert("model".into(), Value::String(self.model.clone()));
+        obj.insert(
+            "output".into(),
+            Value::Array(self.outputs.iter().filter_map(|o| o.clone()).collect()),
+        );
+        obj.insert(
+            "output_text".into(),
+            Value::String(self.text_parts.join("")),
+        );
+        obj.insert(
+            "parallel_tool_calls".into(),
+            self.meta.parallel_tool_calls.clone().unwrap_or(json!(true)),
+        );
+        obj.insert(
+            "tool_choice".into(),
+            self.meta.tool_choice.clone().unwrap_or(json!("auto")),
+        );
+        obj.insert("tools".into(), self.meta.tools.clone().unwrap_or(json!([])));
+        obj.insert("metadata".into(), json!({}));
+        if let Some(u) = responses_usage(self.usage.as_ref()) {
+            obj.insert("usage".into(), u);
+        }
+        Value::Object(obj)
+    }
+
+    /// 推理项（Python `reason_item()` :14644-14649）。
+    fn reason_item(&self, status: &str) -> Value {
+        json!({
+            "id": self.rs_id,
+            "type": "reasoning",
+            "status": status,
+            "summary": [{"type": "summary_text", "text": self.reason_parts.join("")}],
+        })
+    }
+
+    /// 消息项（Python `msg_item()` :14662-14668）。
+    fn msg_item(&self, status: &str) -> Value {
+        let content = if self.text_parts.is_empty() {
+            json!([])
+        } else {
+            json!([{
+                "type": "output_text",
+                "text": self.text_parts.join(""),
+                "annotations": [],
+            }])
+        };
+        json!({
+            "id": self.msg_id,
+            "type": "message",
+            "status": status,
+            "role": "assistant",
+            "content": content,
+        })
+    }
+
+    /// 输出项槽位是否还是空的（Python `outputs[i] is None` 的占位语义）。
+    fn slot_empty(&self, idx: usize) -> bool {
+        matches!(self.outputs.get(idx), Some(None))
+    }
+
+    /// 生命周期开场（Python :14925-14927）：只在**第一轮**送一次。
+    fn ensure_lifecycle(&mut self, events: &mut Vec<Value>) {
+        if self.lifecycle_sent {
+            return;
+        }
+        self.lifecycle_sent = true;
+        let created = self.resp_obj("in_progress");
+        events.push(self.ev("response.created", json!({"response": created})));
+        let in_progress = self.resp_obj("in_progress");
+        events.push(self.ev("response.in_progress", json!({"response": in_progress})));
+    }
+
+    /// 喂一行上游 SSE（`data: {...}` 或 `[DONE]`），返回本行产出的事件。
+    pub fn feed(&mut self, raw_line: &str) -> Vec<Value> {
+        let data = strip_data_prefix(raw_line);
+        if data.is_empty() {
+            return Vec::new();
+        }
+        if data == "[DONE]" {
+            self.saw_done = true;
+            return Vec::new();
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        self.ensure_lifecycle(&mut events);
+        // usage 在 choices 守卫之前捕获（Python :14938-14943）
+        if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
+            let take = match &self.usage {
+                None => true,
+                Some(prev) => {
+                    u.get("total_tokens").and_then(|t| t.as_i64()).unwrap_or(0)
+                        >= prev
+                            .get("total_tokens")
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0)
+                }
+            };
+            if take {
+                self.usage = Some(u.clone());
+            }
+        }
+        let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) else {
+            return events;
+        };
+        for choice in choices {
+            let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
+            self.feed_reasoning(&delta, &mut events);
+            self.feed_tool_calls(&delta, &mut events);
+            self.feed_content(&delta, &mut events);
+            if let Some(fr) = choice
+                .get("finish_reason")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                self.finish = fr.to_string();
+            }
+        }
+        events
+    }
+
+    /// 推理增量（Python :14946-14962）。
+    fn feed_reasoning(&mut self, delta: &Value, events: &mut Vec<Value>) {
+        let Some(piece) = delta
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let rs_id = self.rs_id.clone();
+        if self.reason_index.is_none() {
+            let idx = self.outputs.len();
+            self.outputs.push(None);
+            self.reason_index = Some(idx);
+            let item = self.reason_item("in_progress");
+            events.push(self.ev(
+                "response.output_item.added",
+                json!({"output_index": idx, "item": item}),
+            ));
+            events.push(self.ev(
+                "response.reasoning_summary_part.added",
+                json!({
+                    "item_id": rs_id,
+                    "output_index": idx,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                }),
+            ));
+        }
+        self.reason_parts.push(piece.clone());
+        let idx = self.reason_index.unwrap_or(0);
+        events.push(self.ev(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": rs_id,
+                "output_index": idx,
+                "summary_index": 0,
+                "delta": piece,
+            }),
+        ));
+    }
+
+    /// 工具调用增量（Python :14963-15012）。
+    fn feed_tool_calls(&mut self, delta: &Value, events: &mut Vec<Value>) {
+        let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) else {
+            return;
+        };
+        for tc in calls {
+            let idx = tc.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+            let fn_obj = tc.get("function").cloned().unwrap_or(Value::Null);
+            let fn_name = fn_obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let fn_args = fn_obj
+                .get("arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let call_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !self.tool_calls.contains_key(&idx) {
+                // 首片：开一个新输出项（Python :14970-14998）
+                let out_idx = self.outputs.len();
+                self.outputs.push(None);
+                let c_id = if call_id.is_empty() {
+                    new_id("call_")
+                } else {
+                    call_id.clone()
+                };
+                let is_custom =
+                    !fn_name.is_empty() && self.custom_names.iter().any(|n| n == &fn_name);
+                let item_id = new_id(if is_custom { "ctc_" } else { "fc_" });
+                self.tool_calls.insert(
+                    idx,
+                    ToolEntry {
+                        output_index: out_idx,
+                        call_id: c_id.clone(),
+                        name: fn_name.clone(),
+                        arguments: fn_args.clone(),
+                        custom: is_custom,
+                        item_id: item_id.clone(),
+                    },
+                );
+                let mut item = Map::new();
+                item.insert("id".into(), Value::String(item_id));
+                item.insert("status".into(), Value::String("in_progress".into()));
+                item.insert("call_id".into(), Value::String(c_id));
+                item.insert("name".into(), Value::String(fn_name));
+                if is_custom {
+                    item.insert("type".into(), Value::String("custom_tool_call".into()));
+                    item.insert("input".into(), Value::String(String::new()));
+                } else {
+                    item.insert("type".into(), Value::String("function_call".into()));
+                    item.insert("arguments".into(), Value::String(String::new()));
+                }
+                events.push(self.ev(
+                    "response.output_item.added",
+                    json!({"output_index": out_idx, "item": Value::Object(item)}),
+                ));
+                // ⚠️ Python 首片的 arguments **不**发 delta 事件（直接进 entry），
+                // 只有后续分片才发 —— 这里照抄（:14970-14998）。
+                continue;
+            }
+            let is_custom_name = self.custom_names.iter().any(|n| n == &fn_name);
+            // 借用 `self.tool_calls` 的可变引用期间不能调 `self.ev`（要 &mut self），
+            // 故先把事件载荷攒出来，出了借用再发。
+            let mut delta_event: Option<(String, Value)> = None;
+            {
+                let Some(entry) = self.tool_calls.get_mut(&idx) else {
+                    continue;
+                };
+                if !fn_name.is_empty() && entry.name.is_empty() {
+                    entry.name = fn_name.clone();
+                    if is_custom_name {
+                        entry.custom = true;
+                    }
+                }
+                if !fn_args.is_empty() {
+                    entry.arguments.push_str(&fn_args);
+                    let etype = if entry.custom {
+                        "response.custom_tool_call_input.delta"
+                    } else {
+                        "response.function_call_arguments.delta"
+                    };
+                    delta_event = Some((
+                        etype.to_string(),
+                        json!({
+                            "output_index": entry.output_index,
+                            "item_id": entry.item_id,
+                            "call_id": entry.call_id,
+                            "delta": fn_args,
+                        }),
+                    ));
+                }
+            }
+            if let Some((etype, payload)) = delta_event {
+                events.push(self.ev(&etype, payload));
+            }
+        }
+    }
+
+    /// 文本增量（Python :15013-15075）。
+    ///
+    /// ⚠️ Python 这里有一段 DSML 缓冲（`text_buffer`，:15035-15071）用来从正文里
+    /// 捞工具调用；DSML 兜底不在本关卡范围，故文本**原样**逐片下发。
+    fn feed_content(&mut self, delta: &Value, events: &mut Vec<Value>) {
+        let Some(piece) = delta
+            .get("content")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let msg_id = self.msg_id.clone();
+        if self.msg_index.is_none() {
+            // 推理项还开着就先收尾（Python :15015-15026）
+            if let Some(ridx) = self.reason_index {
+                if self.slot_empty(ridx) {
+                    self.close_reasoning(ridx, events);
+                }
+            }
+            let idx = self.outputs.len();
+            self.outputs.push(None);
+            self.msg_index = Some(idx);
+            events.push(self.ev(
+                "response.output_item.added",
+                json!({
+                    "output_index": idx,
+                    "item": {
+                        "id": msg_id,
+                        "type": "message",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                }),
+            ));
+            events.push(self.ev(
+                "response.content_part.added",
+                json!({
+                    "item_id": msg_id,
+                    "output_index": idx,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                }),
+            ));
+        }
+        self.text_parts.push(piece.clone());
+        let idx = self.msg_index.unwrap_or(0);
+        events.push(self.ev(
+            "response.output_text.delta",
+            json!({
+                "item_id": msg_id,
+                "output_index": idx,
+                "content_index": 0,
+                "delta": piece,
+            }),
+        ));
+    }
+
+    /// 推理项收尾（Python :14686-14697 与 :15018-15026 两处同款）。
+    fn close_reasoning(&mut self, ridx: usize, events: &mut Vec<Value>) {
+        let rs_id = self.rs_id.clone();
+        let full_r = self.reason_parts.join("");
+        events.push(self.ev(
+            "response.reasoning_summary_text.done",
+            json!({
+                "item_id": rs_id,
+                "output_index": ridx,
+                "summary_index": 0,
+                "text": full_r,
+            }),
+        ));
+        events.push(self.ev(
+            "response.reasoning_summary_part.done",
+            json!({
+                "item_id": rs_id,
+                "output_index": ridx,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": full_r},
+            }),
+        ));
+        let item = self.reason_item("completed");
+        if let Some(slot) = self.outputs.get_mut(ridx) {
+            *slot = Some(item.clone());
+        }
+        events.push(self.ev(
+            "response.output_item.done",
+            json!({"output_index": ridx, "item": item}),
+        ));
+    }
+
+    /// 流结束：收尾帧 + `response.completed`（Python `_finalize()` :14678-14905）。
+    pub fn finish(&mut self) -> Vec<Value> {
+        let mut events = Vec::new();
+        self.ensure_lifecycle(&mut events);
+        // 截断的工具调用不收尾（Python :15045-15052）：arguments 是半截 JSON，
+        // 收尾会让客户端拿到一个永远解析不了的调用。
+        let mut dropped_truncated = false;
+        if !self.tool_calls.is_empty() && (self.finish == "length" || !self.saw_done) {
+            let keys: Vec<i64> = self.tool_calls.keys().copied().collect();
+            for idx in keys {
+                let truncated = self
+                    .tool_calls
+                    .get(&idx)
+                    .is_some_and(|e| is_truncated_arguments(&e.arguments));
+                if truncated {
+                    self.tool_calls.remove(&idx);
+                    dropped_truncated = true;
+                }
+            }
+        }
+        // 1. 推理项收尾（Python :14680-14697）
+        if let Some(ridx) = self.reason_index {
+            if self.slot_empty(ridx) {
+                self.close_reasoning(ridx, &mut events);
+            }
+        }
+        // 2. 工具调用收尾（Python :14698-14720）
+        let keys: Vec<i64> = self.tool_calls.keys().copied().collect();
+        for idx in keys {
+            let Some(entry) = self.tool_calls.get(&idx).cloned() else {
+                continue;
+            };
+            let mut item = Map::new();
+            item.insert("id".into(), Value::String(entry.item_id.clone()));
+            item.insert(
+                "type".into(),
+                Value::String(
+                    if entry.custom {
+                        "custom_tool_call"
+                    } else {
+                        "function_call"
+                    }
+                    .to_string(),
+                ),
+            );
+            item.insert("status".into(), Value::String("completed".into()));
+            item.insert("call_id".into(), Value::String(entry.call_id.clone()));
+            item.insert("name".into(), Value::String(entry.name.clone()));
+            if entry.custom {
+                let input = unwrap_custom_input(&entry.arguments);
+                events.push(self.ev(
+                    "response.custom_tool_call_input.done",
+                    json!({
+                        "output_index": entry.output_index,
+                        "item_id": entry.item_id,
+                        "call_id": entry.call_id,
+                        "input": input,
+                    }),
+                ));
+                item.insert("input".into(), Value::String(input));
+            } else {
+                events.push(self.ev(
+                    "response.function_call_arguments.done",
+                    json!({
+                        "output_index": entry.output_index,
+                        "item_id": entry.item_id,
+                        "call_id": entry.call_id,
+                        "arguments": entry.arguments,
+                    }),
+                ));
+                item.insert("arguments".into(), Value::String(entry.arguments.clone()));
+            }
+            let item = Value::Object(item);
+            if let Some(slot) = self.outputs.get_mut(entry.output_index) {
+                *slot = Some(item.clone());
+            }
+            events.push(self.ev(
+                "response.output_item.done",
+                json!({"output_index": entry.output_index, "item": item}),
+            ));
+        }
+        // 3. 消息项收尾（Python :14818-14845）
+        let full_text = self.text_parts.join("");
+        let has_other_items = self.outputs.iter().any(|o| o.is_some());
+        if self.msg_index.is_some() || !full_text.is_empty() || !has_other_items {
+            let msg_id = self.msg_id.clone();
+            let idx = match self.msg_index {
+                Some(i) => i,
+                None => {
+                    let i = self.outputs.len();
+                    self.outputs.push(None);
+                    self.msg_index = Some(i);
+                    events.push(self.ev(
+                        "response.output_item.added",
+                        json!({
+                            "output_index": i,
+                            "item": {
+                                "id": msg_id,
+                                "type": "message",
+                                "status": "in_progress",
+                                "role": "assistant",
+                                "content": [],
+                            },
+                        }),
+                    ));
+                    events.push(self.ev(
+                        "response.content_part.added",
+                        json!({
+                            "item_id": msg_id,
+                            "output_index": i,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": "", "annotations": []},
+                        }),
+                    ));
+                    i
+                }
+            };
+            events.push(self.ev(
+                "response.output_text.done",
+                json!({
+                    "item_id": msg_id,
+                    "output_index": idx,
+                    "content_index": 0,
+                    "text": full_text,
+                }),
+            ));
+            events.push(self.ev(
+                "response.content_part.done",
+                json!({
+                    "item_id": msg_id,
+                    "output_index": idx,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": full_text, "annotations": []},
+                }),
+            ));
+            let item = self.msg_item("completed");
+            if let Some(slot) = self.outputs.get_mut(idx) {
+                *slot = Some(item.clone());
+            }
+            events.push(self.ev(
+                "response.output_item.done",
+                json!({"output_index": idx, "item": item}),
+            ));
+        }
+        // 4. usage 兜底估算（Python :14848-14864）
+        self.estimate_usage();
+        // 5. 收口（Python :14865-14876）
+        let status = if self.finish != "length" && !dropped_truncated {
+            "completed"
+        } else {
+            "incomplete"
+        };
+        let mut final_obj = self.resp_obj(status);
+        if self.finish == "length" {
+            final_obj["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
+        events.push(self.ev("response.completed", json!({"response": final_obj})));
+        events
+    }
+
+    /// usage 兜底估算（Python :14848-14864）。
+    ///
+    /// ⚠️ Python 的 `prompt_est` 是 `max(1, estimate_tokens(str(meta.get("input") or "")))`
+    /// —— `request_meta` 里**没有** `input` 键，故 `str(None)` = `"None"`，
+    /// `estimate_tokens("None")` = 1 ⇒ 恒为 1。这里照抄该口径。
+    fn estimate_usage(&mut self) {
+        let total = self
+            .usage
+            .as_ref()
+            .and_then(|u| u.get("total_tokens").and_then(|t| t.as_i64()))
+            .unwrap_or(0);
+        if self.usage.is_some() && total != 0 {
+            return;
+        }
+        let out_txt = self.text_parts.join("");
+        let rs_txt = self.reason_parts.join("");
+        if out_txt.is_empty() && rs_txt.is_empty() {
+            return;
+        }
+        let comp = estimate_tokens(&out_txt) + estimate_tokens(&rs_txt);
+        let prompt_est = 1;
+        self.usage = Some(json!({
+            "prompt_tokens": prompt_est,
+            "completion_tokens": comp,
+            "total_tokens": prompt_est + comp,
+            "completion_tokens_details": {"reasoning_tokens": estimate_tokens(&rs_txt)},
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }));
+    }
+}
+
+/// `stream_responses_events`（Python :14590-15085）：把上游 chat SSE 分片翻译成
+/// Responses 事件序列。**纯函数**：输入分片 ⇒ 输出事件序列（便于单测）。
+///
+/// `lines` 是上游 SSE 的原始行（`data: {...}` / `[DONE]`）；每个事件是
+/// `{"type": ..., "sequence_number": ..., ...负载}`。
+pub fn stream_responses_events(
+    lines: &[&str],
+    model: &str,
+    request_meta: &RequestMeta,
+    custom_names: &[String],
+    created_at: i64,
+) -> Vec<Value> {
+    let mut translator =
+        ResponsesStreamTranslator::new(model, request_meta, custom_names, created_at);
+    let mut events = Vec::new();
+    for line in lines {
+        events.extend(translator.feed(line));
+    }
+    events.extend(translator.finish());
+    events
+}
+
+/// Responses SSE 帧的字节渲染（Python `ev()` :14637-14641）：
+/// `event: <type>\ndata: <json>\n\n`。
+pub fn responses_sse_frame(event: &Value) -> Vec<u8> {
+    let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let raw = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
+    format!("event: {etype}\ndata: {raw}\n\n").into_bytes()
 }
 
 #[cfg(test)]
@@ -1309,5 +2055,302 @@ mod tests {
     #[test]
     fn unwrap_custom_input_empty_returns_empty() {
         assert_eq!(unwrap_custom_input(""), "");
+    }
+
+    // ---- request_meta_from_payload ----
+
+    #[test]
+    fn request_meta_takes_tools_choice_and_parallel_from_payload() {
+        // :17904-17908 —— 从**原始** payload 取，原样回显
+        let payload = json!({
+            "input": "hi",
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+            "tool_choice": "required",
+            "parallel_tool_calls": false,
+        });
+        let meta = request_meta_from_payload(&payload);
+        // tools 保持 Responses 原样（不降级成单参 input 的函数工具）
+        assert_eq!(
+            meta.tools,
+            Some(json!([{"type": "custom", "name": "apply_patch"}]))
+        );
+        assert_eq!(meta.tool_choice, Some(json!("required")));
+        assert_eq!(meta.parallel_tool_calls, Some(json!(false)));
+    }
+
+    #[test]
+    fn request_meta_defaults_when_fields_absent() {
+        // 键缺省 ⇒ None ⇒ chat_to_response 落成 auto / true / []
+        let meta = request_meta_from_payload(&json!({"input": "hi"}));
+        assert_eq!(meta.tools, Some(json!([])));
+        assert_eq!(meta.tool_choice, None);
+        assert_eq!(meta.parallel_tool_calls, None);
+    }
+
+    #[test]
+    fn request_meta_keeps_explicit_null_tool_choice() {
+        // Python `payload.get("tool_choice", "auto")`：键存在但为 null ⇒ 回显 null
+        let meta = request_meta_from_payload(&json!({"tool_choice": null}));
+        assert_eq!(meta.tool_choice, Some(Value::Null));
+    }
+
+    // ---- stream_responses_events ----
+
+    /// 上游 chat SSE 的一行（`data: ` 前缀 + JSON）。
+    fn sse_line(body: &str) -> String {
+        format!("data: {body}")
+    }
+
+    fn text_stream_lines() -> Vec<String> {
+        vec![
+            sse_line(
+                r#"{"id":"c1","model":"m","choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#,
+            ),
+            sse_line(
+                r#"{"id":"c1","model":"m","choices":[{"delta":{"content":"lo"},"finish_reason":null}]}"#,
+            ),
+            sse_line(r#"{"id":"c1","model":"m","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            "data: [DONE]".to_string(),
+        ]
+    }
+
+    fn event_types(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn stream_text_emits_expected_event_order() {
+        let lines = text_stream_lines();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let events = stream_responses_events(&refs, "m", &RequestMeta::default(), &[], 1000);
+        assert_eq!(
+            event_types(&events),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        // sequence_number 从 1 开始且逐个递增（Python `ev()` :14637-14641）
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev["sequence_number"], json!(i + 1));
+        }
+    }
+
+    #[test]
+    fn stream_text_deltas_concatenate_to_upstream_text() {
+        let lines = text_stream_lines();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let events = stream_responses_events(&refs, "m", &RequestMeta::default(), &[], 1000);
+        let text: String = events
+            .iter()
+            .filter(|e| e["type"] == json!("response.output_text.delta"))
+            .map(|e| e["delta"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(text, "Hello");
+        // 收尾帧的 text 是全文
+        let done = events
+            .iter()
+            .find(|e| e["type"] == json!("response.output_text.done"))
+            .expect("output_text.done");
+        assert_eq!(done["text"], json!("Hello"));
+        assert_eq!(done["content_index"], json!(0));
+    }
+
+    #[test]
+    fn stream_completed_carries_response_object() {
+        let lines = text_stream_lines();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let events = stream_responses_events(&refs, "m", &RequestMeta::default(), &[], 1000);
+        let completed = events
+            .iter()
+            .find(|e| e["type"] == json!("response.completed"))
+            .expect("response.completed");
+        let resp = &completed["response"];
+        assert_eq!(resp["object"], json!("response"));
+        assert_eq!(resp["status"], json!("completed"));
+        assert_eq!(resp["output_text"], json!("Hello"));
+        assert_eq!(resp["created_at"], json!(1000));
+        // output[] 里有一条 message 项
+        let out = resp["output"].as_array().expect("output[]");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], json!("message"));
+        assert_eq!(out[0]["content"][0]["text"], json!("Hello"));
+    }
+
+    #[test]
+    fn stream_created_and_in_progress_carry_empty_response() {
+        let lines = text_stream_lines();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let events = stream_responses_events(&refs, "m", &RequestMeta::default(), &[], 1000);
+        for etype in ["response.created", "response.in_progress"] {
+            let ev = events
+                .iter()
+                .find(|e| e["type"] == json!(etype))
+                .expect(etype);
+            assert_eq!(ev["response"]["status"], json!("in_progress"));
+            assert_eq!(ev["response"]["output"], json!([]));
+            assert_eq!(ev["response"]["output_text"], json!(""));
+        }
+    }
+
+    #[test]
+    fn stream_echoes_request_meta_on_response_object() {
+        // 回显元数据必须来自原始 payload（差距②）
+        let meta = request_meta_from_payload(&json!({
+            "tools": [{"type": "function", "name": "t"}],
+            "tool_choice": "required",
+            "parallel_tool_calls": false,
+        }));
+        let lines = text_stream_lines();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let events = stream_responses_events(&refs, "m", &meta, &[], 1000);
+        let completed = events
+            .iter()
+            .find(|e| e["type"] == json!("response.completed"))
+            .expect("response.completed");
+        assert_eq!(completed["response"]["tools"][0]["name"], json!("t"));
+        assert_eq!(completed["response"]["tool_choice"], json!("required"));
+        assert_eq!(completed["response"]["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn stream_tool_call_emits_function_call_lifecycle() {
+        let lines = [
+            sse_line(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"run","arguments":"{\"a\":"}}]},"finish_reason":null}]}"#,
+            ),
+            sse_line(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ),
+            "data: [DONE]".to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let events = stream_responses_events(&refs, "m", &RequestMeta::default(), &[], 1000);
+        let types = event_types(&events);
+        assert!(types.contains(&"response.output_item.added".to_string()));
+        assert!(types.contains(&"response.function_call_arguments.delta".to_string()));
+        assert!(types.contains(&"response.function_call_arguments.done".to_string()));
+        // 收尾的 function_call 项：arguments 是拼好的完整 JSON
+        let done = events
+            .iter()
+            .find(|e| e["type"] == json!("response.function_call_arguments.done"))
+            .expect("arguments.done");
+        assert_eq!(done["arguments"], json!("{\"a\":1}"));
+        assert_eq!(done["call_id"], json!("call_1"));
+        // output_item.done 带完整的 function_call 项
+        let item_done = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == json!("response.output_item.done"))
+            .expect("output_item.done");
+        assert_eq!(item_done["item"]["type"], json!("function_call"));
+        assert_eq!(item_done["item"]["name"], json!("run"));
+        assert_eq!(item_done["item"]["status"], json!("completed"));
+    }
+
+    #[test]
+    fn stream_custom_tool_call_uses_custom_events() {
+        // 请求里声明为 custom 的工具 ⇒ custom_tool_call 事件族
+        let lines = [
+            sse_line(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"apply_patch","arguments":"{\"input\":\"raw\"}"}}]},"finish_reason":null}]}"#,
+            ),
+            "data: [DONE]".to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let names = vec!["apply_patch".to_string()];
+        let events = stream_responses_events(&refs, "m", &RequestMeta::default(), &names, 1000);
+        let types = event_types(&events);
+        assert!(types.contains(&"response.custom_tool_call_input.done".to_string()));
+        assert!(!types.contains(&"response.function_call_arguments.done".to_string()));
+        let done = events
+            .iter()
+            .find(|e| e["type"] == json!("response.custom_tool_call_input.done"))
+            .expect("custom input done");
+        // custom 的参数被解包回原始 input 串（:14578-14582）
+        assert_eq!(done["input"], json!("raw"));
+    }
+
+    #[test]
+    fn stream_reasoning_emits_summary_events() {
+        let lines = [
+            sse_line(
+                r#"{"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}"#,
+            ),
+            sse_line(r#"{"choices":[{"delta":{"content":"ans"},"finish_reason":"stop"}]}"#),
+            "data: [DONE]".to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let events = stream_responses_events(&refs, "m", &RequestMeta::default(), &[], 1000);
+        let types = event_types(&events);
+        assert!(types.contains(&"response.reasoning_summary_part.added".to_string()));
+        assert!(types.contains(&"response.reasoning_summary_text.delta".to_string()));
+        assert!(types.contains(&"response.reasoning_summary_text.done".to_string()));
+        // 推理项排在 message 项前面（reasoning 先出现 ⇒ output_index 0）
+        let added = events
+            .iter()
+            .find(|e| e["type"] == json!("response.output_item.added"))
+            .expect("output_item.added");
+        assert_eq!(added["output_index"], json!(0));
+        assert_eq!(added["item"]["type"], json!("reasoning"));
+    }
+
+    #[test]
+    fn stream_length_finish_marks_response_incomplete() {
+        let lines = [
+            sse_line(r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}"#),
+            "data: [DONE]".to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let events = stream_responses_events(&refs, "m", &RequestMeta::default(), &[], 1000);
+        let completed = events
+            .iter()
+            .find(|e| e["type"] == json!("response.completed"))
+            .expect("response.completed");
+        assert_eq!(completed["response"]["status"], json!("incomplete"));
+        assert_eq!(
+            completed["response"]["incomplete_details"]["reason"],
+            json!("max_output_tokens")
+        );
+    }
+
+    #[test]
+    fn stream_empty_upstream_still_emits_lifecycle_and_completed() {
+        let events = stream_responses_events(&[], "m", &RequestMeta::default(), &[], 1000);
+        assert_eq!(
+            event_types(&events),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+    }
+
+    #[test]
+    fn responses_sse_frame_has_event_and_data_lines() {
+        let event = json!({"type": "response.created", "sequence_number": 1});
+        let frame = String::from_utf8(responses_sse_frame(&event)).expect("utf8");
+        assert!(
+            frame.starts_with("event: response.created\ndata: "),
+            "got {frame}"
+        );
+        assert!(frame.ends_with("\n\n"), "got {frame}");
     }
 }

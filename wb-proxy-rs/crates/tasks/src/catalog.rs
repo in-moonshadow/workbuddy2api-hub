@@ -41,19 +41,25 @@
 //! Python 的清单**逐条同构**——否则两侧的 `unpriced` 长度会不一样，
 //! 「未定价」这个指标就不可比了。
 //!
-//! ## 已知缺口：live 目录
+//! ## live 目录：静态目录之外的另一半
 //!
 //! Python 的 `priced_model_ids()`（`:1157-1192`）= 本静态目录 ∪ **网关 live
-//! 目录新增**的模型。live 目录那一半需要「远端产品目录抓取 + `is_chat_model`
-//! 过滤 + 变体整理」，**Rust 侧目前完全没有这条链路** ⇒ 本模块只覆盖静态
-//! 目录。后果：Python 能在 live 目录里取到价、而 Rust 取不到的模型，会在
-//! Rust 侧落进 `unpriced`。这是**已知缺口**，不是等价实现。
+//! 目录新增**的模型。live 目录那一半（远端产品目录抓取 + `is_chat_model`
+//! 过滤 + 变体整理 + 免费兄弟规则）在 [`crate::live_catalog`]；本模块提供
+//! [`hub_model_ids_with_live`]——把两者合成**取价输入清单**（静态在前、
+//! 去重保序）。
+//!
+//! 取价链路另外需要**静态目录的 credits**（回答「这个模型是不是免费的」
+//! ⇒ 免费兄弟规则），所以本模块除 id 外还搬了一份 credits 表
+//! （[`HUB_MODEL_CREDITS`]，对齐 Python `wb_proxy.snapshot_credits()`）。
 //!
 //! ## 跨语言 parity
 //!
 //! `crates/tasks/tests/contract_catalog.rs` 直接读仓库里的 `wb_catalog.py`，
 //! 解析出两段内嵌 JSON 的 id 列表，与 [`HUB_MODEL_IDS`] **逐字逐序**比对
 //! （含条数）——目录漂移会在 CI 里直接红。
+//! `crates/tasks/tests/contract_live_catalog.rs` 另有一份 parity：把
+//! `wb_catalog.py` 里的 credits 与 [`HUB_MODEL_CREDITS`] 逐条比对。
 
 /// hub 静态模型 id 目录（去重保序，国际版在前）。
 ///
@@ -62,7 +68,8 @@
 /// `STATIC_CN_MODELS` 30 条新 id）。
 ///
 /// ⚠️ 这里只覆盖**静态目录**；Python `priced_model_ids()` 还会并上网关 live
-/// 目录新增的模型，那一半 Rust 侧尚未落地（见模块文档的「已知缺口」）。
+/// 目录新增的模型——那一半在 [`crate::live_catalog`]，用
+/// [`hub_model_ids_with_live`] 合成完整清单。
 pub const HUB_MODEL_IDS: [&str; 54] = [
     // ---- 国际版（Python `wb_catalog.STATIC_INTL_MODELS`，24 条）----
     "default-model",
@@ -130,6 +137,100 @@ pub fn hub_model_ids() -> &'static [&'static str] {
     &HUB_MODEL_IDS
 }
 
+/// hub 静态模型 id 目录（**含 live 目录新增**）——取价输入清单。
+///
+/// 等价于 Python `wb_pricing.priced_model_ids(extra_ids)`（`:1157-1175`）：
+/// **静态在前**、live 在后、去重保序。`live` 传空切片 ⇒ 就是静态目录本身。
+///
+/// ⚠️ `live` 应当是**已经整理过**的 live id（见 [`crate::live_catalog`] 的
+/// `collect_live_ids`）：别名、变体后缀、付费的「免费兄弟」在那里已经剔除。
+pub fn hub_model_ids_with_live(live: &[String]) -> Vec<String> {
+    crate::live_catalog::merge_catalog(hub_model_ids(), live)
+}
+
+/// hub 静态目录里每个模型的 credits（**小写**，国际版在前）。
+///
+/// 权威源：Python `wb_proxy.snapshot_credits()`（`:10376-10390`）——它遍历
+/// `STATIC_INTL_MODELS` 再 `STATIC_CN_MODELS`，用 `setdefault` ⇒ **国际版
+/// 优先**。
+///
+/// 这个优先级有实质影响：`deepseek-v4.1-flash` 国际版是 `x0.00`（免费）、
+/// 国内版是 `x0.11`；按国际版算，它才是「免费的那个」。
+///
+/// 取价链路用这份表回答「有没有免费的兄弟」——远端只列了付费变体时，
+/// 免费的那个才是选择器应当展示的（Python `curate_remote_catalog`）。
+pub const HUB_MODEL_CREDITS: [(&str, &str); 54] = [
+    ("default-model", ""),
+    ("fast-model", "x0.34 credits"),
+    ("balanced-model", "x0.59 credits"),
+    ("primary-model", "x3.31 credits"),
+    ("deep-model", "x3.33 credits"),
+    ("deepseek-v4.1-flash", "x0.00"),
+    ("gpt-6-astra", "x6.67"),
+    ("hy4-preview-f", "x0.00"),
+    ("hy4-preview", "x0.29"),
+    ("hy3", "x0.00"),
+    ("gpt-5.6-sol", "x3.47"),
+    ("gpt-5.6-terra", "x1.39"),
+    ("gpt-5.6-luna", "x0.14"),
+    ("gpt-5.5", "x3.31"),
+    ("gpt-5.4", "x1.65"),
+    ("grok-4.7", "x1.90"),
+    ("gpt-5.3-codex", "x1.25"),
+    ("gemini-3.5-flash", "x0.99"),
+    ("glm-5.3", "x0.79"),
+    ("glm-5.3-flash", "x0.06"),
+    ("glm-5.2", "x0.79"),
+    ("kimi-k3", "x1.62"),
+    ("kimi-k2.8-preview", "x0.77"),
+    ("kimi-k2.6", "x0.52"),
+    ("hy3-x", "x0.05"),
+    ("hy4-preview-dev", "x0.29"),
+    ("hy4-preview-x", "x0.29"),
+    ("minimax-m2.5", "x0.18"),
+    ("glm-5v-turbo", "x0.71"),
+    ("glm-5.1", "x0.79"),
+    ("glm-5.0-turbo", "x0.95"),
+    ("glm-4.6v", "x0.11"),
+    ("kimi-k3-1", "x1.62"),
+    ("kimi-k2.7", "x0.57"),
+    ("kimi-k2.5", "x0.45"),
+    ("kimi-k2-thinking", "x0.54"),
+    ("minimax-m3", "x0.25"),
+    ("minimax-m2.7", "x0.26"),
+    ("glm-4.6", "x0.23"),
+    ("deepseek-v4-flash", "x0.17"),
+    ("deepseek-v4-pro", "x0.51"),
+    ("deepseek-v3-2-volc", "x0.29"),
+    ("deepseek-v3-1-volc", "x0.52"),
+    ("deepseek-v3-1-lkeap", "x0.52"),
+    ("deepseek-v3-1", "x0.52"),
+    ("deepseek-v3-0324-lkeap", "x0.52"),
+    ("deepseek-r1-0528-lkeap", ""),
+    ("kimi-k2-instruct-taiji", ""),
+    ("default-1.1", ""),
+    ("deepseek-r1-0528", ""),
+    ("deepseek-v3-0324", ""),
+    ("default-1.2", ""),
+    ("hunyuan-2.0-instruct", ""),
+    ("hunyuan-chat", ""),
+];
+
+/// 查一个模型的静态 credits（小写）。未知 id ⇒ `None`。
+pub fn hub_credit(id: &str) -> Option<&'static str> {
+    HUB_MODEL_CREDITS
+        .iter()
+        .find(|(mid, _)| *mid == id)
+        .map(|(_, credits)| *credits)
+}
+
+/// 静态目录的 credits 表（id → 小写 credits）。
+///
+/// 与 Python `snapshot_credits()` 逐条一致（含**国际版优先**的取值）。
+pub fn hub_credits_map() -> std::collections::HashMap<&'static str, &'static str> {
+    HUB_MODEL_CREDITS.iter().copied().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +265,64 @@ mod tests {
     #[test]
     fn hub_model_ids_returns_the_same_slice() {
         assert_eq!(hub_model_ids(), &HUB_MODEL_IDS[..]);
+    }
+
+    #[test]
+    fn credits_table_covers_every_static_id_exactly_once() {
+        assert_eq!(HUB_MODEL_CREDITS.len(), HUB_MODEL_IDS.len());
+        for id in HUB_MODEL_IDS.iter() {
+            assert!(hub_credit(id).is_some(), "credits 表缺少静态 id {id}");
+        }
+        // credits 已经小写化（Python `snapshot_credits()` 的 `.lower()`）。
+        for (id, credits) in HUB_MODEL_CREDITS.iter() {
+            assert_eq!(
+                *credits,
+                credits.to_lowercase(),
+                "{id} 的 credits 必须是小写"
+            );
+        }
+    }
+
+    #[test]
+    fn intl_credits_win_over_cn_ones() {
+        // deepseek-v4.1-flash：国际版 x0.00（免费）、国内版 x0.11 —— 取国际版。
+        assert_eq!(hub_credit("deepseek-v4.1-flash"), Some("x0.00"));
+        // 另外两个免费模型。
+        assert_eq!(hub_credit("hy4-preview-f"), Some("x0.00"));
+        assert_eq!(hub_credit("hy3"), Some("x0.00"));
+        assert_eq!(hub_credit("does-not-exist"), None);
+    }
+
+    #[test]
+    fn hub_model_ids_with_live_keeps_static_first() {
+        let live = vec!["brand-new".to_string()];
+        let merged = hub_model_ids_with_live(&live);
+        assert_eq!(merged.len(), HUB_MODEL_IDS.len() + 1);
+        assert_eq!(&merged[..HUB_MODEL_IDS.len()], &HUB_MODEL_IDS[..]);
+        assert_eq!(merged[HUB_MODEL_IDS.len()], "brand-new");
+    }
+
+    #[test]
+    fn hub_model_ids_with_live_dedups_and_keeps_order() {
+        let live = vec![
+            "zeta".to_string(),
+            HUB_MODEL_IDS[0].to_string(),
+            "zeta".to_string(),
+            "alpha".to_string(),
+        ];
+        let merged = hub_model_ids_with_live(&live);
+        assert_eq!(merged.len(), HUB_MODEL_IDS.len() + 2);
+        assert_eq!(&merged[..HUB_MODEL_IDS.len()], &HUB_MODEL_IDS[..]);
+        assert_eq!(merged[HUB_MODEL_IDS.len()], "zeta");
+        assert_eq!(merged[HUB_MODEL_IDS.len() + 1], "alpha");
+    }
+
+    #[test]
+    fn empty_live_leaves_the_static_catalog_untouched() {
+        let merged = hub_model_ids_with_live(&[]);
+        assert_eq!(merged.len(), HUB_MODEL_IDS.len());
+        for (want, got) in HUB_MODEL_IDS.iter().zip(merged.iter()) {
+            assert_eq!(*want, got);
+        }
     }
 }

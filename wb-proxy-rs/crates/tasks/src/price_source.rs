@@ -10,14 +10,21 @@
 //! - 取价清单走 [`crate::catalog`]（Python `wb_catalog.STATIC_*_MODELS` 的
 //!   静态目录移植）+ 面板手填的 `usage/pricing-overrides.json`。
 //!
-//! ## 已知缺口：live 目录
+//! ## live 目录
 //!
 //! Python 的取价清单是「静态目录 ∪ **网关 live 目录新增**」
-//! （`wb_pricing.priced_model_ids()`，`:1157-1192`）。Rust 侧只落地了
-//! **静态目录**那一半（[`crate::catalog::HUB_MODEL_IDS`]）；live 目录需要
-//! 「远端产品目录抓取 + `is_chat_model` 过滤」，Rust 侧完全缺这条链路。
-//! ⇒ Python 能取到价、而 Rust 取不到的模型会落进 `unpriced`。这是**已知
-//! 缺口**，不是等价实现。
+//! （`wb_pricing.priced_model_ids()`，`:1157-1192`）。Rust 侧两半都有：
+//!
+//! - **静态目录**：[`crate::catalog::HUB_MODEL_IDS`]（54 个 id，与 Python
+//!   逐字逐序一致，有跨语言 parity 测试盯着）；
+//! - **live 目录**：本模块的 [`PriceSource::live_ids`] 走
+//!   [`crate::live_catalog`]（筛选/合并）与
+//!   [`crate::live_source::PoolLiveCatalogSource`]（生产来源：从账号池取
+//!   凭据拉 `<chat_upstream>/v3/config`）。
+//!
+//! ⚠️ **残余差异**：Python 的 live 来源有**三级回落**（远端 → 桌面端缓存文件
+//! → 旧的窄端点），Rust 侧只移植了第 ① 级（远端）⇒ 远端挂掉时 Rust 侧只剩
+//! 静态目录，Python 还能用桌面缓存兜底。这是**少覆盖**，不是错误覆盖。
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -30,6 +37,7 @@ use serde_json::Value;
 
 use wb_gateway::outbound::UpstreamClient;
 
+use crate::live_catalog::{LiveCatalogSource, LiveCollect};
 use crate::price_refresher::{PriceCatalog, PriceSource};
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -49,10 +57,14 @@ pub const OVERRIDES_FILENAME: &str = "pricing-overrides.json";
 pub use crate::settings::PRICING_VARIANT_INHERIT_KEY;
 
 /// 生产数据源：settings 读总开关、`usage/` 写盘、OpenRouter 取价。
+///
+/// `live`：live 模型目录的来源（Python `PriceRefresher.live_ids()` 的那一层）。
+/// **缺省没有** ⇒ 取价清单只有静态目录（[`crate::catalog`]）。
 pub struct SettingsPriceSource {
     accounts_dir: PathBuf,
     usage_dir: PathBuf,
     client: UpstreamClient,
+    live: Option<Arc<dyn LiveCatalogSource>>,
 }
 
 impl SettingsPriceSource {
@@ -61,7 +73,14 @@ impl SettingsPriceSource {
             accounts_dir: accounts_dir.to_path_buf(),
             usage_dir: usage_dir.to_path_buf(),
             client: UpstreamClient::new(),
+            live: None,
         }
+    }
+
+    /// 挂上 live 模型目录来源（Python `live_ids()` 那一层）。
+    pub fn with_live_source(mut self, live: Arc<dyn LiveCatalogSource>) -> Self {
+        self.live = Some(live);
+        self
     }
 
     /// 当前 epoch 秒（等价 Python `time.time()`）。
@@ -173,9 +192,9 @@ impl PriceSource for SettingsPriceSource {
     /// 取价输入清单。
     ///
     /// Python `wb_pricing.priced_model_ids()`（`:1157-1192`）= 静态目录 ∪ live
-    /// 目录新增。Rust 侧只有**静态目录**那一半（[`crate::catalog`]，移植自
-    /// `wb_catalog.STATIC_*_MODELS`）——live 目录那条链路尚未落地（见模块
-    /// 文档的「已知缺口」）。
+    /// 目录新增。Rust 侧本方法给出**静态目录**那一半（[`crate::catalog`]，
+    /// 移植自 `wb_catalog.STATIC_*_MODELS`）；live 目录那一半由
+    /// [`PriceSource::live_ids`] 给出，取价线程负责合并。
     ///
     /// 另外两项：
     ///
@@ -194,16 +213,43 @@ impl PriceSource for SettingsPriceSource {
             variants: self.variant_inherit_enabled(),
         }
     }
+
+    /// live 目录里静态目录之外的新增 id（Python `live_ids()`，`:2368-2387`）。
+    ///
+    /// 没有挂 live 来源 ⇒ 返回空列表（取价清单只有静态目录）。
+    ///
+    /// **失败不抛错**：per-realm 失败只跳过那个 realm（失败原因带回给线程写
+    /// 日志），静态目录必须照样取价。
+    fn live_ids(&self) -> BoxFut<'_, LiveCollect> {
+        let live = self.live.clone();
+        Box::pin(async move {
+            let Some(source) = live else {
+                return LiveCollect::default();
+            };
+            crate::live_catalog::collect_live_ids_detailed(
+                source.as_ref(),
+                crate::catalog::hub_model_ids(),
+            )
+            .await
+        })
+    }
 }
 
 /// 造一个装好生产数据源的刷新器（接线方用）。
+///
+/// `live` = live 模型目录来源；传 `None` ⇒ 取价清单只有静态目录。
 pub fn production_price_refresher(
     accounts_dir: &Path,
     usage_dir: &Path,
     interval_seconds: f64,
+    live: Option<Arc<dyn LiveCatalogSource>>,
 ) -> Arc<crate::price_refresher::PriceRefresher> {
+    let mut source = SettingsPriceSource::new(accounts_dir, usage_dir);
+    if let Some(live) = live {
+        source = source.with_live_source(live);
+    }
     Arc::new(crate::price_refresher::PriceRefresher::new(
-        Arc::new(SettingsPriceSource::new(accounts_dir, usage_dir)),
+        Arc::new(source),
         interval_seconds,
     ))
 }

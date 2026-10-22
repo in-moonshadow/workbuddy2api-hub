@@ -24,18 +24,35 @@
 //!
 //! - [`build_usage_snapshot_with`]：快照 + Python `_usage_snapshot_uncached`
 //!   的装饰键（`started` / `since` / `log_file` / `realm` / `accounts_map` /
-//!   `account`；`usd_cny` 依赖定价表 ⇒ 省略）。
+//!   `account`；`usd_cny` 依赖定价表 ⇒ 省略，见关卡 4.21 的 `_priced` 变体）。
 //! - [`build_usage_recent`]：分页的最近行（Python `recent_usage`）。
 //! - [`build_usage_timeseries`]：分桶序列（Python `usage_timeseries`）。
 //! - [`build_usage_perf`]：延迟分位（Python `perf_stats`；分位从原始样本算）。
 //! - [`resolve_range_window`] / [`pick_bucket_seconds`]：区间与桶粒度
 //!   （Python `range_window` / `_usage_timeseries_scope`）。
+//!
+//! ## 关卡 4.21（线 A）新增：成本估算
+//!
+//! 定价表接进来之后，聚合里多出一组成本键。**既有公开函数的签名一律没动**
+//! （`crates/api/src/routes.rs` 在调它们）⇒ 成本能力挂在**同名的 `_priced`
+//! 变体上**，传 `None` 时与旧函数**逐字节一致**：
+//!
+//! - [`build_usage_snapshot_priced`]：补 `cost_cny`（合计）/ `cost_missing`
+//!   （模型 → 次数），每个模型桶补 `cost_cny`。
+//! - [`build_usage_snapshot_with_priced`]：同上，装饰组补 `usd_cny`。
+//! - [`build_usage_recent_priced`]：每行补 `cost_*` 明细键组。
+//! - [`build_usage_analytics_priced`]：`summary` 与 `models` 桶补 `cost_cny`。
+//!
+//! ⚠️ **没有定价表 ⇒ 一个成本键都不写**（不是 0、不是空表、不是 null）：
+//! 「没有价表」与「价表说这条不要钱」是两回事，面板必须能分开看。
+//! 未定价的**行**同理：整组 `cost_*` 键省略。
 
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use crate::activity;
+use crate::price::{self, Pricing};
 
 /// 用量日志文件名（Python `wb_proxy.USAGE_LOG`：`usage/usage.jsonl`）。
 pub const USAGE_LOG_NAME: &str = "usage.jsonl";
@@ -326,6 +343,10 @@ struct Bucket {
     errors: i64,
     /// 5 个 token 字段的累加。
     tokens: [i64; 5],
+    /// 该桶内**已定价**行的金额合计（人民币）。
+    ///
+    /// 只有 `by_model` 桶用（Python 的桶字面量里有 `cost_cny`）；总桶不读它。
+    cny: f64,
     /// 账号 → 次数（`by_model` 桶里的 `accounts`）。
     accounts: Map<String, Value>,
     /// 模型 → 次数（`by_account` 桶里的 `models`）。
@@ -428,19 +449,56 @@ impl Buckets {
 /// - 没有 `started` / `since` / `usd_cny` / `accounts_map` / `account`
 ///   （进程级信息与定价汇率，Rust 侧未接入）。
 /// - 没有 `by_model_realm` / `by_model_acct`（三维分组）与
-///   `cost_cny` / `cost_missing`（定价表未接入）。
+///   `cost_cny` / `cost_missing`（**定价表未接入**：本函数不接定价表，
+///   要成本请用 [`build_usage_snapshot_priced`]）。
 pub fn build_usage_snapshot(rows: &[Value]) -> Value {
+    build_usage_snapshot_priced(rows, None)
+}
+
+/// 用量快照（**带成本估算**）。
+///
+/// `pricing` 为 `None` ⇒ 与 [`build_usage_snapshot`] **逐字节一致**（不写任何
+/// 成本键）；有定价表 ⇒ 补上 Python 的 `cost_cny` / `cost_missing`（总量）
+/// 与每个模型桶的 `cost_cny`。
+///
+/// ⚠️ 口径（与 Python `_fold_usage_snapshot` / `_fold_cost` 对齐）：
+/// - **只折成功行与失败行，不折中止行**（`outcome == "client_aborted"` 的
+///   usage 块不完整）。
+/// - 折不进价的行记进 `cost_missing`（模型 id → 次数），**不静默少报**。
+/// - **定价表缺失 ⇒ `cost_cny` / `cost_missing` 整组省略**（不是 0、不是
+///   空表）——「没有价表」与「价表说这条不要钱」是两回事。
+pub fn build_usage_snapshot_priced(rows: &[Value], pricing: Option<&Pricing>) -> Value {
     let mut totals = Bucket::default();
     let mut by_model = Buckets::new();
+    let mut cost = CostFold::default();
 
     for row in rows {
-        if row_outcome(row) != "completed" {
+        let outcome = row_outcome(row);
+        // 中止行的 usage 块不完整 ⇒ 不计价（Python 同款）。
+        let row_cost = match pricing {
+            Some(pricing) if outcome != "client_aborted" => Some(price::compute_row(row, pricing)),
+            _ => None,
+        };
+        if outcome != "completed" {
             totals.fold_failed();
-            continue;
+        } else {
+            totals.fold_completed(row);
+            let model = model_of(row);
+            let bucket = by_model.entry(model);
+            bucket.fold_completed(row);
+            if let Some(row_cost) = &row_cost {
+                if row_cost.known {
+                    bucket.cny += row_cost.cny;
+                }
+            }
         }
-        totals.fold_completed(row);
-        let model = model_of(row);
-        by_model.entry(model).fold_completed(row);
+        if let Some(row_cost) = &row_cost {
+            if row_cost.known {
+                cost.cny += row_cost.cny;
+            } else {
+                cost.bump_missing(model_of(row));
+            }
+        }
     }
 
     let mut out = Map::new();
@@ -450,14 +508,24 @@ pub fn build_usage_snapshot(rows: &[Value]) -> Value {
     for (index, name) in TOKEN_FIELDS.iter().enumerate() {
         out.insert((*name).into(), Value::from(totals.tokens[index]));
     }
+    // 成本键（Python `_empty_stats` 的 `cost_cny` / `cost_missing`，位置也在
+    // token 字段之后、`by_model` 之前）。**没有定价表 ⇒ 整组省略**。
+    if pricing.is_some() {
+        out.insert("cost_cny".into(), Value::from(cost.cny));
+        out.insert("cost_missing".into(), Value::Object(cost.missing.clone()));
+    }
     let mut models = Map::new();
     for (name, bucket) in &by_model.items {
         // 键序对齐 Python 的桶字面量（`_fold_usage_snapshot`）：
-        // `{"requests", "accounts", ...USAGE_FIELDS}` —— `accounts` 在 token
-        // 字段**之前**。键序是响应字节的一部分，不能随手排。
+        // `{"requests", "accounts", "cost_cny", ...USAGE_FIELDS}` —— `accounts`
+        // 在 token 字段**之前**，`cost_cny` 夹在中间。键序是响应字节的一部分，
+        // 不能随手排。
         let mut value = Map::new();
         value.insert("requests".into(), Value::from(bucket.requests));
         value.insert("accounts".into(), Value::Object(bucket.accounts.clone()));
+        if pricing.is_some() {
+            value.insert("cost_cny".into(), Value::from(bucket.cny));
+        }
         for (index, field) in TOKEN_FIELDS.iter().enumerate() {
             value.insert((*field).into(), Value::from(bucket.tokens[index]));
         }
@@ -466,6 +534,27 @@ pub fn build_usage_snapshot(rows: &[Value]) -> Value {
     out.insert("by_model".into(), Value::Object(models));
     out.insert("realm".into(), Value::from("all"));
     Value::Object(out)
+}
+
+/// 一次扫描的成本累加器（Python 的 `bucket["cost_cny"]` + `bucket["cost_missing"]`）。
+#[derive(Default)]
+struct CostFold {
+    /// 已定价行的金额合计（人民币）。
+    cny: f64,
+    /// 未定价的模型 → 出现次数（Python `cost_missing`）。
+    missing: Map<String, Value>,
+}
+
+impl CostFold {
+    /// 记一次「这个模型没有价」（Python `_fold_cost` 的 else 分支）。
+    fn bump_missing(&mut self, model: String) {
+        let count = self
+            .missing
+            .get(&model)
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        self.missing.insert(model, Value::from(count + 1));
+    }
 }
 
 /// 按账号聚合（Python `usage_by_account` / `_usage_by_account_uncached`）。
@@ -549,17 +638,40 @@ fn models_list(models: &Map<String, Value>) -> Value {
 /// - 没有 `keys`（Rust 侧拿不到 Python 的 settings key id）与 `usd_cny`。
 /// - `by_date` 是 Rust 侧新增的（Python 的日桶只在窗口聚合内部用，不外露）。
 pub fn build_usage_analytics(rows: &[Value]) -> Value {
+    build_usage_analytics_priced(rows, None)
+}
+
+/// 用量分析（**带成本估算**）。
+///
+/// `pricing` 为 `None` ⇒ 与 [`build_usage_analytics`] 完全一致。
+/// 有定价表 ⇒ `summary` 与 `models` 各桶补上 `cost_cny`（Python 的
+/// `_new_analytics_stat` / `_bump_analytics_models` 同款）。
+pub fn build_usage_analytics_priced(rows: &[Value], pricing: Option<&Pricing>) -> Value {
     let mut totals = Bucket::default();
     let mut dates = Buckets::new();
+    let mut cost = CostFold::default();
 
     for row in rows {
         let date = row_date(row);
-        if row_outcome(row) == "completed" {
+        let outcome = row_outcome(row);
+        // 中止行不计价（与快照同口径）。
+        let row_cost = match pricing {
+            Some(pricing) if outcome != "client_aborted" => Some(price::compute_row(row, pricing)),
+            _ => None,
+        };
+        if outcome == "completed" {
             totals.fold_completed(row);
             dates.entry(date).fold_completed(row);
         } else {
             totals.fold_failed();
             dates.entry(date).fold_failed();
+        }
+        if let Some(row_cost) = &row_cost {
+            if row_cost.known {
+                cost.cny += row_cost.cny;
+            } else {
+                cost.bump_missing(model_of(row));
+            }
         }
     }
 
@@ -581,9 +693,12 @@ pub fn build_usage_analytics(rows: &[Value]) -> Value {
     };
     summary.insert("total_requests".into(), Value::from(totals.total_rows));
     summary.insert("errors".into(), Value::from(totals.errors));
+    if pricing.is_some() {
+        summary.insert("cost_cny".into(), Value::from(cost.cny));
+    }
 
     let by_account = build_usage_by_account(rows);
-    let snapshot = build_usage_snapshot(rows);
+    let snapshot = build_usage_snapshot_priced(rows, pricing);
 
     let mut out = Map::new();
     out.insert("realm".into(), Value::from("all"));
@@ -647,14 +762,29 @@ pub struct SnapshotDecor {
 /// 与 [`build_usage_snapshot`] 的差别只在装饰键：基底的键与键序不变。
 ///
 /// ⚠️ 与 Python 的差异：
-/// - 没有 `usd_cny`（定价表未接入）。
+/// - 没有 `usd_cny`（定价表未接入：要用它请调
+///   [`build_usage_snapshot_with_priced`]）。
 /// - `accounts_map` 的 `nickname` 恒为 `""`：Rust 的账号池结构体
 ///   （`AccountState`）不携带昵称，而 Python 的 `Account.nickname` 缺省也是
 ///   空串（`wb_accounts.py:495`）。
 /// - `account` 里没有 `domain` / `issuer`：Rust 侧拿不到这两个值 ⇒ 省略
 ///   这两个子键，而不是写假的空串。
 pub fn build_usage_snapshot_with(rows: &[Value], decor: &SnapshotDecor) -> Value {
-    let mut out = match build_usage_snapshot(rows) {
+    build_usage_snapshot_with_priced(rows, decor, None)
+}
+
+/// 用量快照 + 装饰键（**带成本估算**）。
+///
+/// `pricing` 为 `None` ⇒ 与 [`build_usage_snapshot_with`] 完全一致。
+/// 有定价表 ⇒ 基底补 `cost_cny` / `cost_missing`，装饰组按 Python 的顺序
+/// 在 `realm` 之后补 `usd_cny`（Python `_usage_snapshot_uncached` 的
+/// `snap["usd_cny"] = wb_pricing.usd_cny()`）。
+pub fn build_usage_snapshot_with_priced(
+    rows: &[Value],
+    decor: &SnapshotDecor,
+    pricing: Option<&Pricing>,
+) -> Value {
+    let mut out = match build_usage_snapshot_priced(rows, pricing) {
         Value::Object(map) => map,
         _ => Map::new(),
     };
@@ -674,6 +804,9 @@ pub fn build_usage_snapshot_with(rows: &[Value], decor: &SnapshotDecor) -> Value
             decor.realm.clone()
         }),
     );
+    if let Some(pricing) = pricing {
+        out.insert("usd_cny".into(), Value::from(pricing.usd_cny()));
+    }
     if let Some(accounts_map) = &decor.accounts_map {
         out.insert("accounts_map".into(), accounts_map.clone());
     }
@@ -801,9 +934,47 @@ pub fn pick_bucket_seconds(span_secs: f64, requested: Option<i64>) -> i64 {
 /// ⚠️ 与 Python 的差异：定价字段（`cost_cny` / `cost_band` / `cost_source` /
 /// `cost_rates` / `cost_unit` / `cost_currency` / `cost_usd_cny` / `cost_or_id`
 /// / `cost_via` / `cost_inherited_from` / `cost_override_from` /
-/// `cost_band_note` / `cost_via_derived`）依赖定价表，Rust 侧本关不接定价 ⇒
-/// **整组省略**（不写假的 0 / null）；`usd_cny` 同理省略。
+/// `cost_band_note` / `cost_via_derived`）依赖定价表 ⇒ 要用它们请调
+/// [`build_usage_recent_priced`]；`usd_cny` 同理。
 pub fn build_usage_recent(rows: &[Value], realm: &str, page: i64, limit: i64) -> Value {
+    build_usage_recent_priced(rows, realm, page, limit, None)
+}
+
+/// 分页的最近用量行（**带成本估算**）。
+///
+/// `pricing` 为 `None` ⇒ 与 [`build_usage_recent`] 完全一致（行里没有任何
+/// `cost_*` 键）。
+///
+/// 有定价表时，每一行按 Python `recent_usage`（`wb_proxy.py:5607-5637`）补上
+/// 这一组键（键序与 Python 一致）：
+///
+/// | 键 | 来源 | Rust 侧能否算出 |
+/// |---|---|---|
+/// | `cost_cny` | `compute_row` | ✅ |
+/// | `cost_band` | 命中的条件档序号 | ✅（无档位 ⇒ 省略） |
+/// | `cost_source` | 条目自身的 `source` | ⚠️ Python 是策略 id / "builtin"，Rust 无策略层 |
+/// | `cost_source_at` | 策略首次取到时刻 | ❌ 省略（策略层） |
+/// | `cost_backfilled` | 补算标记 | ✅ 恒 `false`（Rust 无补算） |
+/// | `cost_rates` | 命中的那档单价表 | ✅ |
+/// | `cost_unit` | 条目的计价单位 | ✅ |
+/// | `cost_currency` | 条目的货币 | ✅ |
+/// | `cost_usd_cny` | 快照里的汇率 | ✅ |
+/// | `cost_or_id` | OpenRouter 模型 id | ✅ |
+/// | `cost_via` | 匹配方式（direct/variant/override） | ✅ |
+/// | `cost_inherited_from` | 变体继承的基准名 | ✅ |
+/// | `cost_override_from` | 人工映射的来源名 | ✅ |
+/// | `cost_band_note` | 条件档的中文说明 | ✅ |
+/// | `cost_via_derived` | `via` 是否推断得来 | ✅ 恒 `false` |
+///
+/// **未定价的行整组省略**（Python 写 `None`）：本仓库的口径是「省略胜过
+/// 编 0」，面板按 `cost_cny == null` 显示「该模型暂无定价数据」。
+pub fn build_usage_recent_priced(
+    rows: &[Value],
+    realm: &str,
+    page: i64,
+    limit: i64,
+    pricing: Option<&Pricing>,
+) -> Value {
     let limit = limit.max(1) as usize;
     let matched: Vec<&Value> = rows
         .iter()
@@ -819,7 +990,10 @@ pub fn build_usage_recent(rows: &[Value], realm: &str, page: i64, limit: i64) ->
         .rev()
         .skip(start)
         .take(limit)
-        .map(|row| (*row).clone())
+        .map(|row| match pricing {
+            Some(pricing) => decorate_cost_row(row, pricing),
+            None => (*row).clone(),
+        })
         .collect();
 
     let mut out = Map::new();
@@ -827,7 +1001,53 @@ pub fn build_usage_recent(rows: &[Value], realm: &str, page: i64, limit: i64) ->
     out.insert("page".into(), Value::from(page as i64));
     out.insert("limit".into(), Value::from(limit as i64));
     out.insert("total_pages".into(), Value::from(total_pages as i64));
+    if let Some(pricing) = pricing {
+        out.insert("usd_cny".into(), Value::from(pricing.usd_cny()));
+    }
     out.insert("rows".into(), Value::Array(page_rows));
+    Value::Object(out)
+}
+
+/// 给一行补上成本明细键（Python `recent_usage` 里的那一组）。
+///
+/// **未定价 ⇒ 原样返回**（不写半截明细、不写假的 0）。
+fn decorate_cost_row(row: &Value, pricing: &Pricing) -> Value {
+    let Some(detail) = price::compute_row_detail(row, pricing) else {
+        return row.clone();
+    };
+    let mut out = match row {
+        Value::Object(map) => map.clone(),
+        other => return other.clone(),
+    };
+    // 键序与 Python `recent_usage`（`wb_proxy.py:5618-5637`）一致。
+    out.insert("cost_cny".into(), Value::from(price::round6(detail.cny)));
+    if let Some(band) = detail.band {
+        out.insert("cost_band".into(), Value::from(band));
+    }
+    out.insert("cost_source".into(), Value::from(detail.source.clone()));
+    // Rust 侧没有「补算」这回事（没有策略表层）⇒ 恒 false。
+    out.insert("cost_backfilled".into(), Value::Bool(false));
+    if let Some(rates) = detail.rates {
+        out.insert("cost_rates".into(), rates.to_json());
+    }
+    out.insert("cost_unit".into(), Value::from(detail.unit));
+    out.insert("cost_currency".into(), Value::from(detail.currency.clone()));
+    out.insert("cost_usd_cny".into(), Value::from(detail.usd_cny));
+    out.insert("cost_or_id".into(), Value::from(detail.or_id.clone()));
+    out.insert(
+        "cost_via".into(),
+        Value::from(detail.via.clone().unwrap_or_else(|| "direct".to_string())),
+    );
+    if let Some(base) = &detail.inherited_from {
+        out.insert("cost_inherited_from".into(), Value::from(base.clone()));
+    }
+    if let Some(from) = &detail.override_from {
+        out.insert("cost_override_from".into(), Value::from(from.clone()));
+    }
+    if let Some(note) = &detail.band_note {
+        out.insert("cost_band_note".into(), Value::from(note.clone()));
+    }
+    out.insert("cost_via_derived".into(), Value::Bool(detail.via_derived));
     Value::Object(out)
 }
 

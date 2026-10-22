@@ -318,13 +318,16 @@ impl TaskRuntime {
         // `pricing_refresh_minutes`（默认 5 分钟，0 = 关闭）。**线程不在这里
         // 启动**——启动点与积分刷新器一样在 `wb-api` 侧（`WB_BACKGROUND_TASKS`）。
         //
-        // ⚠️ 已知缺口：取价清单为空（Rust 侧无模型目录）⇒ 抓回来的模型列表
-        // 匹配不到任何 hub 模型 ⇒ 不写盘。见 `crate::price_source` 的模块文档。
+        // 取价清单 = 静态目录（`crate::catalog`，54 个 id）∪ live 目录新增
+        // （关卡 4.21 补齐）：live 那一半用账号池里的凭据拉远端产品目录。
         let pricing_interval = settings.pricing_refresh_minutes.max(0) as f64 * 60.0;
         let price_refresher = crate::price_source::production_price_refresher(
             &task.accounts_dir,
             &task.usage_dir,
             pricing_interval,
+            Some(Arc::new(crate::live_source::PoolLiveCatalogSource::new(
+                &task,
+            ))),
         );
         let _ = task.price_refresher.set(price_refresher);
 
