@@ -45,10 +45,10 @@ impl PanelSink for NullPanel {
 /// 建账号目录：一个账号文件（`{}`）+ 可选的 `settings.json`。
 fn account_dir(daily_chat_web: Option<bool>) -> TempDir {
     let dir = TempDir::new().expect("tempdir");
-    std::fs::write(dir.path().join(ACCOUNT_NAME), "{}").expect("seed account file");
+    std::fs::write(accounts_dir(dir.path()).join(ACCOUNT_NAME), "{}").expect("seed account file");
     if let Some(flag) = daily_chat_web {
         std::fs::write(
-            dir.path().join("settings.json"),
+            accounts_dir(dir.path()).join("settings.json"),
             json!({"daily_chat_web": flag}).to_string(),
         )
         .expect("write settings");
@@ -59,8 +59,8 @@ fn account_dir(daily_chat_web: Option<bool>) -> TempDir {
 /// 建账号目录，`settings.json` 写**原始文本**（用来喂损坏的 JSON）。
 fn account_dir_with_raw_settings(raw: &str) -> TempDir {
     let dir = TempDir::new().expect("tempdir");
-    std::fs::write(dir.path().join(ACCOUNT_NAME), "{}").expect("seed account file");
-    std::fs::write(dir.path().join("settings.json"), raw).expect("write settings");
+    std::fs::write(accounts_dir(dir.path()).join(ACCOUNT_NAME), "{}").expect("seed account file");
+    std::fs::write(accounts_dir(dir.path()).join("settings.json"), raw).expect("write settings");
     dir
 }
 
@@ -217,7 +217,7 @@ async fn desktop_and_web_success_writes_last_daily_chat() {
     mount_web_ok(&server, &base).await;
 
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(true));
@@ -231,7 +231,7 @@ async fn desktop_and_web_success_writes_last_daily_chat() {
     assert_eq!(web.get("conversation").and_then(Value::as_str), Some(CONV));
 
     assert!(
-        read_last_daily_chat(dir.path()).is_some(),
+        read_last_daily_chat(&accounts_dir(dir.path())).is_some(),
         "网页腿成功必须写 lastDailyChat"
     );
 }
@@ -247,14 +247,14 @@ async fn desktop_success_web_failure_does_not_write_last_daily_chat() {
     mount_web_broken(&server).await;
 
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(true));
     let msg = res.get("msg").and_then(Value::as_str).unwrap_or_default();
     assert!(msg.contains("网页通道失败"), "msg={msg}");
     assert!(
-        read_last_daily_chat(dir.path()).is_none(),
+        read_last_daily_chat(&accounts_dir(dir.path())).is_none(),
         "网页腿失败时不得写 lastDailyChat，否则当天积分静默丢掉"
     );
 }
@@ -276,14 +276,14 @@ async fn desktop_channel_blocked_falls_back_to_web_leg() {
     mount_web_ok(&server, &base).await;
 
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(true));
     let msg = res.get("msg").and_then(Value::as_str).unwrap_or_default();
     assert!(msg.contains("桌面腿被渠道校验拦截"), "msg={msg}");
     assert!(msg.contains("网页通道 completed"), "msg={msg}");
-    assert!(read_last_daily_chat(dir.path()).is_some());
+    assert!(read_last_daily_chat(&accounts_dir(dir.path())).is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -297,14 +297,14 @@ async fn desktop_channel_blocked_and_web_failed_is_failure() {
     mount_web_broken(&server).await;
 
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(false));
     let err = res.get("error").and_then(Value::as_str).unwrap_or_default();
     assert!(err.contains("桌面腿被渠道校验拦截"), "err={err}");
     assert!(err.contains("网页通道也失败"), "err={err}");
-    assert!(read_last_daily_chat(dir.path()).is_none());
+    assert!(read_last_daily_chat(&accounts_dir(dir.path())).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -323,13 +323,13 @@ async fn desktop_400_without_11128_fails_without_web_leg() {
         .await;
 
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(false));
     let err = res.get("error").and_then(Value::as_str).unwrap_or_default();
     assert!(err.starts_with("HTTP 400: "), "err={err}");
-    assert!(read_last_daily_chat(dir.path()).is_none());
+    assert!(read_last_daily_chat(&accounts_dir(dir.path())).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +340,7 @@ async fn desktop_400_without_11128_fails_without_web_leg() {
 async fn cn_realm_is_rejected_without_requests() {
     let server = MockServer::start().await;
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-cn", "cn", dir.path());
+    let exec = build_exec(&server, "u-cn", "cn", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-cn", "cn")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(false));
@@ -374,7 +374,7 @@ async fn web_leg_disabled_keeps_desktop_only_semantics() {
         .await;
 
     let dir = account_dir(Some(false));
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(true));
@@ -384,7 +384,7 @@ async fn web_leg_disabled_keeps_desktop_only_semantics() {
     );
     assert!(res.get("web").is_none(), "关了网页腿就不该有 web 段");
     assert!(
-        read_last_daily_chat(dir.path()).is_some(),
+        read_last_daily_chat(&accounts_dir(dir.path())).is_some(),
         "没开网页腿时桌面腿成功即算完成（旧语义）"
     );
 }
@@ -399,7 +399,7 @@ async fn desktop_request_body_matches_python() {
     mount_desktop(&server, 200, "{}").await;
 
     let dir = account_dir(Some(false));
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let _ = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     let reqs = server.received_requests().await.expect("requests");
@@ -437,7 +437,7 @@ async fn desktop_request_body_matches_python() {
 async fn account_not_found_sends_no_request() {
     let server = MockServer::start().await;
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("no-such-uid", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(false));
@@ -470,7 +470,7 @@ async fn accounts_view_refreshes_last_daily_chat_after_write() {
     mount_web_ok(&server, &base).await;
 
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(true));
 
@@ -504,7 +504,7 @@ async fn numeric_conversation_id_is_accepted() {
     mount_web_ok_with(&server, &base, "987654", json!(987654)).await;
 
     let dir = account_dir(None);
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(true));
@@ -519,7 +519,7 @@ async fn numeric_conversation_id_is_accepted() {
         web.get("conversation").and_then(Value::as_i64),
         Some(987654)
     );
-    assert!(read_last_daily_chat(dir.path()).is_some());
+    assert!(read_last_daily_chat(&accounts_dir(dir.path())).is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +537,7 @@ async fn corrupt_settings_json_falls_back_to_web_leg() {
     mount_web_ok(&server, &base).await;
 
     let dir = account_dir_with_raw_settings("{ this is not json");
-    let exec = build_exec(&server, "u-chat", "intl", dir.path());
+    let exec = build_exec(&server, "u-chat", "intl", &accounts_dir(dir.path()));
     let res = exec.daily_chat(&acc_view("u-chat", "intl")).await;
 
     assert_eq!(res.get("ok").and_then(Value::as_bool), Some(true));
@@ -545,4 +545,15 @@ async fn corrupt_settings_json_falls_back_to_web_leg() {
         res.get("web").is_some(),
         "settings.json 损坏时按默认「开网页腿」处理"
     );
+}
+
+/// 账号目录：tempdir 内的 `accounts/` 子目录（并建出来）。
+///
+/// 活动历史与用量目录都是从**账号目录的同级**目录推导的（`usage/` 与
+/// `accounts/` 同级，对齐 Python `wb_proxy.py:402-403`）。直接用 tempdir 根
+/// 目录 ⇒ 同级目录变成 `/tmp` ⇒ 测试会往 tempdir 外面写（`/tmp/usage`）。
+fn accounts_dir(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("accounts");
+    let _ = std::fs::create_dir_all(&path);
+    path
 }

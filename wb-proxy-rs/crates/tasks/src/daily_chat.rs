@@ -46,6 +46,7 @@ use wb_gateway::endpoints::chat_base_url;
 use wb_gateway::outbound::{describe_error, UpstreamClient};
 use wb_storage::{write_idempotent_fields, IdempotentFields};
 
+use crate::activity;
 use crate::growth_runner::Clock;
 
 // ---------------------------------------------------------------------------
@@ -363,7 +364,50 @@ async fn run_desktop_leg(
 /// 成功 `{"ok": true, "status": "completed", "chunks": n, "elapsed_ms": n,
 /// "conversation": id, "msg": "网页通道会话跑完：…"}`；失败 `{"ok": false,
 /// "error": …}`（尽量带 `conversation`）。
+///
+/// **不记活动历史**：Python 的 `daily_chat_web(prompt, trigger)` 里 trigger
+/// 只由**直接调用**它的那一层给（面板路由给 `manual`）；`daily_chat` 内部
+/// 调它时传 `trigger=None`（那一步属于同一次尝试，由外层记一行）。Rust 侧
+/// 的对应入口是 [`daily_chat_web_recorded`]（带用量目录 ⇒ 能写历史）。
 pub async fn daily_chat_web(
+    client: &UpstreamClient,
+    cfg: &DailyChatConfig,
+    acc: &DailyChatAccount<'_>,
+    prompt: Option<&str>,
+) -> Value {
+    daily_chat_web_impl(client, cfg, acc, prompt, None).await
+}
+
+/// 网页腿 + **记一行活动历史**（Python `wb_accounts.daily_chat_web` 的
+/// `record_attempt` 调用点，:1478）。
+///
+/// `usage_dir` 是活动历史文件所在目录（`usage/`）——历史写在用量目录里，
+/// 与 Python 的 `wb_activity.history_path()` 同一个文件。
+pub async fn daily_chat_web_recorded(
+    client: &UpstreamClient,
+    cfg: &DailyChatConfig,
+    acc: &DailyChatAccount<'_>,
+    prompt: Option<&str>,
+    usage_dir: &Path,
+) -> Value {
+    daily_chat_web_impl(client, cfg, acc, prompt, Some(usage_dir)).await
+}
+
+/// 网页腿的实现；`history` 非空 ⇒ 跑完记一行活动历史。
+async fn daily_chat_web_impl(
+    client: &UpstreamClient,
+    cfg: &DailyChatConfig,
+    acc: &DailyChatAccount<'_>,
+    prompt: Option<&str>,
+    history: Option<&Path>,
+) -> Value {
+    let result = daily_chat_web_raw(client, cfg, acc, prompt).await;
+    record_daily_chat(history, acc, "", &result);
+    result
+}
+
+/// 网页腿本体（不记活动历史）。
+async fn daily_chat_web_raw(
     client: &UpstreamClient,
     cfg: &DailyChatConfig,
     acc: &DailyChatAccount<'_>,
@@ -591,6 +635,52 @@ fn persist_last_daily_chat(ctx: &DailyChatCtx<'_>) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// 活动历史（关卡 4.20 线 B）
+// ---------------------------------------------------------------------------
+
+/// 记一次每日活跃尝试（Python `wb_activity.record_attempt`）。
+///
+/// `history` 为 `None` ⇒ 不记（Python 的 `trigger=None`：那一步属于同一次
+/// 尝试，由外层记一行）。
+///
+/// **写不进去只打日志**：活动历史是运维元数据，写不进去不该把一次成功的
+/// 对话变成失败（Python `record()` 绝不抛异常，同款）。
+fn record_daily_chat(
+    history: Option<&Path>,
+    acc: &DailyChatAccount<'_>,
+    nickname: &str,
+    result: &Value,
+) {
+    let Some(usage_dir) = history else {
+        return;
+    };
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let message = result
+        .get("msg")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .or_else(|| result.get("error").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if ok {
+                "成功".to_string()
+            } else {
+                "失败".to_string()
+            }
+        });
+    activity::record_attempt(
+        usage_dir,
+        acc.uid,
+        nickname,
+        acc.realm,
+        activity::TASK_DAILY_CHAT,
+        activity::TRIGGER_UNKNOWN,
+        ok,
+        &message,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 编排
 // ---------------------------------------------------------------------------
 
@@ -604,6 +694,10 @@ fn persist_last_daily_chat(ctx: &DailyChatCtx<'_>) -> Option<String> {
 /// - 桌面腿 4xx/5xx 且 body 含 `"code": 11128` → **降级**：网页腿单独跑
 /// - 桌面腿其他失败 → 直接失败
 /// - `lastDailyChat` **只在网页腿成功（或没开网页腿）时写**
+///
+/// **活动历史**：整次尝试记一行（Python `wb_accounts.py:1570`）；网页腿那一步
+/// 不单独记（Python 内部调用传 `trigger=None`）。非国际版账号**不记**
+/// （Python 的早退在 `record_attempt` 之前）。
 pub async fn daily_chat(
     client: &UpstreamClient,
     acc: &DailyChatAccount<'_>,
@@ -622,7 +716,7 @@ pub async fn daily_chat(
     };
     let chat_base = cfg.resolved_chat_base(acc.realm, acc.product);
 
-    match run_desktop_leg(client, acc, &chat_base).await {
+    let outcome = match run_desktop_leg(client, acc, &chat_base).await {
         DesktopLeg::Ok => {
             let mut body = Map::new();
             body.insert("ok".to_string(), json!(true));
@@ -662,47 +756,54 @@ pub async fn daily_chat(
         DesktopLeg::ChannelBlocked(note) => {
             // 没开网页腿就真的没有别的路可走了，照旧算失败。
             if !web_enabled {
-                return DailyChatOutcome::failed(note);
-            }
-            let res = daily_chat_web(client, cfg, acc, None).await;
-            let web_ok = res.get("ok").and_then(Value::as_bool).unwrap_or(false);
-            let mut body = Map::new();
-            body.insert("ok".to_string(), json!(web_ok));
-            body.insert("msg".to_string(), json!(""));
-            body.insert("web".to_string(), res.clone());
-            if web_ok {
-                let msg = format!(
-                    "桌面腿被渠道校验拦截（{}），网页通道 {}：{} 段输出，{} ms",
-                    note,
-                    res.get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("completed"),
-                    res.get("chunks").and_then(Value::as_i64).unwrap_or(0),
-                    res.get("elapsed_ms").and_then(Value::as_i64).unwrap_or(0),
-                );
-                body.insert("msg".to_string(), json!(msg));
-                let persist_error = persist_last_daily_chat(ctx);
-                DailyChatOutcome {
-                    body: Value::Object(body),
-                    persist_error,
-                }
+                DailyChatOutcome::failed(note)
             } else {
-                // 两条腿都没成：今天不算做过，后续巡检继续重试。
-                let msg = format!(
-                    "桌面腿被渠道校验拦截（{}），网页通道也失败：{}",
-                    note,
-                    res.get("error").and_then(Value::as_str).unwrap_or("")
-                );
-                body.insert("msg".to_string(), json!(msg.clone()));
-                body.insert("error".to_string(), json!(msg));
-                DailyChatOutcome {
-                    body: Value::Object(body),
-                    persist_error: None,
+                let res = daily_chat_web(client, cfg, acc, None).await;
+                let web_ok = res.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                let mut body = Map::new();
+                body.insert("ok".to_string(), json!(web_ok));
+                body.insert("msg".to_string(), json!(""));
+                body.insert("web".to_string(), res.clone());
+                if web_ok {
+                    let msg = format!(
+                        "桌面腿被渠道校验拦截（{}），网页通道 {}：{} 段输出，{} ms",
+                        note,
+                        res.get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("completed"),
+                        res.get("chunks").and_then(Value::as_i64).unwrap_or(0),
+                        res.get("elapsed_ms").and_then(Value::as_i64).unwrap_or(0),
+                    );
+                    body.insert("msg".to_string(), json!(msg));
+                    let persist_error = persist_last_daily_chat(ctx);
+                    DailyChatOutcome {
+                        body: Value::Object(body),
+                        persist_error,
+                    }
+                } else {
+                    // 两条腿都没成：今天不算做过，后续巡检继续重试。
+                    let msg = format!(
+                        "桌面腿被渠道校验拦截（{}），网页通道也失败：{}",
+                        note,
+                        res.get("error").and_then(Value::as_str).unwrap_or("")
+                    );
+                    body.insert("msg".to_string(), json!(msg.clone()));
+                    body.insert("error".to_string(), json!(msg));
+                    DailyChatOutcome {
+                        body: Value::Object(body),
+                        persist_error: None,
+                    }
                 }
             }
         }
         DesktopLeg::Failed(err) => DailyChatOutcome::failed(err),
-    }
+    };
+
+    // 整次尝试记一行（Python `wb_accounts.py:1570` 的 record_attempt）。
+    let usage_dir = crate::api_routes::usage_dir_from(ctx.dir);
+    let nickname = activity::account_nickname(ctx.dir, ctx.account_name);
+    record_daily_chat(Some(&usage_dir), acc, &nickname, &outcome.body);
+    outcome
 }
 
 #[cfg(test)]

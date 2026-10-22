@@ -22,7 +22,7 @@ use wb_storage::read_idempotent_fields;
 use crate::checkin::production_billing_base;
 use crate::claim_all::{self, route_claim_all, uid8, ClaimAllDeps, ClaimAllRequest};
 use crate::daily_chat::{
-    daily_chat as run_daily_chat, daily_chat_web as run_daily_chat_web, DailyChatAccount,
+    daily_chat as run_daily_chat, daily_chat_web_recorded as run_daily_chat_web, DailyChatAccount,
     DailyChatConfig, DailyChatCtx,
 };
 use crate::growth_api::{TaskAccount, TaskEndpoints};
@@ -1060,7 +1060,18 @@ pub async fn route_accounts_daily_chat_web(task: &TaskRuntime, payload: &Value) 
             product: &ra.state.product,
             chat_headers: &ra.creds.chat_headers,
         };
-        let res = run_daily_chat_web(&task.client, &task.daily_chat_config, &account, None).await;
+        // 用 `daily_chat_web_recorded`：网页腿被面板**直接**调用时（这条路由）
+        // 要记一行活动历史（Python `wb_accounts.py:1478`）；而被
+        // `daily_chat()` 内部调用时**不记**（Python 那边 `trigger=None`）——
+        // 两种语义的差别就落在这个入口上。
+        let res = run_daily_chat_web(
+            &task.client,
+            &task.daily_chat_config,
+            &account,
+            None,
+            &task.usage_dir,
+        )
+        .await;
         let nick = manual_nickname(ra);
         let detail = manual_log_detail(&res, "conversation");
         task.panel.add_log_entry(

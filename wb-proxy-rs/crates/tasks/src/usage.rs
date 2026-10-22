@@ -19,9 +19,21 @@
 //!
 //! 本模块是**最小可用版**：逐行累加，**不做增量折叠、不做 TTL 缓存、不做
 //! ETag**（Python 侧那些是纯加速，留到后续关卡）。
+//!
+//! ## 关卡 4.20（线 B）新增
+//!
+//! - [`build_usage_snapshot_with`]：快照 + Python `_usage_snapshot_uncached`
+//!   的装饰键（`started` / `since` / `log_file` / `realm` / `accounts_map` /
+//!   `account`；`usd_cny` 依赖定价表 ⇒ 省略）。
+//! - [`build_usage_recent`]：分页的最近行（Python `recent_usage`）。
+//! - [`build_usage_timeseries`]：分桶序列（Python `usage_timeseries`）。
+//! - [`build_usage_perf`]：延迟分位（Python `perf_stats`；分位从原始样本算）。
+//! - [`resolve_range_window`] / [`pick_bucket_seconds`]：区间与桶粒度
+//!   （Python `range_window` / `_usage_timeseries_scope`）。
 
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use crate::activity;
 
@@ -598,6 +610,585 @@ pub fn build_usage_analytics(rows: &[Value]) -> Value {
     Value::Object(out)
 }
 
+// ---------------------------------------------------------------------------
+// 关卡 4.20（线 B）：聚合三件套 + 快照装饰键
+// ---------------------------------------------------------------------------
+
+/// 进程启动时刻（epoch 秒）。
+///
+/// Python 的 `_usage = {"started": time.time()}` 是模块级的：进程启动时打点，
+/// 之后每次快照都回同一个值。Rust 侧用「首次使用时打点」等价。
+static PROCESS_STARTED: LazyLock<f64> = LazyLock::new(activity::now_epoch);
+
+/// 进程启动时刻（epoch 秒）。
+pub fn process_started() -> f64 {
+    *PROCESS_STARTED
+}
+
+/// `usage_snapshot` 的装饰键（Python `_usage_snapshot_uncached` 追加的那一组）。
+///
+/// 拿不到的键**整键省略**（不写假的 0 值）：
+/// - `usd_cny`：定价表未接入（Rust 侧不做定价）⇒ 省略。
+/// - `accounts_map` / `account`：由调用方按池里的真实账号填；池为空时省略。
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotDecor {
+    /// 生效的 realm（`"all"` = 不过滤）。
+    pub realm: String,
+    /// 用量日志路径（Python `snap["log_file"]`）。
+    pub log_file: String,
+    /// 账号 → `{nickname, realm}`（Python `snap["accounts_map"]`）。
+    pub accounts_map: Option<Value>,
+    /// 代表账号（Python `snap["account"]`）。
+    pub account: Option<Value>,
+}
+
+/// 用量快照 + 装饰键（Python `usage_snapshot` 的完整返回体）。
+///
+/// 与 [`build_usage_snapshot`] 的差别只在装饰键：基底的键与键序不变。
+///
+/// ⚠️ 与 Python 的差异：
+/// - 没有 `usd_cny`（定价表未接入）。
+/// - `accounts_map` 的 `nickname` 恒为 `""`：Rust 的账号池结构体
+///   （`AccountState`）不携带昵称，而 Python 的 `Account.nickname` 缺省也是
+///   空串（`wb_accounts.py:495`）。
+/// - `account` 里没有 `domain` / `issuer`：Rust 侧拿不到这两个值 ⇒ 省略
+///   这两个子键，而不是写假的空串。
+pub fn build_usage_snapshot_with(rows: &[Value], decor: &SnapshotDecor) -> Value {
+    let mut out = match build_usage_snapshot(rows) {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    // Python 的装饰组：`started` / `since` / `log_file` / `realm` / `usd_cny`
+    // / `accounts_map` / `account`。`realm` 在基底里已是最后一个键，这里先摘掉
+    // 再按 Python 的顺序重新追加，保证响应字节的键序一致。
+    out.remove("realm");
+    let started = process_started();
+    out.insert("started".into(), Value::from(started));
+    out.insert("since".into(), Value::from(local_iso(started)));
+    out.insert("log_file".into(), Value::from(decor.log_file.clone()));
+    out.insert(
+        "realm".into(),
+        Value::from(if decor.realm.is_empty() {
+            "all".to_string()
+        } else {
+            decor.realm.clone()
+        }),
+    );
+    if let Some(accounts_map) = &decor.accounts_map {
+        out.insert("accounts_map".into(), accounts_map.clone());
+    }
+    if let Some(account) = &decor.account {
+        out.insert("account".into(), account.clone());
+    }
+    Value::Object(out)
+}
+
+/// 把面板的区间选择解析成 `(since, until)`（epoch 秒）。
+///
+/// 对齐 Python `wb_proxy.range_window`（:576-610）：
+/// - `today` / `day` / `1d` → 本地零点起
+/// - `week` / `w` → 本地**周一**零点起
+/// - `month` / `m` → 本地月初起
+/// - `custom` → 取 `since` / `until` 两个 epoch（可以只有一边；反了会自动换）
+/// - 其它 / 缺省 → `(None, None)` = **不过滤**（旧面板的老行为）
+pub fn resolve_range_window(
+    range_key: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+    now: f64,
+) -> (Option<f64>, Option<f64>) {
+    let key = range_key.trim().to_lowercase();
+    use chrono::Datelike;
+    match key.as_str() {
+        "today" | "day" | "1d" => (Some(activity::local_midnight(now)), None),
+        "week" | "w" => {
+            let weekday = chrono::DateTime::from_timestamp(now as i64, 0)
+                .map(|dt| dt.with_timezone(&chrono::Local))
+                .map(|local| local.weekday().num_days_from_monday())
+                .unwrap_or(0);
+            (
+                Some(activity::local_midnight(now - weekday as f64 * 86400.0)),
+                None,
+            )
+        }
+        "month" | "m" => {
+            let local = chrono::DateTime::from_timestamp(now as i64, 0)
+                .map(|dt| dt.with_timezone(&chrono::Local))
+                .unwrap_or_else(chrono::Local::now);
+            let naive = local
+                .date_naive()
+                .with_day(1)
+                .and_then(|day| day.and_hms_opt(0, 0, 0))
+                .expect("月初是合法时间");
+            let midnight = match naive.and_local_timezone(chrono::Local) {
+                chrono::LocalResult::Single(dt) => dt.timestamp() as f64,
+                chrono::LocalResult::Ambiguous(dt, _) => dt.timestamp() as f64,
+                chrono::LocalResult::None => local.timestamp() as f64,
+            };
+            (Some(midnight), None)
+        }
+        "custom" => {
+            let mut lo = epoch_or_none(since);
+            let mut hi = epoch_or_none(until);
+            if let (Some(low), Some(high)) = (lo, hi) {
+                if high < low {
+                    lo = Some(high);
+                    hi = Some(low);
+                }
+            }
+            (lo, hi)
+        }
+        _ => (None, None),
+    }
+}
+
+/// 面板给的 epoch 秒；负数 / 解析不了 ⇒ `None`（该侧不设限）。
+///
+/// 对齐 Python `_epoch_or_none`（:559-573）。
+fn epoch_or_none(value: Option<&str>) -> Option<f64> {
+    let text = value.map(str::trim).unwrap_or("");
+    if text.is_empty() {
+        return None;
+    }
+    match text.parse::<f64>() {
+        Ok(parsed) if parsed >= 0.0 => Some(parsed),
+        _ => None,
+    }
+}
+
+/// 一行是否落在 `[since, until]` 窗口内（两端都含）。
+///
+/// ⚠️ 边界为 0 时**当作没有边界**（Python 的真值语义：折叠里写的是
+/// `if since and at < since`，`since == 0` 是假值 ⇒ 那一侧不筛）。
+pub fn row_in_window(row: &Value, since: Option<f64>, until: Option<f64>) -> bool {
+    let at = row.get("at").and_then(Value::as_f64).unwrap_or(0.0);
+    if let Some(low) = since {
+        if low > 0.0 && at < low {
+            return false;
+        }
+    }
+    if let Some(high) = until {
+        if high > 0.0 && at > high {
+            return false;
+        }
+    }
+    true
+}
+
+/// 桶粒度自适应（Python `_usage_timeseries_scope`，:4445-4483）。
+///
+/// 窗口 ≤6h ⇒ 60s；≤14d ⇒ 3600s；更长 ⇒ 86400s。显式 `bucket` 覆盖，
+/// 但**下限 60 秒**（Python `max(60, int(bucket_seconds))`）。
+pub fn pick_bucket_seconds(span_secs: f64, requested: Option<i64>) -> i64 {
+    if let Some(value) = requested {
+        if value != 0 {
+            return value.max(60);
+        }
+    }
+    if span_secs <= 6.0 * 3600.0 {
+        60
+    } else if span_secs <= 14.0 * 86400.0 {
+        3600
+    } else {
+        86400
+    }
+}
+
+/// 分页的最近用量行（Python `recent_usage`）。
+///
+/// **行序：最新在前**（Python 从日志尾部往回读）；页 1 是最新的一页。
+///
+/// ⚠️ 与 Python 的差异：定价字段（`cost_cny` / `cost_band` / `cost_source` /
+/// `cost_rates` / `cost_unit` / `cost_currency` / `cost_usd_cny` / `cost_or_id`
+/// / `cost_via` / `cost_inherited_from` / `cost_override_from` /
+/// `cost_band_note` / `cost_via_derived`）依赖定价表，Rust 侧本关不接定价 ⇒
+/// **整组省略**（不写假的 0 / null）；`usd_cny` 同理省略。
+pub fn build_usage_recent(rows: &[Value], realm: &str, page: i64, limit: i64) -> Value {
+    let limit = limit.max(1) as usize;
+    let matched: Vec<&Value> = rows
+        .iter()
+        .filter(|row| realm_matches(row, realm))
+        .collect();
+    let total = matched.len();
+    let total_pages = if total > 0 { total.div_ceil(limit) } else { 1 };
+    let page = page.max(1).min(total_pages as i64) as usize;
+    let start = (page - 1) * limit;
+    // `matched` 是文件序（最旧 → 最新）⇒ 倒着取才是「最新在前」。
+    let page_rows: Vec<Value> = matched
+        .iter()
+        .rev()
+        .skip(start)
+        .take(limit)
+        .map(|row| (*row).clone())
+        .collect();
+
+    let mut out = Map::new();
+    out.insert("total".into(), Value::from(total as i64));
+    out.insert("page".into(), Value::from(page as i64));
+    out.insert("limit".into(), Value::from(limit as i64));
+    out.insert("total_pages".into(), Value::from(total_pages as i64));
+    out.insert("rows".into(), Value::Array(page_rows));
+    Value::Object(out)
+}
+
+/// 一个时间序列桶（Python `_usage_timeseries_scan` 的桶字面量）。
+#[derive(Default)]
+struct SeriesBucket {
+    requests: i64,
+    errors: i64,
+    tokens: [i64; 5],
+    credit: f64,
+}
+
+/// 一条计费行的载荷（Python `_series_credit_entry`，:7679-7689）。
+fn series_credit_entry(at: f64, row: &Value) -> Value {
+    json!({
+        "at": at,
+        "iso": row.get("iso").and_then(Value::as_str).unwrap_or(""),
+        "model": row.get("model").and_then(Value::as_str).unwrap_or(""),
+        "account": row.get("account").and_then(Value::as_str).unwrap_or(""),
+        "credit": row.get("credit").and_then(Value::as_f64).unwrap_or(0.0),
+        "total_tokens": row.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
+/// 时间序列（Python `usage_timeseries` / `_usage_timeseries_scan`）。
+///
+/// 返回 `{ok, realm, bucket_seconds, since, until, series[], credits[]}`。
+/// 桶键序与 Python 的桶字面量一致；`credits` 是窗口内**按 `at` 倒序的前 50 条**
+/// 计费行（`at` 相同时保持日志顺序）。
+///
+/// ⚠️ 与 Python 的差异：没有增量折叠与 TTL 缓存（Python 侧那两样是纯加速）。
+pub fn build_usage_timeseries(
+    rows: &[Value],
+    realm: &str,
+    since: f64,
+    until: f64,
+    bucket_seconds: i64,
+) -> Value {
+    let step = bucket_seconds.max(1) as f64;
+    let mut buckets: Vec<(i64, SeriesBucket)> = Vec::new();
+    let mut credits: Vec<(f64, usize, Value)> = Vec::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        if !realm_matches(row, realm) {
+            continue;
+        }
+        let at = row.get("at").and_then(Value::as_f64).unwrap_or(0.0);
+        if at < since || at > until {
+            continue;
+        }
+        let key = ((at - since) / step).floor() as i64;
+        let position = match buckets.binary_search_by_key(&key, |(k, _)| *k) {
+            Ok(found) => found,
+            Err(found) => {
+                buckets.insert(found, (key, SeriesBucket::default()));
+                found
+            }
+        };
+        let bucket = &mut buckets[position].1;
+        let outcome = row_outcome(row);
+        if outcome == "completed" {
+            bucket.requests += 1;
+            for (slot, field) in TOKEN_FIELDS.iter().enumerate() {
+                bucket.tokens[slot] += row
+                    .get(*field)
+                    .and_then(Value::as_f64)
+                    .map(|value| value as i64)
+                    .unwrap_or(0);
+            }
+        } else {
+            bucket.errors += 1;
+        }
+        let credit = row.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+        // 客户端自己走掉的请求没有消耗计费额度（Python 同款）。
+        if outcome != "client_aborted" {
+            bucket.credit += credit;
+        }
+        if credit > 0.0 {
+            credits.push((at, index, series_credit_entry(at, row)));
+        }
+    }
+
+    // Python：按 `(at, 序号)` 倒序（`at` 相同时序号小的在前 = 日志顺序在前），
+    // 取前 50 条。
+    credits.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.1.cmp(&right.1))
+    });
+    credits.truncate(SERIES_CREDITS_KEEP);
+
+    let mut series = Vec::with_capacity(buckets.len());
+    for (key, bucket) in &buckets {
+        let mut value = Map::new();
+        value.insert("at".into(), Value::from(since + *key as f64 * step));
+        value.insert("requests".into(), Value::from(bucket.requests));
+        value.insert("errors".into(), Value::from(bucket.errors));
+        for (slot, field) in TOKEN_FIELDS.iter().enumerate() {
+            value.insert((*field).into(), Value::from(bucket.tokens[slot]));
+        }
+        value.insert("credit".into(), Value::from(bucket.credit));
+        series.push(Value::Object(value));
+    }
+
+    let mut out = Map::new();
+    out.insert("ok".into(), Value::Bool(true));
+    out.insert(
+        "realm".into(),
+        Value::from(if realm.is_empty() {
+            "all".to_string()
+        } else {
+            realm.to_string()
+        }),
+    );
+    out.insert("bucket_seconds".into(), Value::from(bucket_seconds));
+    out.insert("since".into(), Value::from(since));
+    out.insert("until".into(), Value::from(until));
+    out.insert("series".into(), Value::Array(series));
+    out.insert(
+        "credits".into(),
+        Value::Array(credits.into_iter().map(|(_, _, entry)| entry).collect()),
+    );
+    Value::Object(out)
+}
+
+/// 窗口内保留的计费行条数（Python `_SERIES_CREDITS_KEEP`）。
+const SERIES_CREDITS_KEEP: usize = 50;
+
+/// 一个性能指标的原始样本集合。
+#[derive(Default)]
+struct PerfSamples {
+    ttfts: Vec<f64>,
+    gens: Vec<f64>,
+    walls: Vec<f64>,
+    tok_rates: Vec<f64>,
+    hits: Vec<f64>,
+}
+
+/// 单个模型的性能桶（Python `m_buckets` 的一项）。
+#[derive(Default)]
+struct PerfModelBucket {
+    total: i64,
+    ok: i64,
+    err: i64,
+    aborted: i64,
+    samples: PerfSamples,
+}
+
+/// Python 的 `round()`（平局取偶）——分位下标用它，不能用 `.round()`
+/// （Rust 是「平局远离零」，`round(0.5)` 会差一位）。
+fn py_round(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let floor = value.floor();
+    let diff = value - floor;
+    if diff > 0.5 {
+        floor + 1.0
+    } else if diff < 0.5 || (floor as i64) % 2 == 0 {
+        floor
+    } else {
+        floor + 1.0
+    }
+}
+
+/// Python 的 `round(x, 1)`：按十进制精确舍入（平局取偶）。
+///
+/// Rust 的 `format!("{:.1}")` 走的是同一套「精确二进制值 → 就近舍入、平局
+/// 取偶」，所以两者对同一个 `f64` 给出同一个结果。
+fn py_round1(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    format!("{value:.1}").parse::<f64>().unwrap_or(value)
+}
+
+/// 一个指标的汇总块（Python `_perf_block`，:819-843）。
+///
+/// **没有样本 ⇒ 整块为 `null`**（不是 0 值块）。分位从原始样本算（不许用
+/// 聚合近似），排序一次喂三个分位。
+fn perf_block(samples: &[f64]) -> Value {
+    if samples.is_empty() {
+        return Value::Null;
+    }
+    let mut ordered = samples.to_vec();
+    ordered.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let count = ordered.len();
+    let rank = |quantile: f64| -> f64 {
+        let index = py_round((quantile / 100.0) * (count as f64 - 1.0)) as i64;
+        let index = index.clamp(0, count as i64 - 1) as usize;
+        ordered[index]
+    };
+    json!({
+        "avg": py_round1(samples.iter().sum::<f64>() / count as f64),
+        "p50": rank(50.0),
+        "p90": rank(90.0),
+        "p99": rank(99.0),
+        "max": ordered[count - 1],
+        "samples": count,
+    })
+}
+
+/// 一个模型桶的返回体（Python `by_model` 的一项）。
+fn perf_model_json(bucket: &PerfModelBucket) -> Value {
+    let mut out = Map::new();
+    out.insert("requests".into(), Value::from(bucket.total));
+    out.insert("errors".into(), Value::from(bucket.err));
+    out.insert("client_aborted".into(), Value::from(bucket.aborted));
+    out.insert(
+        "success_rate_pct".into(),
+        success_rate(bucket.ok, bucket.err),
+    );
+    out.insert("ttft_ms".into(), perf_block(&bucket.samples.ttfts));
+    out.insert("generation_ms".into(), perf_block(&bucket.samples.gens));
+    out.insert("wall_ms".into(), perf_block(&bucket.samples.walls));
+    out.insert(
+        "tokens_per_sec".into(),
+        perf_block(&bucket.samples.tok_rates),
+    );
+    out.insert("cache_hit_pct".into(), perf_block(&bucket.samples.hits));
+    Value::Object(out)
+}
+
+/// 成功率（%）：分母为 0 ⇒ `null`（Python 同款）。
+fn success_rate(ok: i64, err: i64) -> Value {
+    if ok + err == 0 {
+        return Value::Null;
+    }
+    Value::from(py_round1(ok as f64 * 100.0 / (ok + err) as f64))
+}
+
+/// 性能统计（Python `perf_stats` / `_perf_stats_uncached`）。
+///
+/// `sample` 是「日志**末尾**多少行」参与统计（Python 读文件尾部），不是时间
+/// 窗；窗口过滤在这之后做。分位一律从原始样本算。
+///
+/// ⚠️ 与 Python 的差异：没有 `by_model_realm` / `by_model_acct` 两层三维分组
+/// （Rust 的行不带账号 → realm 的推断链，跑不了）。
+pub fn build_usage_perf(
+    rows: &[Value],
+    realm: &str,
+    sample: i64,
+    since: Option<f64>,
+    until: Option<f64>,
+) -> Value {
+    let sample = sample.max(1) as usize;
+    let sample_capped = rows.len() >= sample;
+    let tail: &[Value] = if rows.len() > sample {
+        &rows[rows.len() - sample..]
+    } else {
+        rows
+    };
+    // Python `sample_from` = 尾部第一行解析出来的 `at`（**在窗口过滤之前**）。
+    let sample_from = tail
+        .first()
+        .and_then(|row| row.get("at"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let mut total = 0i64;
+    let mut ok = 0i64;
+    let mut err = 0i64;
+    let mut aborted = 0i64;
+    let mut samples = PerfSamples::default();
+    let mut models: Vec<(String, PerfModelBucket)> = Vec::new();
+
+    for row in tail {
+        if !realm_matches(row, realm) {
+            continue;
+        }
+        let at = row.get("at").and_then(Value::as_f64).unwrap_or(0.0);
+        if let Some(low) = since {
+            if low > 0.0 && at < low {
+                continue;
+            }
+        }
+        if let Some(high) = until {
+            if high > 0.0 && at > high {
+                continue;
+            }
+        }
+        total += 1;
+        let outcome = row_outcome(row);
+        let model = model_of(row);
+        let model_index = match models.iter().position(|(name, _)| *name == model) {
+            Some(found) => found,
+            None => {
+                models.push((model.clone(), PerfModelBucket::default()));
+                models.len() - 1
+            }
+        };
+        let bucket = &mut models[model_index].1;
+        bucket.total += 1;
+
+        // 客户端自己走掉的请求既不是成功也不是失败，单独一档。
+        if outcome == "client_aborted" {
+            aborted += 1;
+            bucket.aborted += 1;
+            if let Some(value) = row.get("elapsed_ms").and_then(Value::as_f64) {
+                samples.walls.push(value);
+                bucket.samples.walls.push(value);
+            }
+            continue;
+        }
+        if outcome != "completed" {
+            err += 1;
+            bucket.err += 1;
+            if let Some(value) = row.get("elapsed_ms").and_then(Value::as_f64) {
+                samples.walls.push(value);
+                bucket.samples.walls.push(value);
+            }
+            continue;
+        }
+        ok += 1;
+        bucket.ok += 1;
+        if let Some(value) = row.get("ttft_ms").and_then(Value::as_f64) {
+            samples.ttfts.push(value);
+            bucket.samples.ttfts.push(value);
+        }
+        if let Some(value) = row.get("gen_ms").and_then(Value::as_f64) {
+            samples.gens.push(value);
+            bucket.samples.gens.push(value);
+        }
+        if let Some(value) = row.get("elapsed_ms").and_then(Value::as_f64) {
+            samples.walls.push(value);
+            bucket.samples.walls.push(value);
+        }
+        if let Some(value) = row.get("tokens_per_sec").and_then(Value::as_f64) {
+            samples.tok_rates.push(value);
+            bucket.samples.tok_rates.push(value);
+        }
+        if let Some(value) = row.get("cache_hit_pct").and_then(Value::as_f64) {
+            samples.hits.push(value);
+            bucket.samples.hits.push(value);
+        }
+    }
+
+    let mut by_model = Map::new();
+    for (name, bucket) in &models {
+        by_model.insert(name.clone(), perf_model_json(bucket));
+    }
+
+    let mut out = Map::new();
+    out.insert("sampled".into(), Value::from(total));
+    out.insert("sample_from".into(), sample_from);
+    out.insert("sample_capped".into(), Value::Bool(sample_capped));
+    out.insert("success".into(), Value::from(ok));
+    out.insert("errors".into(), Value::from(err));
+    out.insert("client_aborted".into(), Value::from(aborted));
+    out.insert("success_rate_pct".into(), success_rate(ok, err));
+    out.insert("ttft_ms".into(), perf_block(&samples.ttfts));
+    out.insert("generation_ms".into(), perf_block(&samples.gens));
+    out.insert("wall_ms".into(), perf_block(&samples.walls));
+    out.insert("tokens_per_sec".into(), perf_block(&samples.tok_rates));
+    out.insert("cache_hit_pct".into(), perf_block(&samples.hits));
+    out.insert("by_model".into(), Value::Object(by_model));
+    Value::Object(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,5 +1334,214 @@ mod tests {
     fn extract_usage_missing_is_empty() {
         assert_eq!(extract_usage(None), json!({}));
         assert_eq!(extract_usage(Some(&json!("x"))), json!({}));
+    }
+
+    // -----------------------------------------------------------------
+    // 关卡 4.20（线 B）：聚合三件套
+    // -----------------------------------------------------------------
+
+    /// 一条带 `at` 的用量行。
+    fn timed_row(at: f64, model: &str, total_tokens: i64) -> Value {
+        json!({
+            "at": at,
+            "iso": "2026-10-21 10:00:00",
+            "model": model,
+            "outcome": "completed",
+            "prompt_tokens": total_tokens / 2,
+            "completion_tokens": total_tokens - total_tokens / 2,
+            "total_tokens": total_tokens,
+            "account": "a1",
+            "realm": "cn",
+            "credit": 0.25,
+        })
+    }
+
+    #[test]
+    fn recent_usage_paginates_newest_first() {
+        let rows: Vec<Value> = (0..5)
+            .map(|index| timed_row(1_700_000_000.0 + index as f64, "m", index + 1))
+            .collect();
+        let out = build_usage_recent(&rows, "cn", 1, 2);
+        assert_eq!(out["total"], 5);
+        assert_eq!(out["limit"], 2);
+        assert_eq!(out["page"], 1);
+        assert_eq!(out["total_pages"], 3);
+        let page = out["rows"].as_array().unwrap();
+        assert_eq!(page.len(), 2);
+        // 最新在前。
+        assert_eq!(page[0]["total_tokens"], 5);
+        assert_eq!(page[1]["total_tokens"], 4);
+
+        // 页码越界 ⇒ 夹回最后一页。
+        let out = build_usage_recent(&rows, "cn", 99, 2);
+        assert_eq!(out["page"], 3);
+        assert_eq!(out["rows"].as_array().unwrap().len(), 1);
+
+        // 空集 ⇒ total_pages 至少 1。
+        let out = build_usage_recent(&[], "cn", 1, 10);
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["total_pages"], 1);
+        assert!(out["rows"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn timeseries_buckets_rows_by_window() {
+        let rows = vec![
+            timed_row(1_700_000_000.0, "m1", 10),
+            timed_row(1_700_000_030.0, "m1", 20),
+            timed_row(1_700_000_090.0, "m2", 30),
+        ];
+        // 60s 桶 ⇒ 前两行同桶，第三行另开一桶。
+        let out = build_usage_timeseries(&rows, "cn", 1_700_000_000.0, 1_700_000_120.0, 60);
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["realm"], "cn");
+        assert_eq!(out["bucket_seconds"], 60);
+        let series = out["series"].as_array().unwrap();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0]["at"], 1_700_000_000.0);
+        assert_eq!(series[0]["requests"], 2);
+        assert_eq!(series[0]["total_tokens"], 30);
+        assert_eq!(series[1]["at"], 1_700_000_060.0);
+        assert_eq!(series[1]["requests"], 1);
+        // 有 credit 的行进 `credits`（按 at 倒序）。
+        let credits = out["credits"].as_array().unwrap();
+        assert_eq!(credits.len(), 3);
+        assert_eq!(credits[0]["at"], 1_700_000_090.0);
+
+        // 窗口外的行不进桶。
+        let out = build_usage_timeseries(&rows, "cn", 1_700_000_000.0, 1_700_000_010.0, 60);
+        let series = out["series"].as_array().unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0]["requests"], 1);
+    }
+
+    #[test]
+    fn perf_blocks_come_from_raw_samples_and_are_null_when_empty() {
+        let rows = vec![
+            json!({"at": 1.0, "model": "m1", "outcome": "completed", "realm": "cn",
+                   "ttft_ms": 100.0, "gen_ms": 10.0, "elapsed_ms": 50.0,
+                   "tokens_per_sec": 12.5, "cache_hit_pct": 33.3}),
+            json!({"at": 2.0, "model": "m1", "outcome": "completed", "realm": "cn",
+                   "ttft_ms": 200.0, "gen_ms": 10.0, "elapsed_ms": 50.0,
+                   "tokens_per_sec": 12.5, "cache_hit_pct": 33.3}),
+            json!({"at": 3.0, "model": "m1", "outcome": "completed", "realm": "cn",
+                   "ttft_ms": 300.0, "gen_ms": 10.0, "elapsed_ms": 50.0,
+                   "tokens_per_sec": 12.5, "cache_hit_pct": 33.3}),
+        ];
+        let out = build_usage_perf(&rows, "cn", 5000, None, None);
+        assert_eq!(out["sampled"], 3);
+        assert_eq!(out["success"], 3);
+        assert_eq!(out["success_rate_pct"], 100.0);
+        assert_eq!(out["sample_from"], 1.0);
+        let ttft = &out["ttft_ms"];
+        assert_eq!(ttft["avg"], 200.0);
+        assert_eq!(ttft["p50"], 200.0);
+        assert_eq!(ttft["p90"], 300.0);
+        assert_eq!(ttft["p99"], 300.0);
+        assert_eq!(ttft["max"], 300.0);
+        assert_eq!(ttft["samples"], 3);
+        assert_eq!(out["by_model"]["m1"]["requests"], 3);
+
+        // 没有样本 ⇒ 整块为 null。
+        let out = build_usage_perf(&[], "cn", 5000, None, None);
+        assert_eq!(out["sampled"], 0);
+        assert!(out["ttft_ms"].is_null());
+        assert!(out["generation_ms"].is_null());
+        assert!(out["wall_ms"].is_null());
+        assert!(out["tokens_per_sec"].is_null());
+        assert!(out["cache_hit_pct"].is_null());
+        assert!(out["success_rate_pct"].is_null());
+    }
+
+    #[test]
+    fn perf_counts_client_aborted_separately() {
+        let rows = vec![
+            json!({"at": 1.0, "model": "m1", "outcome": "completed", "realm": "cn"}),
+            json!({"at": 2.0, "model": "m1", "outcome": "failed", "realm": "cn"}),
+            json!({"at": 3.0, "model": "m1", "outcome": "client_aborted", "realm": "cn"}),
+        ];
+        let out = build_usage_perf(&rows, "cn", 5000, None, None);
+        assert_eq!(out["sampled"], 3);
+        assert_eq!(out["success"], 1);
+        assert_eq!(out["errors"], 1);
+        assert_eq!(out["client_aborted"], 1);
+        // 客户端走掉的请求不进成功率的分母。
+        assert_eq!(out["success_rate_pct"], 50.0);
+        assert_eq!(out["by_model"]["m1"]["client_aborted"], 1);
+    }
+
+    #[test]
+    fn range_window_matches_python_ranges() {
+        let now = 1_800_000_000.0;
+        // 认不出来的 range ⇒ 不过滤。
+        assert_eq!(resolve_range_window("nope", None, None, now), (None, None));
+        assert_eq!(resolve_range_window("", None, None, now), (None, None));
+        // custom ⇒ 取两个 epoch；反了自动换。
+        let (lo, hi) = resolve_range_window("custom", Some("100"), Some("200"), now);
+        assert_eq!(lo, Some(100.0));
+        assert_eq!(hi, Some(200.0));
+        let (lo, hi) = resolve_range_window("custom", Some("200"), Some("100"), now);
+        assert_eq!(lo, Some(100.0));
+        assert_eq!(hi, Some(200.0));
+        // 负数 / 解析不了 ⇒ 该侧不设限。
+        let (lo, hi) = resolve_range_window("custom", Some("-5"), Some("abc"), now);
+        assert_eq!(lo, None);
+        assert_eq!(hi, None);
+        // today ⇒ 本地零点起。
+        let (lo, hi) = resolve_range_window("today", None, None, now);
+        assert!(lo.is_some());
+        assert_eq!(hi, None);
+    }
+
+    #[test]
+    fn bucket_seconds_scale_with_the_window_span() {
+        assert_eq!(pick_bucket_seconds(3600.0, None), 60);
+        assert_eq!(pick_bucket_seconds(6.0 * 3600.0, None), 60);
+        assert_eq!(pick_bucket_seconds(6.0 * 3600.0 + 1.0, None), 3600);
+        assert_eq!(pick_bucket_seconds(7.0 * 86400.0, None), 3600);
+        assert_eq!(pick_bucket_seconds(14.0 * 86400.0, None), 3600);
+        assert_eq!(pick_bucket_seconds(14.0 * 86400.0 + 1.0, None), 86400);
+        // 显式 bucket 覆盖，但下限 60。
+        assert_eq!(pick_bucket_seconds(3600.0, Some(300)), 300);
+        assert_eq!(pick_bucket_seconds(3600.0, Some(5)), 60);
+        assert_eq!(pick_bucket_seconds(3600.0, Some(0)), 60);
+    }
+
+    #[test]
+    fn snapshot_decoration_appends_python_keys() {
+        let rows = vec![timed_row(1_700_000_000.0, "m1", 10)];
+        let decor = SnapshotDecor {
+            realm: "cn".to_string(),
+            log_file: "/tmp/usage/usage.jsonl".to_string(),
+            accounts_map: Some(json!({"a1": {"nickname": "", "realm": "cn"}})),
+            account: Some(json!({"uid": "a1"})),
+        };
+        let out = build_usage_snapshot_with(&rows, &decor);
+        let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        // 基底键在前，装饰组在后（Python 的顺序）。
+        assert_eq!(keys[0], "requests");
+        assert_eq!(keys[keys.len() - 6], "started");
+        assert_eq!(keys[keys.len() - 5], "since");
+        assert_eq!(keys[keys.len() - 4], "log_file");
+        assert_eq!(keys[keys.len() - 3], "realm");
+        assert_eq!(keys[keys.len() - 2], "accounts_map");
+        assert_eq!(keys[keys.len() - 1], "account");
+        assert_eq!(out["realm"], "cn");
+        assert_eq!(out["log_file"], "/tmp/usage/usage.jsonl");
+        assert!(out["started"].as_f64().unwrap() > 0.0);
+        // 定价未接入 ⇒ 不写假的 usd_cny。
+        assert!(out.get("usd_cny").is_none());
+    }
+
+    #[test]
+    fn python_rounding_matches_python_semantics() {
+        // Python `round(x, 1)`：平局取偶 + 十进制精确舍入。
+        assert_eq!(py_round1(2.25), 2.2);
+        assert_eq!(py_round1(2.35), 2.4);
+        assert_eq!(py_round1(200.0 / 3.0), 66.7);
+        // Python `round(x)`：平局取偶（Rust 的 `.round()` 是平局远离零）。
+        assert_eq!(py_round(0.5), 0.0);
+        assert_eq!(py_round(1.5), 2.0);
+        assert_eq!(py_round(2.5), 2.0);
     }
 }

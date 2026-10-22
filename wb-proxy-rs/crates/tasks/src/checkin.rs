@@ -26,10 +26,17 @@
 //! 由此带来的可重试性是本关卡的验收核心：签到失败后 `can_checkin` 必须仍为
 //! true，下一轮调度可以重新尝试。
 //!
-//! ## 未移植的分支（记入 4.11 账本）
+//! ## 活动历史（关卡 4.20 线 B）
 //!
-//! Python 在 `checkin()` 里调 `wb_activity.record_attempt(...)`（:1607）记录
-//! 活动历史；Rust 侧没有活动历史子系统，本模块不写该记录，也不改变返回形状。
+//! Python 在 `checkin()` 里调 `wb_activity.record_attempt(...)`
+//! （`wb_accounts.py:1674`）记录活动历史；Rust 侧在本关接上了这一条写入点：
+//! 整次尝试记一行（成功 / 失败都记），写不进去只打日志——活动历史是运维
+//! 元数据，写不进去不该把一次成功的签到变成失败。
+//!
+//! ⚠️ Python 的 `report_activity()`（国内版对话活跃上报）**没有**
+//! `record_attempt` 调用点（`wb_activity` 的调用点只有 `wb_accounts.py` 的
+//! 1478 / 1570 / 1674 三处），Rust 侧同样不写：活动词表里也没有它的位置
+//! （`wb_activity.TASKS` 只有 `checkin` 与 `daily_chat`）。
 
 use std::path::Path;
 use std::time::Duration;
@@ -42,6 +49,7 @@ use wb_gateway::headers::{billing_request_headers, BillingHeadersParams};
 use wb_gateway::outbound::UpstreamClient;
 use wb_storage::{write_idempotent_fields, IdempotentFields};
 
+use crate::activity;
 use crate::events::{build_event, report_events};
 use crate::growth_api::TaskEndpoints;
 use crate::growth_runner::{Clock, RunnerAccount};
@@ -262,10 +270,30 @@ fn code_of(payload: &Value) -> Option<i64> {
 /// - 请求：`POST {billing_base}{CHECKIN_PATH}`，body `{}`，billing 头
 /// - 任何失败路径都不写 `lastCheckin`，从而保留当天重试的可能
 ///
+/// **活动历史**：整次尝试记一行（Python `wb_accounts.py:1674` 的
+/// `wb_activity.record_attempt`）；写不进去只打日志，不翻转签到结论。
+///
 /// `billing_base` 显式传入而非内部取 `realm_config("cn")`：契约测试要用 mock
 /// 上游替换 `https://www.codebuddy.cn`（M4 约束「不得对真实上游发任何请求」）。
 /// 生产侧统一传 [`production_billing_base`]。
 pub async fn checkin(
+    client: &UpstreamClient,
+    acc: &RunnerAccount<'_>,
+    billing_base: &str,
+    ctx: &CheckinCtx<'_>,
+) -> CheckinOutcome {
+    // Python `Account.checkin`（`wb_accounts.py:1663-1674`）：守卫（realm /
+    // 企业账号）在 `record_attempt` **之前**早退 ⇒ 这两种情况不记活动历史。
+    if acc.realm != "cn" || acc.is_enterprise {
+        return checkin_inner(client, acc, billing_base, ctx).await;
+    }
+    let outcome = checkin_inner(client, acc, billing_base, ctx).await;
+    record_checkin(ctx, acc, &outcome);
+    outcome
+}
+
+/// 签到本体（不含活动历史写入）。
+async fn checkin_inner(
     client: &UpstreamClient,
     acc: &RunnerAccount<'_>,
     billing_base: &str,
@@ -336,6 +364,41 @@ pub async fn checkin(
         Some(code) => CheckinOutcome::rejected(code, msg),
         None => CheckinOutcome::failure(fallback_msg),
     }
+}
+
+/// 记一次签到尝试（Python `wb_activity.record_attempt`，`wb_accounts.py:1674`）。
+///
+/// 说明文案取 `msg` → `error` → `"成功"` / `"失败"`，与 Python
+/// `record_attempt` 的 `result.get("msg") or result.get("error") or (…)`
+/// 同款。
+///
+/// **写不进去只打日志**（`record_attempt` 内部）：活动历史是运维元数据，
+/// 写不进去不该把一次成功的签到变成失败。
+fn record_checkin(ctx: &CheckinCtx<'_>, acc: &RunnerAccount<'_>, outcome: &CheckinOutcome) {
+    let usage_dir = crate::api_routes::usage_dir_from(ctx.dir);
+    let message = outcome
+        .msg
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .or(outcome.error.as_deref())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if outcome.ok {
+                "成功".to_string()
+            } else {
+                "失败".to_string()
+            }
+        });
+    activity::record_attempt(
+        &usage_dir,
+        acc.api.uid,
+        acc.nickname.unwrap_or(""),
+        acc.realm,
+        activity::TASK_CHECKIN,
+        activity::TRIGGER_UNKNOWN,
+        outcome.ok,
+        &message,
+    );
 }
 
 // ---------------------------------------------------------------------------

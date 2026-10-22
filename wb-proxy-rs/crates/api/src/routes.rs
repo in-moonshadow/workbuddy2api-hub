@@ -204,11 +204,22 @@ pub fn app_with(
         .route("/pricing", get(pricing_get).options(preflight))
         .route("/updates", get(updates_get).options(preflight))
         .route("/usage", get(usage_get).options(preflight))
+        .route("/v1/usage", get(usage_get).options(preflight))
         .route(
             "/usage/by-account",
             get(usage_by_account).options(preflight),
         )
         .route("/usage/analytics", get(usage_analytics).options(preflight))
+        .route("/usage/recent", get(usage_recent_get).options(preflight))
+        .route(
+            "/usage/timeseries",
+            get(usage_timeseries_get).options(preflight),
+        )
+        .route("/usage/perf", get(usage_perf_get).options(preflight))
+        .route(
+            "/activity/history",
+            get(activity_history_get).options(preflight),
+        )
         .route(
             "/accounts/credits-refresher",
             get(credits_refresher_get).options(preflight),
@@ -1258,8 +1269,8 @@ async fn scheduler_toggle(
 // （`/usage` 前缀，:15662-15691）⇒ **需要鉴权**；鉴权模式与 `/scheduler`
 // 一样：`key_ok` 走 API key / 面板会话 / 免鉴权三条路径。
 //
-// ⚠️ Python 还把 `/v1/usage` 也指向同一份快照（:15719），Rust 侧本关卡
-// 只接了 `/usage` 三条路由（`/v1/usage` 留后续关卡）。
+// ⚠️ Python 还把 `/v1/usage` 也指向同一份快照（:15719），Rust 侧自关卡
+// 4.20 起两条路径挂同一个 handler ⇒ 同一份响应体。
 // ---------------------------------------------------------------------------
 
 /// 读用量行。
@@ -1276,10 +1287,17 @@ fn read_usage_rows(state: &AppState) -> Vec<Value> {
     }
 }
 
-/// `GET /usage`：用量快照（Python `_get_v1_usage`）。
+/// `GET /usage` 与 `GET /v1/usage`：用量快照（Python `_get_v1_usage`）。
+///
+/// **两条路径同一份实现**（Python `wb_proxy.py:15719`：
+/// `if path in ("/usage", "/v1/usage")` ⇒ 同一个 handler、同一个响应体）。
 ///
 /// **按 realm 过滤**（Python `_get_v1_usage` :15839-15842）：
 /// `?realm=` → `X-Realm` 头 → 当前 realm；`all` 表示不过滤。
+///
+/// **按区间过滤**（Python `range_query` + `range_window`）：`range` /
+/// `since` / `until` 三个参数决定这次快照描述哪段窗口；缺省或认不出来的
+/// `range` ⇒ **不过滤**（旧面板的老行为）。
 async fn usage_get(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1293,11 +1311,229 @@ async fn usage_get(
         );
     }
     let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
+    let now = wb_tasks::activity::now_epoch();
+    let (since, until) = resolve_window(&params, now);
     let rows: Vec<Value> = read_usage_rows(&state)
         .into_iter()
         .filter(|row| wb_tasks::usage::realm_matches(row, &realm))
+        .filter(|row| wb_tasks::usage::row_in_window(row, since, until))
         .collect();
-    Json(wb_tasks::usage::build_usage_snapshot(&rows)).into_response()
+    let decor = snapshot_decor(&state, &realm, now).await;
+    Json(wb_tasks::usage::build_usage_snapshot_with(&rows, &decor)).into_response()
+}
+
+/// 快照的装饰键（Python `_usage_snapshot_uncached` 追加的那一组）。
+///
+/// `accounts_map` / `account` 来自**账号池的真实状态**；拿不到的子键整个
+/// 省略（`domain` / `issuer` Rust 侧没有 ⇒ 不写假值）。`usd_cny` 依赖定价
+/// 表，Rust 侧本关不接定价 ⇒ 整个键省略。
+async fn snapshot_decor(state: &AppState, realm: &str, now: f64) -> wb_tasks::usage::SnapshotDecor {
+    let mut decor = wb_tasks::usage::SnapshotDecor {
+        realm: realm.to_string(),
+        log_file: wb_tasks::usage::usage_log_path(&state.task.usage_dir)
+            .to_string_lossy()
+            .into_owned(),
+        accounts_map: None,
+        account: None,
+    };
+    let pool = state.upstream.pool.lock().await;
+    let mut accounts_map = serde_json::Map::new();
+    for account in pool.iter_accounts() {
+        // 昵称：Rust 的账号池结构体不携带昵称，Python 那边缺省也是空串。
+        accounts_map.insert(
+            account.uid.clone(),
+            json!({"nickname": "", "realm": account.realm}),
+        );
+    }
+    decor.accounts_map = Some(Value::Object(accounts_map));
+
+    // 代表账号：Python `POOL.representative(realm=r)` —— 先挑有 token 的，
+    // 没有就挑第一个候选；一个都没有时 Python 也给一个「空代表」（各字段是
+    // 空串 / 0），Rust 侧同样给一个 ⇒ 这个键恒定存在。
+    let candidates: Vec<&wb_gateway::pool::AccountState> = pool
+        .iter_accounts()
+        .filter(|account| realm.is_empty() || realm == "all" || account.realm == realm)
+        .collect();
+    let representative = candidates
+        .iter()
+        .find(|account| account.has_token)
+        .or_else(|| candidates.first());
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "uid".into(),
+        json!(representative
+            .map(|account| account.uid.clone())
+            .unwrap_or_default()),
+    );
+    value.insert(
+        "credential_file".into(),
+        json!(representative
+            .map(|account| account.credential_file.clone())
+            .unwrap_or_default()),
+    );
+    value.insert(
+        "expires_at".into(),
+        json!(representative
+            .and_then(|account| account.expires_at)
+            .unwrap_or(0.0)),
+    );
+    value.insert("accounts".into(), json!(pool.len()));
+    value.insert(
+        "accounts_ready".into(),
+        json!(pool.count_ready(None, None, now)),
+    );
+    // Python 的 `account` 还有 `domain` / `issuer`：Rust 的账号池拿不到这两个
+    // 值 ⇒ **省略这两个子键**，不写假的空串。
+    decor.account = Some(Value::Object(value));
+    decor
+}
+
+/// 解析面板的区间参数（Python `range_query` + `range_window`）。
+///
+/// 缺省 / 认不出来的 `range` ⇒ `(None, None)` = **不过滤**。
+fn resolve_window(params: &HashMap<String, String>, now: f64) -> (Option<f64>, Option<f64>) {
+    wb_tasks::usage::resolve_range_window(
+        params.get("range").map(String::as_str).unwrap_or(""),
+        params.get("since").map(String::as_str),
+        params.get("until").map(String::as_str),
+        now,
+    )
+}
+
+/// 读一个整型查询参数（Python `int(...)` 的近似）。
+///
+/// 解析不了 ⇒ `None`（调用方按 Python 的兜底值处理）。Python 的
+/// `int("12.5")` 抛 `ValueError` ⇒ 同样回 `None`。
+fn parse_int(params: &HashMap<String, String>, key: &str) -> Option<i64> {
+    params
+        .get(key)
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+}
+
+/// `GET /usage/recent`：分页的最近用量行（Python `_get_usage_recent`）。
+///
+/// `limit` 夹在 1..1000（默认 100）、`page` ≥ 1（默认 1）；解析不了回默认值。
+///
+/// ⚠️ 返回的**行没有定价字段**（`cost_cny` / `cost_band` / …）：那些依赖定价
+/// 表，Rust 侧本关不接定价 ⇒ 整组省略，不写假的 0 值。
+async fn usage_recent_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
+    let limit = parse_int(&params, "limit")
+        .map(|value| value.clamp(1, 1000))
+        .unwrap_or(100);
+    let page = parse_int(&params, "page")
+        .map(|value| value.max(1))
+        .unwrap_or(1);
+    let rows = read_usage_rows(&state);
+    Json(wb_tasks::usage::build_usage_recent(
+        &rows, &realm, page, limit,
+    ))
+    .into_response()
+}
+
+/// `GET /usage/timeseries`：分桶的用量序列（Python `_get_usage_timeseries`）。
+///
+/// 桶粒度自适应（Python `_usage_timeseries_scope`）：窗口 ≤6h ⇒ 60s；
+/// ≤14d ⇒ 3600s；更长 ⇒ 86400s；`?bucket=` 可覆盖（下限 60 秒）。
+/// 缺省窗口是「最近 24 小时」。
+async fn usage_timeseries_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
+    let now = wb_tasks::activity::now_epoch();
+    let (since, until) = resolve_window(&params, now);
+    let until = until.unwrap_or(now);
+    let since = since.unwrap_or(until - 86400.0);
+    let span = (until - since).max(1.0);
+    let step = wb_tasks::usage::pick_bucket_seconds(span, parse_int(&params, "bucket"));
+    let rows = read_usage_rows(&state);
+    Json(wb_tasks::usage::build_usage_timeseries(
+        &rows, &realm, since, until, step,
+    ))
+    .into_response()
+}
+
+/// `GET /usage/perf`：延迟分位与派生速率（Python `_get_usage_perf`）。
+///
+/// `sample` 夹在 10..20000（默认 5000），指的是日志**末尾**多少行参与统计
+/// （不是时间窗）。分位一律从原始样本算。
+async fn usage_perf_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
+    let sample = parse_int(&params, "sample")
+        .map(|value| value.clamp(10, 20000))
+        .unwrap_or(5000);
+    let now = wb_tasks::activity::now_epoch();
+    let (since, until) = resolve_window(&params, now);
+    let rows = read_usage_rows(&state);
+    Json(wb_tasks::usage::build_usage_perf(
+        &rows, &realm, sample, since, until,
+    ))
+    .into_response()
+}
+
+/// `GET /activity/history`：账号每日活动的结构化历史（Python
+/// `_get_activity_history`）。
+///
+/// **筛选值非法 ⇒ 400**（不是静默忽略）：调用方拿着一个被忽略的
+/// `result=failed` 会以为「这几天没有失败」，实际上它拿回的是全部结果。
+async fn activity_history_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(&state)),
+            "invalid_request_error",
+        );
+    }
+    let rows = wb_tasks::activity::history_rows(&state.task.usage_dir);
+    let now = wb_tasks::activity::now_epoch();
+    let outcome = wb_tasks::activity::query(
+        &rows,
+        params.get("range").map(String::as_str).unwrap_or(""),
+        params.get("uid").map(String::as_str).unwrap_or(""),
+        params.get("task").map(String::as_str).unwrap_or(""),
+        params.get("result").map(String::as_str).unwrap_or(""),
+        parse_int(&params, "limit"),
+        now,
+    );
+    match outcome {
+        Ok(result) => Json(result.to_json()).into_response(),
+        Err(message) => openai_error(400, &message, "invalid_request_error"),
+    }
 }
 
 /// `GET /usage/by-account`：按账号聚合（Python `_get_usage_by_account`）。

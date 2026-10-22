@@ -15,6 +15,7 @@ use serde_json::{json, Map, Value};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 /// 历史文件名。
@@ -35,6 +36,12 @@ pub const TRIGGERS: [&str; 5] = [
     "account_import",
     "unknown",
 ];
+
+/// 触发来源：未知（Python 的默认值 `trigger="unknown"`）。
+///
+/// Python 的 `trigger` 由**调用方**给（`scheduler` / `manual` /
+/// `account_add` / `account_import`），拿不到时用这个。
+pub const TRIGGER_UNKNOWN: &str = "unknown";
 
 /// 可记录的区域。
 pub const REALMS: [&str; 2] = ["cn", "intl"];
@@ -505,6 +512,128 @@ pub fn write_rows_atomic(path: &Path, rows: &[Value]) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| format!("替换失败: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// 写入（关卡 4.20 线 B）
+// ---------------------------------------------------------------------------
+
+/// 历史文件的写锁。
+///
+/// 追加与整理必须互斥：整理是「读全部 → 过滤 → 原子替换」，与并发追加撞上
+/// 会把刚写进去的行吃掉。
+static HISTORY_WRITE_LOCK: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+
+/// 上次整理的时刻（epoch 秒）；Python `wb_activity._last_compact` 的等价物。
+static LAST_COMPACT: AtomicU64 = AtomicU64::new(0);
+
+/// 当前 epoch 秒（浮点）。
+pub fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// 读出历史行（**文件序：最旧 → 最新**）。
+///
+/// [`query`] 自己倒序遍历（最新在前），所以这里按写入顺序返回即可。
+pub fn history_rows(usage_dir: &Path) -> Vec<Value> {
+    load_rows(&history_path(usage_dir))
+}
+
+/// 读账号文件里的昵称（读不到 / 不是纯文本 ⇒ 空串）。
+///
+/// 对齐 Python `wb_accounts.py:491-496`：国内版桌面端把昵称存成加密信封
+/// （`{"$wbEncrypted": …}`），把整个字典字符串化进账号行是错的 ⇒ 丢弃，
+/// 退回空串。
+pub fn account_nickname(accounts_dir: &Path, account_name: &str) -> String {
+    if account_name.is_empty() {
+        return String::new();
+    }
+    let Ok(text) = fs::read_to_string(accounts_dir.join(account_name)) else {
+        return String::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return String::new();
+    };
+    match doc.get("nickname").and_then(Value::as_str) {
+        Some(name) if !name.contains("$wbEncrypted") => name.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 记一次尝试（Python `wb_activity.record_attempt` + `record`）。
+///
+/// 行结构与 Python `record()` 的字面量逐字一致：
+/// `ts` / `uid` / `nickname` / `realm` / `task` / `trigger` / `ok` / `message`。
+///
+/// **绝不抛错**：写不进去只打日志并回 `None` —— 磁盘满、文件被占用都不该把
+/// 一次成功的签到变成失败（Python `record()` 的注释同款）。
+///
+/// ⚠️ `ts` 用 [`local_iso_now`]（`2026-10-21T12:34:56+08:00`），**不是**
+/// `%Y-%m-%d %H:%M:%S`：Python `wb_activity._timestamp()` 走的是
+/// `datetime.now().astimezone().isoformat(timespec="seconds")`，且读侧
+/// [`parse_ts`] 只认 RFC3339 —— 写成空格分隔会让每一行在有界区间里被判成
+/// 「时间读不出来」而被整段丢掉。
+///
+/// 形参与 Python `wb_activity.record` 的 8 个形参逐字对应（改用结构体拆开
+/// 反而不好并排比对），故豁免 clippy 的「参数过多」。
+#[allow(clippy::too_many_arguments)]
+pub fn record_attempt(
+    usage_dir: &Path,
+    uid: &str,
+    nickname: &str,
+    realm: &str,
+    task: &str,
+    trigger: &str,
+    ok: bool,
+    message: &str,
+) -> Option<Value> {
+    let row = build_row("", uid, nickname, realm, task, trigger, ok, message);
+    let path = history_path(usage_dir);
+    let guard = match HISTORY_WRITE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Err(err) = append_row(&path, &row) {
+        eprintln!("[wb-activity] 写活动历史失败: {err}");
+        return None;
+    }
+    compact_if_due(&path);
+    drop(guard);
+    Some(row)
+}
+
+/// 到点了就整理一次（Python `_compaction_due` + `_compact_locked`）。
+///
+/// 整理失败**保持原文件不变**（`write_rows_atomic` 先写临时文件再替换）。
+fn compact_if_due(path: &Path) {
+    let now = now_epoch();
+    let last = LAST_COMPACT.load(Ordering::Relaxed);
+    let last = if last == 0 {
+        // 第一次：只记时刻，不整理（对齐 Python 模块级 `_last_compact`）。
+        LAST_COMPACT.store(now as u64, Ordering::Relaxed);
+        now
+    } else {
+        last as f64
+    };
+    let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let due = size > COMPACT_TRIGGER_BYTES || now - last >= COMPACT_INTERVAL_SECONDS;
+    if !due {
+        return;
+    }
+    LAST_COMPACT.store(now as u64, Ordering::Relaxed);
+    let rows = load_rows(path);
+    let (keep, dropped) = compact_rows(&rows, None, None, now);
+    if let Err(err) = write_rows_atomic(path, &keep) {
+        eprintln!("[wb-activity] 整理活动历史失败（保留原文件）: {err}");
+        return;
+    }
+    if dropped > 0 {
+        eprintln!("[wb-activity] 活动历史整理：丢弃 {dropped} 行");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,5 +819,69 @@ mod tests {
             .expect("write must succeed");
         let rows = load_rows(&path);
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn record_attempt_writes_a_row_that_can_be_read_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let row = record_attempt(
+            dir.path(),
+            "u1",
+            "nick",
+            "cn",
+            TASK_CHECKIN,
+            "manual",
+            true,
+            "签到成功",
+        )
+        .expect("写入必须成功");
+        assert_eq!(row["uid"], "u1");
+        assert_eq!(row["task"], TASK_CHECKIN);
+        assert_eq!(row["trigger"], "manual");
+        assert_eq!(row["ok"], true);
+
+        let rows = history_rows(dir.path());
+        assert_eq!(rows.len(), 1);
+        // `ts` 必须是能解析的 ISO 串（有界区间靠它过滤）。
+        let ts = rows[0]["ts"].as_str().expect("ts is a string");
+        assert!(parse_ts(ts).is_some(), "ts 应当能被 parse_ts 读出来");
+    }
+
+    #[test]
+    fn record_attempt_never_panics_on_an_unwritable_directory() {
+        // 目标路径是一个已存在的普通文件 ⇒ 建目录必然失败。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, "not a dir").expect("write must succeed");
+        let outcome = record_attempt(
+            &blocker,
+            "u1",
+            "nick",
+            "cn",
+            TASK_CHECKIN,
+            "manual",
+            true,
+            "x",
+        );
+        assert!(outcome.is_none(), "写不进去只回 None，不抛错");
+    }
+
+    #[test]
+    fn account_nickname_reads_the_plain_string_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("acc.json"), r#"{"nickname":"  tester  "}"#)
+            .expect("write must succeed");
+        assert_eq!(account_nickname(dir.path(), "acc.json"), "tester");
+
+        // 加密信封不是纯文本 ⇒ 丢弃（对齐 Python）。
+        fs::write(
+            dir.path().join("enc.json"),
+            r#"{"nickname":"{\"$wbEncrypted\": \"x\"}"}"#,
+        )
+        .expect("write must succeed");
+        assert_eq!(account_nickname(dir.path(), "enc.json"), "");
+
+        // 读不到 / 不是 JSON ⇒ 空串。
+        assert_eq!(account_nickname(dir.path(), "missing.json"), "");
     }
 }

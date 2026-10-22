@@ -1223,3 +1223,95 @@ D36 从「恒回填 `None`」改为「读账号文件里**本地已存**的快�
 - 企业版积分路径（`_fetch_credits_enterprise`）未移植。
 - M3-b（`/v1/responses` 翻译 + web-tools replay）、M6（影子回放）、M7（切流）未启动。
 - `ApiPanelSink::add_log_entry` 仍是 no-op ⇒ 三个后台线程的日志进不了面板日志页。
+
+---
+
+### 关卡 4.20：模型目录（D55）+ 用量/活动路由补齐 — 已完成（2026-10-21）
+
+**授权**：用户 2026-10-21 指示「并行做」——并行推进上一关收尾时提的两项：①落 Rust 侧模型目录（解 D55，让定价刷新真能写盘）②补齐剩下的用量/活动路由。
+
+#### 结构：两轮只读调研 → 两条并行线 → 主会话集成
+
+| 线 | 范围 | 独占文件 |
+|---|---|---|
+| A | Rust 侧模型目录（静态 54 个 id + 跨语言 parity 测试 + overrides 读取） | `tasks/src/catalog.rs`（新）、`tasks/src/price_source.rs`、`tasks/tests/contract_catalog.rs`（新）、`tasks/src/lib.rs`（加一行声明） |
+| B | 5 条用量/活动路由 + **活动历史写入点** | `tasks/src/usage.rs`、`tasks/src/activity.rs`、`tasks/src/daily_chat.rs`、`tasks/src/checkin.rs`、`api/src/routes.rs`、`api/tests/contract_usage_routes2.rs`（新） |
+
+**两条线文件所有权零重叠**（与关卡 4.19 相比是改进：上一关的 `routes.rs` 被两条线同时需要，本关把它整条划给线 B）。
+
+#### 产出物
+
+| 线 | 文件 | 行数 | 复核方式 |
+|---|---|---|---|
+| A | `crates/tasks/src/catalog.rs`（新） | 168 | `HUB_MODEL_IDS: [&str; 54]` + `hub_model_ids()` + 3 个模块内单测 |
+| A | `crates/tasks/src/price_source.rs`（改） | 210 | `catalog()` 返回真实 hub_ids + `read_runtime_overrides()` |
+| A | `crates/tasks/tests/contract_catalog.rs`（新） | 421 | 8 条（含跨语言 parity） |
+| B | `crates/tasks/src/usage.rs`（改） | +800 | `build_usage_recent` / `build_usage_timeseries` / `build_usage_perf` / `build_usage_snapshot_with` |
+| B | `crates/tasks/src/activity.rs`（改） | +193 | `record_attempt()`（写失败只打日志、绝不抛） |
+| B | `crates/tasks/src/daily_chat.rs`（改） | +175/-44 | `daily_chat_web_recorded()`（网页腿带历史写入的入口） |
+| B | `crates/tasks/src/checkin.rs`（改） | +69 | 签到/活跃上报写活动历史 |
+| B | `crates/api/src/routes.rs`（改） | +244 | 5 条路由 + handler |
+| B | `crates/api/tests/contract_usage_routes2.rs`（新） | 774 | 16 条 |
+| 主 | `crates/tasks/src/api_routes.rs` | 网页腿接上历史写入 | — |
+| 主 | `crates/tasks/src/settings.rs` | `pricing_variant_inherit` 键位收口 | — |
+| 主 | 3 个既有测试文件 | 修 `/tmp/usage` 副作用 | — |
+
+#### 线 A：模型目录（解 D55）
+
+- Python 侧 `wb_catalog.py`：`STATIC_INTL_MODELS` **24** 条、`STATIC_CN_MODELS` **39** 条，两段交集 9 个 id ⇒ **去重后 54** 条。`hub_model_ids()`（`wb_pricing.py:1137-1155`）**只取 `item["id"]`** ⇒ 整份 JSON（含 `credits`/描述/token 上限）不必搬，只搬 54 个字符串。
+- Rust 侧 `catalog.rs` 的 `HUB_MODEL_IDS` 与 Python **逐字逐序一致**（主会话独立复核：脚本解析 `wb_catalog.py` 两段 JSON → 去重保序 → 与 Rust 数组比对 ⇒ `True`；不是只信代理报告）。
+- **跨语言 parity 测试**（`contract_catalog.rs`）读 `wb_catalog.py` 逐字逐序比对，目录漂移即测试红。线 A 还做了**变异测试**：把 `hy4-preview` 改成 `hy4-preview-X` ⇒ 3 条测试立刻红 ⇒ 断言确实咬得住。
+- **别名档位不剔除**（`default-model`/`fast-model`/`balanced-model`/`primary-model`/`deep-model`/`default-1.1`/`default-1.2`）—— 与 Python 一致，让它们自然落进 `unpriced`。
+- **live 目录那一半仍缺**（已知缺口）：Python 的 `priced_model_ids()` = 静态 ∪ 网关 live 目录新增，live 需要「远端产品目录抓取 + `is_chat_model` 过滤 + 变体整理」整条链路，Rust 侧没有。按 Python 语义，缺它只是**少覆盖**（那部分模型落进 `unpriced`），不会让覆盖变小。
+
+#### 线 B：5 条路由 + 活动历史写入点
+
+| 路由 | Rust 顶层键 | 与 Python 对照 |
+|---|---|---|
+| `/usage` 与 `/v1/usage` | `requests, total_requests, errors, +5 token 键, by_model, started, since, log_file, realm, accounts_map, account` | Python 多：`credit, cost_cny, cost_missing, by_model_realm, by_model_acct, ttft_ms_sum, ttft_samples, gen_ms_sum, gen_samples, wall_ms_sum, wall_samples, usd_cny`。`/v1/usage` 与 `/usage` **同一 handler ⇒ 同一份响应体**（与 Python `:15719` 同分支一致） |
+| `/usage/recent` | `total, page, limit, total_pages, rows` | Python 多 `usd_cny`；**行内**少 15 个 `cost_*` 定价键（依赖定价表 ⇒ **整组省略，不写假 0**） |
+| `/usage/timeseries` | `ok, realm, bucket_seconds, since, until, series, credits` | **完全一致**（含桶与 `credits` 项的键） |
+| `/usage/perf` | `sampled, sample_from, sample_capped, success, errors, client_aborted, success_rate_pct, +5 指标块, by_model` | 指标块 `{avg,p50,p90,p99,max,samples}` **完全一致**，**无样本 ⇒ 整块 null**。Python 多 `by_model_realm`/`by_model_acct` |
+| `/activity/history` | `rows, total, limit, range, filters{uid, task, result}` | **完全一致**（含键序）；**非法筛选 ⇒ 400**（不静默忽略） |
+
+- **活动历史写入点**（Python `wb_activity.record` 的三个调用点）：`checkin()`（成功/失败都记，守卫早退不记）、`daily_chat()`（整次尝试记一行，内部网页腿不重复记）。落盘 `usage/activity_history.jsonl`（与 Python 同一文件）。**写入失败只打日志、绝不抛**（磁盘满不该把一次成功的签到变成失败）。
+- **线 B 纠正了主会话任务书的一处错误**：`ts` 字段格式。主会话写成 `%Y-%m-%d %H:%M:%S`，但 Python `wb_activity._timestamp()` 是 `datetime.now().astimezone().isoformat(timespec="seconds")` ⇒ **`2026-10-21T19:39:56+08:00`**（RFC3339）。线 B 按源码走是对的：读侧 `activity::parse_ts` 只认 RFC3339，写成空格分隔会让每行在有界区间被判「时间读不出来」⇒ `/activity/history` 恒返回 0 行。**教训**：格式类契约要引源码、不要凭印象。
+
+#### 主会话的三处集成
+
+1. **网页腿接上历史写入**（`api_routes.rs`）：改调 `daily_chat_web_recorded(..., &task.usage_dir)`。Python 的 `daily_chat_web` 被面板直接调用时记一行、被 `daily_chat()` 内部调用时不记（`trigger=None`）——两种语义的差别就落在这个入口上；线 B 留了口，主会话接上。
+2. **settings 键位收口（消除双份定义）**：线 A 在 `price_source.rs` 就地定义了 `PRICING_VARIANT_INHERIT_KEY`（Rust 的 `settings.rs` 原本没有这把键）。主会话把它补进 `crates/tasks/src/settings.rs`（键位层的本职），并加 `pricing_variant_inherit(data)`（**缺键 = 开**、有键时只有布尔 `true` 算开，对齐 Python `wb_settings.py:955-968` 的 `value is True` 严格判定），`price_source.rs` 改为调它 ⇒ **唯一一份定义**，不再漂移。
+3. **修 `/tmp/usage` 污染**（3 个既有测试文件）：`contract_checkin.rs` / `contract_daily_chat.rs`（tasks 侧）与 `contract_manual_endpoints.rs`（api 侧）原把 **tempdir 根目录**当账号目录 ⇒ 用量/活动历史目录被推成 `/tmp/usage` ⇒ 测试往 tempdir 外写。改为把账号放进 tempdir 内的 `accounts/` 子目录 ⇒ 用量目录随之落在 tempdir 内。**修完实测 `/tmp/usage/activity_history.jsonl` 不再增长**（33539 字节 → 33539 字节）。
+
+#### 差异清单（本关新增）
+
+| # | 差异 | 影响 | 处理 |
+|---|---|---|---|
+| **D67** | 活动历史行的 `trigger` **恒为 `"unknown"`** | Python 的 trigger 有 4 种取值（`scheduler`/`manual`/`account_add`/`account_import`），Rust 侧暂统一 | **有意留口**：精确化需要给 `AccountView` 加字段并改 **6 处构造点**（含 4 个测试文件），或改 `CycleExecutor` 签名 ⇒ 触及调度器核心类型，超出「路由可用」的范围。留给后续关卡 |
+| **D68** | `/usage` 缺 Python 的 `credit`/`cost_cny`/`cost_missing`/`by_model_realm`/`by_model_acct`/`ttft_*`/`gen_*`/`wall_*`/`usd_cny` 等键 | 面板少若干字段 | 依赖**定价表**（本关未做策略库接线）⇒ 省略而非写假值。键序也不同（Python 的基底键 Rust 缺一大半，逐字对齐不可能） |
+| **D69** | `/usage/recent` 的行缺 15 个 `cost_*` 定价键 | 同上 | 同上 |
+| **D70** | `/usage/perf` 的 `by_model_realm`/`by_model_acct` 未实现 | 少两个分组维度 | `by_model_realm` 其实可算（Rust 行带显式 `realm`），`by_model_acct` 需「账号→realm」推断链（Python 的 `row_realm` 链）⇒ 留后续 |
+| **D71** | `/usage/perf` 的 `ttft_ms`/`generation_ms` 指标块**恒为 null** | 首字延迟/生成耗时分位没有数 | Rust 落盘的行里这两个字段恒为 `null`（只有非流式分支拿不到首字/生成耗时）⇒ **如实呈现 null，不拿别的指标顶替** |
+| **D72** | `/usage/remaining` **未做** | 面板没有「剩余额度」视图 | 它**不是用量聚合**，而是额度/预算估算：依赖 `limit-events.jsonl` + `estimate-daily.json` + 账号 `model_caps` + 跨天归档，Rust 侧整套未移植 ⇒ 硬做出来是空壳，比不做更糟 |
+| **D73** | ETag/304、5 份 `usage-aggregate-cache-*.json` checkpoint、`usage-recent-index.json` 行偏移索引 **均未做** | 每次聚合都是全量重算 | Python 自己的注释明说「checkpoint 只是加速，读写失败静默降级，**丢的是加速不是服务**」⇒ 后续关卡按需补 |
+| **D74** | 活动历史压实的写锁是**进程内**的 | Python 与 Rust 同时写同一文件时存在极小的丢行窗口 | Python 自身的锁也是进程内，同类问题；记在案 |
+| **D75** | `pricing_variant_inherit` 的键位定义 | 曾在两处各有一份 | **已修**：收口到 `crate::settings`（键名 + 语义唯一一份） |
+
+#### 本关验证数字（仓库内实测）
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --workspace` | **832 passed / 0 failed**（上一关 794 ⇒ **+38**） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 零警告 |
+| `cargo fmt --all -- --check` | FMT_OK |
+| 跨语言 parity 复核（主会话独立跑） | Rust 54 条 vs Python 去重 54 条 ⇒ **逐字逐序一致** |
+
+#### 本关遗留（未做）
+
+- **live 模型目录**（D55 的另一半）：需要「远端产品目录 + `is_chat_model` 过滤 + 变体整理」整条链路。
+- **定价表接线**：策略库（`pricing-policies.jsonl`）的读取端 + 成本估算 ⇒ 解 D68/D69，并让 `/usage` 的 `cost_cny` 可算。
+- `/usage/remaining`（D72）、ETag/checkpoint（D73）、`trigger` 精确化（D67）。
+- `/settings`、`/settings/save`、`/panel/login|logout|password` 仍缺 ⇒ 面板登录页没通。
+- 企业版积分路径（`_fetch_credits_enterprise`）未移植。
+- M3-b（`/v1/responses` 翻译 + web-tools replay）、M6（影子回放）、M7（切流）未启动。
+- `ApiPanelSink::add_log_entry` 仍是 no-op ⇒ 三个后台线程的日志进不了面板日志页。

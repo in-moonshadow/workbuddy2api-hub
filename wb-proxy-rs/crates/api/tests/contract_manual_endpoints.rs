@@ -43,7 +43,10 @@ const CONV: &str = "conv-1";
 
 fn make_cfg(dir: &TempDir) -> Arc<Config> {
     Arc::new(Config {
-        accounts_dir: dir.path().to_path_buf(),
+        // 账号目录放在 tempdir **里面**的 `accounts/`：活动历史与用量目录都
+        // 是从账号目录的**同级**目录推导的（`usage/` 与 `accounts/` 同级），
+        // 直接用 tempdir 根目录会推出 `/tmp/usage` ⇒ 测试往 tempdir 外写。
+        accounts_dir: accounts_dir(dir.path()),
         dashboard: dir.path().to_path_buf(),
         api_key: Some("test-key".to_string()),
         upstream_base_url: None,
@@ -55,10 +58,10 @@ fn make_cfg(dir: &TempDir) -> Arc<Config> {
 /// 建账号目录：一个账号文件（`{}`）+ 可选的 `settings.json`。
 fn account_dir(daily_chat_web: Option<bool>) -> TempDir {
     let dir = TempDir::new().expect("tempdir");
-    std::fs::write(dir.path().join(ACCOUNT_NAME), "{}").expect("seed account file");
+    std::fs::write(accounts_dir(dir.path()).join(ACCOUNT_NAME), "{}").expect("seed account file");
     if let Some(flag) = daily_chat_web {
         std::fs::write(
-            dir.path().join("settings.json"),
+            accounts_dir(dir.path()).join("settings.json"),
             json!({"daily_chat_web": flag}).to_string(),
         )
         .expect("write settings");
@@ -111,7 +114,7 @@ fn manual_runtime(dir: &TempDir, base: &'static str, ready: Vec<ReadyAccount>) -
         web_base: base,
     };
     let task = TaskRuntime::new(
-        dir.path(),
+        &accounts_dir(dir.path()),
         Arc::new(ApiPanelSink),
         endpoints,
         "http://127.0.0.1:1".to_string(),
@@ -255,7 +258,7 @@ async fn manual_web_chat_does_not_write_last_daily_chat() {
     assert!(v["accounts"].is_array(), "信封要带 accounts");
 
     assert!(
-        read_last_daily_chat(dir.path()).is_none(),
+        read_last_daily_chat(&accounts_dir(dir.path())).is_none(),
         "网页通道手动打卡刻意不写 lastDailyChat（否则定时巡检会跳过当天流程）"
     );
 }
@@ -287,7 +290,7 @@ async fn manual_full_chat_writes_last_daily_chat_when_web_ok() {
     assert_eq!(results[0]["ok"], true);
 
     assert!(
-        read_last_daily_chat(dir.path()).is_some(),
+        read_last_daily_chat(&accounts_dir(dir.path())).is_some(),
         "完整手动打卡在网页腿成功时必须写 lastDailyChat（与 Python 一致）"
     );
 }
@@ -436,7 +439,7 @@ async fn manual_web_chat_failure_is_reported_in_result() {
         "失败原因要出现在 error 字段：{results:?}"
     );
     assert!(
-        read_last_daily_chat(dir.path()).is_none(),
+        read_last_daily_chat(&accounts_dir(dir.path())).is_none(),
         "失败时更不能写 lastDailyChat"
     );
 }
@@ -491,4 +494,11 @@ async fn manual_endpoints_require_api_key() {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri} 应当 401");
     }
+}
+
+/// 账号目录：tempdir 内的 `accounts/` 子目录（并建出来）。
+fn accounts_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("accounts");
+    let _ = std::fs::create_dir_all(&path);
+    path
 }

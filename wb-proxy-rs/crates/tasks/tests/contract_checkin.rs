@@ -52,7 +52,7 @@ const ACCOUNT_NAME: &str = "acct.json";
 /// 建账号文件（空 JSON 对象），返回目录句柄。
 fn account_dir() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
-    std::fs::write(dir.path().join(ACCOUNT_NAME), "{}").expect("seed account file");
+    std::fs::write(accounts_dir(dir.path()).join(ACCOUNT_NAME), "{}").expect("seed account file");
     dir
 }
 
@@ -123,7 +123,7 @@ async fn rejected_checkin_does_not_mark_done_and_stays_retryable() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -135,13 +135,18 @@ async fn rejected_checkin_does_not_mark_done_and_stays_retryable() {
     assert_eq!(out.msg.as_deref(), Some("risk control"));
     // R4 核心：不写盘
     assert_eq!(
-        read_last_checkin(dir.path()),
+        read_last_checkin(&accounts_dir(dir.path())),
         None,
         "失败不得写 lastCheckin"
     );
     // 可重试性
     assert!(
-        can_checkin("cn", false, read_last_checkin(dir.path()).as_deref(), TODAY),
+        can_checkin(
+            "cn",
+            false,
+            read_last_checkin(&accounts_dir(dir.path())).as_deref(),
+            TODAY
+        ),
         "签到失败后当天必须仍可重试"
     );
 
@@ -171,7 +176,7 @@ async fn successful_checkin_persists_today() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -183,7 +188,7 @@ async fn successful_checkin_persists_today() {
     assert_eq!(out.data, Some(json!({"reward": 10})));
     assert_eq!(out.persist_error, None);
     assert_eq!(
-        read_last_checkin(dir.path()).as_deref(),
+        read_last_checkin(&accounts_dir(dir.path())).as_deref(),
         Some("2026-10-17 09:00:00"),
         "成功后写入本地时间戳"
     );
@@ -191,7 +196,7 @@ async fn successful_checkin_persists_today() {
     assert!(!can_checkin(
         "cn",
         false,
-        read_last_checkin(dir.path()).as_deref(),
+        read_last_checkin(&accounts_dir(dir.path())).as_deref(),
         TODAY
     ));
 }
@@ -212,7 +217,7 @@ async fn code_10001_on_200_counts_as_success() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -222,7 +227,7 @@ async fn code_10001_on_200_counts_as_success() {
     assert!(out.ok);
     assert_eq!(out.code, Some(10001));
     assert_eq!(
-        read_last_checkin(dir.path()).as_deref(),
+        read_last_checkin(&accounts_dir(dir.path())).as_deref(),
         Some("2026-10-17 09:00:00")
     );
 }
@@ -247,7 +252,7 @@ async fn http_400_already_checked_in_counts_as_success() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -256,7 +261,7 @@ async fn http_400_already_checked_in_counts_as_success() {
 
     assert!(out.ok, "「今天已签到」代表今天已完成，应判成功");
     assert_eq!(
-        read_last_checkin(dir.path()).as_deref(),
+        read_last_checkin(&accounts_dir(dir.path())).as_deref(),
         Some("2026-10-17 09:00:00")
     );
 }
@@ -277,7 +282,7 @@ async fn http_400_other_message_is_rejection() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -287,7 +292,11 @@ async fn http_400_other_message_is_rejection() {
     assert!(!out.ok);
     assert_eq!(out.code, Some(400));
     assert_eq!(out.error.as_deref(), Some("bad request"));
-    assert_eq!(read_last_checkin(dir.path()), None, "HTTP 失败不得写盘");
+    assert_eq!(
+        read_last_checkin(&accounts_dir(dir.path())),
+        None,
+        "HTTP 失败不得写盘"
+    );
     assert!(can_checkin("cn", false, None, TODAY));
 }
 
@@ -323,7 +332,7 @@ async fn network_failure_does_not_mark_done() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -335,7 +344,11 @@ async fn network_failure_does_not_mark_done() {
     assert!(!out.ok, "网络失败不得判成功");
     assert_eq!(out.code, None, "无响应时不应有 code");
     assert!(out.error.is_some(), "应带 error 文案");
-    assert_eq!(read_last_checkin(dir.path()), None, "网络失败不得写盘");
+    assert_eq!(
+        read_last_checkin(&accounts_dir(dir.path())),
+        None,
+        "网络失败不得写盘"
+    );
     assert!(can_checkin("cn", false, None, TODAY));
 }
 
@@ -352,7 +365,7 @@ async fn http_error_with_non_json_body_is_rejection() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -362,7 +375,7 @@ async fn http_error_with_non_json_body_is_rejection() {
     assert!(!out.ok);
     assert_eq!(out.code, None);
     assert_eq!(out.error.as_deref(), Some("HTTP 502"));
-    assert_eq!(read_last_checkin(dir.path()), None);
+    assert_eq!(read_last_checkin(&accounts_dir(dir.path())), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,7 +401,7 @@ async fn persist_failure_keeps_ok_true_and_reports_error() {
     let dir = TempDir::new().expect("tempdir");
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -404,7 +417,7 @@ async fn persist_failure_keeps_ok_true_and_reports_error() {
     assert_eq!(j["ok"], true);
     assert!(j.get("persist_error").is_some());
     assert_eq!(
-        read_last_checkin(dir.path()),
+        read_last_checkin(&accounts_dir(dir.path())),
         None,
         "文件不存在，自然读不到"
     );
@@ -420,7 +433,7 @@ async fn guards_reject_without_touching_upstream() {
     let server = MockServer::start().await;
     let dir = account_dir();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -454,7 +467,7 @@ async fn guards_reject_without_touching_upstream() {
             .is_empty(),
         "守卫命中时不得发任何上游请求"
     );
-    assert_eq!(read_last_checkin(dir.path()), None);
+    assert_eq!(read_last_checkin(&accounts_dir(dir.path())), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +488,7 @@ async fn checkin_uses_billing_headers() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: Some("dev-token"),
@@ -573,7 +586,7 @@ async fn report_activity_writes_timestamp_and_returns_streak() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -585,7 +598,7 @@ async fn report_activity_writes_timestamp_and_returns_streak() {
     assert_eq!(out["streak_days"], 7);
     assert_eq!(out["msg"], "对话活跃上报成功（连续打卡 7 天）");
     assert_eq!(
-        read_last_activity_report(dir.path()).as_deref(),
+        read_last_activity_report(&accounts_dir(dir.path())).as_deref(),
         Some("2026-10-17 09:00:00")
     );
 }
@@ -608,7 +621,7 @@ async fn report_activity_survives_streak_failure() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -620,7 +633,7 @@ async fn report_activity_survives_streak_failure() {
     assert_eq!(out["msg"], "对话活跃上报成功（连登天数未知）");
     assert!(out.get("streak_days").is_none(), "未知时不得编造天数");
     assert_eq!(
-        read_last_activity_report(dir.path()).as_deref(),
+        read_last_activity_report(&accounts_dir(dir.path())).as_deref(),
         Some("2026-10-17 09:00:00")
     );
 }
@@ -646,7 +659,7 @@ async fn report_activity_reports_zero_streak_explicitly() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -675,7 +688,7 @@ async fn report_activity_rejection_does_not_persist() {
     let dir = account_dir();
     let acc = cn_account();
     let ctx = CheckinCtx {
-        dir: dir.path(),
+        dir: &accounts_dir(dir.path()),
         account_name: ACCOUNT_NAME,
         clock: &FixedClock,
         device_token: None,
@@ -686,9 +699,20 @@ async fn report_activity_rejection_does_not_persist() {
     assert_eq!(out["ok"], false);
     assert_eq!(out["error"], "活跃上报被上游拒绝（未返回 code=0）");
     assert_eq!(
-        read_last_activity_report(dir.path()),
+        read_last_activity_report(&accounts_dir(dir.path())),
         None,
         "上报失败不得写 lastActivityReport"
     );
     assert!(can_report_activity("cn", false, None, TODAY));
+}
+
+/// 账号目录：tempdir 内的 `accounts/` 子目录（并建出来）。
+///
+/// 活动历史与用量目录都是从**账号目录的同级**目录推导的（`usage/` 与
+/// `accounts/` 同级，对齐 Python `wb_proxy.py:402-403`）。直接用 tempdir 根
+/// 目录 ⇒ 同级目录变成 `/tmp` ⇒ 测试会往 tempdir 外面写（`/tmp/usage`）。
+fn accounts_dir(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("accounts");
+    let _ = std::fs::create_dir_all(&path);
+    path
 }
