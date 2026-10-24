@@ -345,11 +345,20 @@ pub fn read_settings(accounts_dir: &Path) -> Result<serde_json::Value, StorageEr
 
 /// 把 `patch` 的**顶层键**合并进 settings.json 并原子落盘。
 ///
-/// 合并语义是**浅合并**（顶层键覆盖，未提到的键原样保留）——与 Python
-/// `wb_settings` 的保存口径一致；`patch` 里非对象的值按整体替换处理。
+/// 合并语义是**浅合并**（顶层键覆盖，未提到的键原样保留）；`patch` 里非对象的
+/// 值按整体替换处理。
 ///
-/// 与 `read_settings` 的**宽容度相反**：settings.json 已存在但 JSON 损坏时
-/// **报错、不写**——否则这一写就会把用户其余设置连同损坏内容一起抹掉。
+/// ## 与 [`replace_settings`] 的口径差异（两个都留着，按需选择）
+///
+/// | | [`write_settings`] | [`replace_settings`] |
+/// |---|---|---|
+/// | 写入口径 | **浅合并**：只覆盖 `patch` 里出现的顶层键，其余键原样保留 | **整体替换**：文件内容 = `value` |
+/// | 坏 JSON | **报错、不写**（保护用户其余设置） | **宽容读**：坏 JSON 当空对象，用新数据**覆盖**掉损坏文件 |
+/// | 删键 | 做不到（写 `null` 只是置空，不是删） | 天然可以（读出来 → 删 → 整体写回） |
+/// | 对应 Python | 无直接对应（Python 的 `save()` 是整体替换） | `wb_settings.save()`（`wb_settings.py:163-175`） |
+///
+/// ⇒ **要「整体替换 / 能删键 / 与 Python 口径一致」就用 [`replace_settings`]**；
+/// 「只想改一两个键、又不想在文件损坏时丢数据」才用 [`write_settings`]。
 pub fn write_settings(accounts_dir: &Path, patch: &serde_json::Value) -> Result<(), StorageError> {
     let path = accounts_dir.join("settings.json");
     let mut map = match read_json(&path)? {
@@ -362,6 +371,55 @@ pub fn write_settings(accounts_dir: &Path, patch: &serde_json::Value) -> Result<
             map.insert(key.clone(), value.clone());
         }
     }
+    write_json_atomic(&path, serde_json::Value::Object(map))
+}
+
+/// **整体替换** settings.json（Python `wb_settings.save()` 的等价物）。
+///
+/// ## 语义（逐条对齐 Python `wb_settings.save()` `wb_settings.py:163-175`）
+///
+/// 1. **宽容读**：先按 [`read_settings`] 的口径把现有文件读进来——文件缺失 /
+///    内容为空 / 不是一个 JSON 对象 / **JSON 损坏**，一律当作**空对象**，不报错。
+/// 2. **整体替换**：落盘的内容 = 传入的 `value`（顶层键**全部**以新值为准，
+///    调用方没提到的键**不会**被保留）。
+/// 3. **原子写**：同目录 temp + `rename`，格式 `indent(2)`（与 Python 的
+///    `json.dump(..., indent=2)` 一致）。
+/// 4. **自动建目录**：accounts 目录不存在时先创建（Python 的
+///    `os.makedirs(accounts_dir, exist_ok=True)`）——全新安装第一次保存也要能落盘。
+///
+/// ## 为什么要有它（而不是把 `write_settings` 改掉）
+///
+/// Python 的保存口径是「读出来 → 改 → 整份写回」，因此：
+///
+/// - **能删键**：Python `set_panel_password()` 在口令回到默认值时会
+///   `pop("panel_password_salt")` / `pop("panel_password_rounds")`。浅合并做不到
+///   「删键」（写 `null` 只是置空），整体替换天然可以。
+/// - **坏 JSON 会被覆盖**：Python `load()` 对损坏的 JSON 静默当空对象，于是
+///   下一次保存会用新数据**覆盖掉**整个损坏文件。Rust 侧的
+///   [`write_settings`] 反其道而行（坏 JSON 报错拒绝写），是为了保护用户
+///   其余设置——两套口径都保留，由调用方按需选择。
+///
+/// `value` 不是 JSON 对象时按**空对象**处理（写出一个 `{}`）——Python 的
+/// `save()` 只会写 dict，不会出现这种情况。
+pub fn replace_settings(
+    accounts_dir: &Path,
+    value: &serde_json::Value,
+) -> Result<(), StorageError> {
+    let path = accounts_dir.join("settings.json");
+    // 宽容读（Python `load()` 的口径）：坏 JSON / 非对象 / 缺失 ⇒ 空对象。
+    // 本函数随后**整体替换**，所以旧内容不参与结果——这一步只是把
+    // 「坏 JSON 不会让写入失败、会被新数据覆盖」这条口径显式落在代码里。
+    let _tolerated = match read_json(&path) {
+        Ok(Some(serde_json::Value::Object(map))) => map,
+        _ => serde_json::Map::new(),
+    };
+    let map = match value {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    // Python: os.makedirs(accounts_dir, exist_ok=True)
+    fs::create_dir_all(accounts_dir)
+        .map_err(|err| StorageError::Io(accounts_dir.to_path_buf(), err))?;
     write_json_atomic(&path, serde_json::Value::Object(map))
 }
 
@@ -949,5 +1007,60 @@ mod tests {
         .unwrap();
         let snap = load_snapshot(dir.path(), None, false).unwrap();
         assert!(!snap.api_key_required);
+    }
+
+    #[test]
+    fn replace_settings_overwrites_the_whole_document() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("settings.json"),
+            r#"{"ui_language":"zh","launcher_key":"keep-me"}"#,
+        )
+        .unwrap();
+        replace_settings(dir.path(), &serde_json::json!({"ui_language":"en"})).unwrap();
+        let doc = read_settings(dir.path()).unwrap();
+        assert_eq!(
+            doc,
+            serde_json::json!({"ui_language":"en"}),
+            "整体替换：没提到的键不保留"
+        );
+    }
+
+    #[test]
+    fn replace_settings_can_delete_a_key() {
+        // 浅合并做不到删键（写 null 只是置空）；整体替换天然可以。
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("settings.json"),
+            r#"{"panel_password_hash":"h","panel_password_salt":"s"}"#,
+        )
+        .unwrap();
+        let mut doc = read_settings(dir.path()).unwrap();
+        doc.as_object_mut().unwrap().remove("panel_password_salt");
+        replace_settings(dir.path(), &doc).unwrap();
+        let after = read_settings(dir.path()).unwrap();
+        assert!(after.get("panel_password_salt").is_none());
+        assert_eq!(after["panel_password_hash"], serde_json::json!("h"));
+    }
+
+    #[test]
+    fn replace_settings_overwrites_a_broken_file_instead_of_failing() {
+        // Python 的口径：load() 对损坏的 JSON 静默当空对象 ⇒ 下一次保存会用
+        // 新数据把损坏的文件整个覆盖掉。
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings.json"), "{ not json").unwrap();
+        replace_settings(dir.path(), &serde_json::json!({"ui_language":"en"})).unwrap();
+        assert_eq!(
+            read_settings(dir.path()).unwrap(),
+            serde_json::json!({"ui_language":"en"})
+        );
+    }
+
+    #[test]
+    fn replace_settings_creates_the_accounts_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("accounts");
+        replace_settings(&nested, &serde_json::json!({"ui_language":"zh"})).unwrap();
+        assert!(nested.join("settings.json").exists());
     }
 }

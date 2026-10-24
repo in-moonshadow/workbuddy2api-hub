@@ -21,6 +21,14 @@ futures-core = "0.3"
 # 非流式路径要读上游 SSE body 再聚合（对齐 Python _chat_nonstream_response）：
 # Outcome::Served 带的是 reqwest::Response，api 层需能具名其类型。
 reqwest = { version = "0.12", default-features = false }
+# 面板口令：PBKDF2-HMAC-SHA256，摘要必须与 Python wb_settings._digest 逐字节
+# 一致（sha2 提供 SHA-256，pbkdf2 的 hmac 特性提供 PBKDF2-HMAC 构造）。
+pbkdf2 = { version = "0.13", features = ["sha2"] }
+sha2 = "0.11"
+# 摘要恒定时间比较（对齐 Python hmac.compare_digest）。
+subtle = "2"
+# 可信代理的 IP / CIDR 解析（对齐 Python ipaddress.ip_network）。
+ipnet = "2"
 wb-storage = { path = "../storage" }
 wb-identity = { path = "../identity" }
 wb-gateway = { path = "../gateway" }

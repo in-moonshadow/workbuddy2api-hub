@@ -42,11 +42,9 @@ async fn unauthorized_returns_401() {
         "http://127.0.0.1:1".to_string(),
         None,
     );
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let _token = panels.create();
+    let app = app_with(cfg, panels, task);
     for path in ["/tasks", "/scheduler"] {
         let req = Request::builder().uri(path).body(Body::empty()).unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -65,15 +63,15 @@ async fn invalid_body_returns_400() {
         "http://127.0.0.1:1".to_string(),
         None,
     );
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(cfg, panels, task);
     let req = Request::builder()
         .method("POST")
         .uri("/tasks/run")
         .header("authorization", "Bearer test-key")
+        .header("x-panel-token", token.as_str())
+        .header("x-panel-token", token.as_str())
         .header("content-type", "application/json")
         .body(Body::from("not json"))
         .unwrap();
@@ -92,14 +90,14 @@ async fn tasks_get_empty_pool_returns_msg() {
         "http://127.0.0.1:1".to_string(),
         None,
     );
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(cfg, panels, task);
     let req = Request::builder()
         .uri("/tasks")
         .header("authorization", "Bearer test-key")
+        .header("x-panel-token", token.as_str())
+        .header("x-panel-token", token.as_str())
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -120,14 +118,14 @@ async fn scheduler_get_returns_enabled_field() {
         "http://127.0.0.1:1".to_string(),
         None,
     );
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(cfg, panels, task);
     let req = Request::builder()
         .uri("/scheduler")
         .header("authorization", "Bearer test-key")
+        .header("x-panel-token", token.as_str())
+        .header("x-panel-token", token.as_str())
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -148,15 +146,15 @@ async fn claim_all_empty_pool_returns_ok() {
         "http://127.0.0.1:1".to_string(),
         None,
     );
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(cfg, panels, task);
     let req = Request::builder()
         .method("POST")
         .uri("/tasks/claim-all")
         .header("authorization", "Bearer test-key")
+        .header("x-panel-token", token.as_str())
+        .header("x-panel-token", token.as_str())
         .header("content-type", "application/json")
         .body(Body::from(json!({}).to_string()))
         .unwrap();
@@ -241,7 +239,7 @@ fn streak_runtime(
     task
 }
 
-fn streak_req(uid: Option<&str>) -> Request<Body> {
+fn streak_req(uid: Option<&str>, panel_token: &str) -> Request<Body> {
     let body = match uid {
         Some(uid) => json!({"uid": uid}),
         None => json!({}),
@@ -250,6 +248,7 @@ fn streak_req(uid: Option<&str>) -> Request<Body> {
         .method("POST")
         .uri("/tasks/streak-bonus")
         .header("authorization", "Bearer test-key")
+        .header("x-panel-token", panel_token)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -372,12 +371,10 @@ fn streak_account_split_realm(
 async fn streak_bonus_route_empty_pool_msg() {
     let dir = TempDir::new().unwrap();
     let task = streak_runtime(&dir, "http://127.0.0.1:1", true, vec![]);
-    let app = app_with(
-        make_cfg(&dir),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
-    let resp = app.oneshot(streak_req(None)).await.unwrap();
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(make_cfg(&dir), panels, task);
+    let resp = app.oneshot(streak_req(None, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&body).unwrap();
@@ -390,12 +387,10 @@ async fn streak_bonus_route_empty_pool_msg() {
 async fn streak_bonus_route_pool_unavailable() {
     let dir = TempDir::new().unwrap();
     let task = streak_runtime(&dir, "http://127.0.0.1:1", false, vec![]);
-    let app = app_with(
-        make_cfg(&dir),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
-    let resp = app.oneshot(streak_req(None)).await.unwrap();
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(make_cfg(&dir), panels, task);
+    let resp = app.oneshot(streak_req(None, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&body).unwrap();
@@ -408,12 +403,13 @@ async fn streak_bonus_route_pool_unavailable() {
 async fn streak_bonus_route_uid_not_found() {
     let dir = TempDir::new().unwrap();
     let task = streak_runtime(&dir, "http://127.0.0.1:1", true, vec![]);
-    let app = app_with(
-        make_cfg(&dir),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
-    let resp = app.oneshot(streak_req(Some("ghost"))).await.unwrap();
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(make_cfg(&dir), panels, task);
+    let resp = app
+        .oneshot(streak_req(Some("ghost"), &token))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&body).unwrap();
@@ -439,12 +435,10 @@ async fn streak_bonus_route_uid_filters_cn_enabled() {
         streak_account("u-cn-off", "cn-off-tok", "cn", false),
     ];
     let task = streak_runtime(&dir, base, true, ready);
-    let app = app_with(
-        make_cfg(&dir),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
-    let resp = app.oneshot(streak_req(None)).await.unwrap();
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(make_cfg(&dir), panels, task);
+    let resp = app.oneshot(streak_req(None, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&body).unwrap();
@@ -487,12 +481,10 @@ async fn streak_bonus_route_single_success() {
         true,
         vec![streak_account("u-streak", "streak-tok", "cn", true)],
     );
-    let app = app_with(
-        make_cfg(&dir),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
-    let resp = app.oneshot(streak_req(None)).await.unwrap();
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(make_cfg(&dir), panels, task);
+    let resp = app.oneshot(streak_req(None, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&body).unwrap();
@@ -528,12 +520,10 @@ async fn streak_bonus_route_upstream_failure_keeps_ok_true() {
         streak_account("u-fail", "fail-tok", "cn", true),
     ];
     let task = streak_runtime(&dir, base, true, ready);
-    let app = app_with(
-        make_cfg(&dir),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
-    let resp = app.oneshot(streak_req(None)).await.unwrap();
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(make_cfg(&dir), panels, task);
+    let resp = app.oneshot(streak_req(None, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&body).unwrap();
@@ -570,12 +560,10 @@ async fn streak_bonus_route_partial_failure() {
         streak_account_split_realm("u-gate", "gate-tok", "cn", "intl", true),
     ];
     let task = streak_runtime(&dir, base, true, ready);
-    let app = app_with(
-        make_cfg(&dir),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    );
-    let resp = app.oneshot(streak_req(None)).await.unwrap();
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(make_cfg(&dir), panels, task);
+    let resp = app.oneshot(streak_req(None, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&body).unwrap();

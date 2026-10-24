@@ -41,8 +41,15 @@ fn runtime(dir: &TempDir) -> Arc<TaskRuntime> {
     )
 }
 
-async fn get_json(app: axum::Router, uri: &str, with_key: bool) -> (StatusCode, Value) {
-    let mut builder = Request::builder().uri(uri);
+async fn get_json(
+    app: axum::Router,
+    uri: &str,
+    with_key: bool,
+    panel_token: &str,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .uri(uri)
+        .header("x-panel-token", panel_token);
     if with_key {
         builder = builder.header("authorization", "Bearer test-key");
     }
@@ -62,13 +69,11 @@ async fn get_json(app: axum::Router, uri: &str, with_key: bool) -> (StatusCode, 
 async fn pricing_and_updates_require_auth() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        runtime(&dir),
-    );
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let _token = panels.create();
+    let app = app_with(cfg, panels, runtime(&dir));
     for uri in ["/pricing", "/updates"] {
-        let (status, _) = get_json(app.clone(), uri, false).await;
+        let (status, _) = get_json(app.clone(), uri, false, "").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} 未鉴权应 401");
     }
 }
@@ -77,12 +82,10 @@ async fn pricing_and_updates_require_auth() {
 async fn pricing_status_has_the_python_keys() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        runtime(&dir),
-    );
-    let (status, body) = get_json(app, "/pricing", true).await;
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(cfg, panels, runtime(&dir));
+    let (status, body) = get_json(app, "/pricing", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     for key in [
         "interval_minutes",
@@ -100,12 +103,10 @@ async fn pricing_status_has_the_python_keys() {
 async fn updates_status_has_the_ten_python_keys() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        runtime(&dir),
-    );
-    let (status, body) = get_json(app, "/updates", true).await;
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(cfg, panels, runtime(&dir));
+    let (status, body) = get_json(app, "/updates", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     for key in [
         "current_version",

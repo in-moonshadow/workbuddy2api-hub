@@ -48,17 +48,17 @@ fn make_task(cfg: &Arc<Config>) -> Arc<TaskRuntime> {
     )
 }
 
-fn make_app(cfg: &Arc<Config>) -> Router {
-    app_with(
-        cfg.clone(),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        make_task(cfg),
-    )
+fn make_app(cfg: &Arc<Config>) -> (Router, String) {
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    (app_with(cfg.clone(), panels, make_task(cfg)), token)
 }
 
 /// 发一次 GET，返回 (状态码, 解析后的 JSON)。
-async fn get(app: &Router, path: &str, with_key: bool) -> (StatusCode, Value) {
-    let mut builder = Request::builder().uri(path);
+async fn get(app: &Router, path: &str, with_key: bool, panel_token: &str) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .uri(path)
+        .header("x-panel-token", panel_token);
     if with_key {
         builder = builder.header("authorization", format!("Bearer {API_KEY}"));
     }
@@ -101,9 +101,9 @@ fn usage_dir(cfg: &Config) -> PathBuf {
 async fn usage_routes_require_auth() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, _token) = make_app(&cfg);
     for path in ["/usage", "/usage/by-account", "/usage/analytics"] {
-        let (status, body) = get(&app, path, false).await;
+        let (status, body) = get(&app, path, false, "").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 未鉴权应回 401");
         // 401 走 OpenAI 信封（对齐 `/scheduler` 的鉴权模式）。
         assert_eq!(body["error"]["code"], 401);
@@ -114,10 +114,10 @@ async fn usage_routes_require_auth() {
 async fn usage_get_returns_empty_aggregate_when_log_missing() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
     // 用量目录压根不存在。
     assert!(!usage_dir(&cfg).exists());
-    let (status, body) = get(&app, "/usage", true).await;
+    let (status, body) = get(&app, "/usage", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_requests"], 0);
     assert_eq!(body["requests"], 0);
@@ -130,19 +130,19 @@ async fn usage_get_returns_empty_aggregate_when_log_missing() {
 async fn usage_get_returns_empty_aggregate_when_log_file_missing() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
     // 目录在、日志不在。
     std::fs::create_dir_all(usage_dir(&cfg)).unwrap();
-    let (status, body) = get(&app, "/usage", true).await;
+    let (status, body) = get(&app, "/usage", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_requests"], 0);
     assert!(body["by_model"].as_object().unwrap().is_empty());
 
-    let (status, body) = get(&app, "/usage/by-account", true).await;
+    let (status, body) = get(&app, "/usage/by-account", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["accounts"].as_array().unwrap().is_empty());
 
-    let (status, body) = get(&app, "/usage/analytics", true).await;
+    let (status, body) = get(&app, "/usage/analytics", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["by_date"].as_object().unwrap().is_empty());
 }
@@ -169,14 +169,14 @@ async fn usage_get_counts_appended_rows() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m1", "a1", 10, "2026-10-21 10:00:00"))
         .unwrap();
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m2", "a2", 30, "2026-10-21 10:01:00"))
         .unwrap();
 
-    let (status, body) = get(&app, "/usage", true).await;
+    let (status, body) = get(&app, "/usage", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_requests"], 2);
     assert_eq!(body["requests"], 2);
@@ -192,7 +192,7 @@ async fn usage_by_account_groups_by_account() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m1", "a1", 10, "2026-10-21 10:00:00"))
         .unwrap();
@@ -201,7 +201,7 @@ async fn usage_by_account_groups_by_account() {
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m2", "a2", 100, "2026-10-21 10:02:00"))
         .unwrap();
 
-    let (status, body) = get(&app, "/usage/by-account", true).await;
+    let (status, body) = get(&app, "/usage/by-account", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     let accounts = body["accounts"].as_array().unwrap();
     assert_eq!(accounts.len(), 2);
@@ -223,7 +223,7 @@ async fn usage_analytics_groups_by_date() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m1", "a1", 10, "2026-10-21 10:00:00"))
         .unwrap();
@@ -232,7 +232,7 @@ async fn usage_analytics_groups_by_date() {
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m1", "a1", 30, "2026-10-22 01:00:00"))
         .unwrap();
 
-    let (status, body) = get(&app, "/usage/analytics", true).await;
+    let (status, body) = get(&app, "/usage/analytics", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["by_date"]["2026-10-21"]["requests"], 2);
     assert_eq!(body["by_date"]["2026-10-21"]["total_tokens"], 30);
@@ -248,7 +248,7 @@ async fn failed_rows_are_counted_as_errors_not_requests() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     let mut failed = ok_row("m1", "a1", 10, "2026-10-21 10:00:00");
     failed["outcome"] = json!("failed");
@@ -258,7 +258,7 @@ async fn failed_rows_are_counted_as_errors_not_requests() {
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m1", "a1", 10, "2026-10-21 10:01:00"))
         .unwrap();
 
-    let (status, body) = get(&app, "/usage", true).await;
+    let (status, body) = get(&app, "/usage", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["requests"], 1);
     assert_eq!(body["errors"], 1);
@@ -354,7 +354,7 @@ async fn openai_chat_appends_one_usage_row() {
     let dir = TempDir::new().unwrap();
     let server = chat_fixture(&dir, "intl").await;
     let cfg = chat_cfg(&dir, &server.uri());
-    let app = make_app(&cfg);
+    let (app, _token) = make_app(&cfg);
 
     let (status, _) = post_json(
         &app,
@@ -387,7 +387,7 @@ async fn anthropic_chat_appends_one_usage_row() {
     let dir = TempDir::new().unwrap();
     let server = chat_fixture(&dir, "intl").await;
     let cfg = chat_cfg(&dir, &server.uri());
-    let app = make_app(&cfg);
+    let (app, _token) = make_app(&cfg);
 
     let (status, _) = post_json(
         &app,
@@ -429,7 +429,7 @@ async fn failed_chat_still_appends_an_error_row() {
     std::fs::create_dir_all(&accounts).unwrap();
     std::fs::write(accounts.join("acc-1.json"), account_doc("intl")).unwrap();
     let cfg = chat_cfg(&dir, &server.uri());
-    let app = make_app(&cfg);
+    let (app, _token) = make_app(&cfg);
 
     let (status, _) = post_json(
         &app,
@@ -453,7 +453,7 @@ async fn usage_get_filters_by_realm_like_python() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     // cn 行 + intl 行（当前 realm 是 cn）。
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m1", "a1", 10, "2026-10-21 10:00:00"))
@@ -463,19 +463,19 @@ async fn usage_get_filters_by_realm_like_python() {
     wb_tasks::usage::append_usage_row(&usage, &intl).unwrap();
 
     // 缺省 = 当前 realm（cn）⇒ 只算 cn 行（Python `_get_v1_usage` 同款）。
-    let (status, body) = get(&app, "/usage", true).await;
+    let (status, body) = get(&app, "/usage", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_requests"], 1);
     assert_eq!(body["total_tokens"], 10);
 
     // `?realm=all` ⇒ 不过滤。
-    let (status, body) = get(&app, "/usage?realm=all", true).await;
+    let (status, body) = get(&app, "/usage?realm=all", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_requests"], 2);
     assert_eq!(body["total_tokens"], 110);
 
     // `?realm=intl` ⇒ 只算 intl 行。
-    let (status, body) = get(&app, "/usage?realm=intl", true).await;
+    let (status, body) = get(&app, "/usage?realm=intl", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_requests"], 1);
     assert_eq!(body["total_tokens"], 100);
@@ -486,7 +486,7 @@ async fn usage_analytics_reports_all_realms_by_default() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     wb_tasks::usage::append_usage_row(&usage, &ok_row("m1", "a1", 10, "2026-10-21 10:00:00"))
         .unwrap();
@@ -496,13 +496,13 @@ async fn usage_analytics_reports_all_realms_by_default() {
 
     // analytics 缺省是「全 realm 合并」（Python `_get_usage_analytics` 的
     // `req_realm = ... or None`）。
-    let (status, body) = get(&app, "/usage/analytics", true).await;
+    let (status, body) = get(&app, "/usage/analytics", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["summary"]["requests"], 2);
     assert_eq!(body["summary"]["total_tokens"], 110);
 
     // by-account 也从不过滤 realm。
-    let (status, body) = get(&app, "/usage/by-account", true).await;
+    let (status, body) = get(&app, "/usage/by-account", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["accounts"].as_array().unwrap().len(), 2);
 }

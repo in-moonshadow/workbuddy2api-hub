@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -12,6 +13,11 @@ use serde_json::{json, Value};
 
 use crate::auth::{key_ok, PanelSessions};
 use crate::chat::{extract_session_key, run_chat, ChatParams, ChatRun, Upstream, UsageContext};
+use crate::config::PanelConfig;
+use crate::panel_auth::{
+    panel_password_is_default, set_panel_password, verify_panel_password, LoginLimiter,
+    DEFAULT_PANEL_PASSWORD,
+};
 use crate::Config;
 
 use wb_gateway::anthropic::{chat_to_messages, messages_to_chat};
@@ -25,6 +31,7 @@ use wb_gateway::retry::{anthropic_error_obj, Outcome};
 use wb_gateway::stream::{aggregate_stream, strip_data_prefix};
 use wb_tasks::api_routes as task_routes;
 use wb_tasks::scheduler::PanelSink;
+use wb_tasks::settings_view::{runtime_settings_view, save_settings};
 
 /// 面板会话 TTL：7 天（对齐 wb_settings.SESSION_TTL）。
 const SESSION_TTL: u64 = 7 * 24 * 3600;
@@ -80,6 +87,32 @@ const OPENAI_PATHS: [&str; 6] = [
 const ANTHROPIC_MESSAGE_PATHS: [&str; 2] = ["/v1/messages", "/messages"];
 const ANTHROPIC_COUNT_PATHS: [&str; 2] = ["/v1/messages/count_tokens", "/messages/count_tokens"];
 
+/// 面板路由前缀表（Python `wb_proxy._is_panel_route` :15661-15689，逐条照抄）。
+///
+/// **命中这些前缀的路由必须有面板会话**（`X-Panel-Token` 有效），API key
+/// **不够** —— 这是 Python 的双层门禁：外层 `_is_panel_route` 查面板会话，
+/// 内层 `_authorized()` 才放行 API key。Rust 侧对齐这个强度。
+///
+/// ⚠️ `/panel` **不在**表里（面板自己的三条认证路由自己管门禁）；
+/// `/v1/models` 也不在表里（Python 注释：模型列表只用 API key 就能访问，
+/// 好让普通 OpenAI 客户端继续发现模型）。
+///
+/// 注意 `/usage` 与 `/v1/usage` **都**在表里（Python 用
+/// `path.startswith("/usage") or path.startswith("/v1/usage")`）。
+const PANEL_ROUTE_PREFIXES: [&str; 11] = [
+    "/accounts",
+    "/usage",
+    "/v1/usage",
+    "/activity",
+    "/tasks",
+    "/scheduler",
+    "/settings",
+    "/updates",
+    "/logs",
+    "/pricing",
+    "/agents",
+];
+
 /// 聚合路由状态：配置 + 面板会话表 + 进程级上游依赖 + 并发闸。
 ///
 /// `upstream` / `gate` 必须是**进程级单例**（Python 侧 `POOL`/`DEGRADE`/闸都是
@@ -91,6 +124,13 @@ struct AppState {
     upstream: Arc<Upstream>,
     gate: Arc<ConcurrencyGate>,
     task: Arc<task_routes::TaskRuntime>,
+    /// 面板可调项（退避时长、可信代理网段）。
+    panel_cfg: Arc<PanelConfig>,
+    /// 登录限流器（Python 的模块全局 `_login_attempts`）。
+    ///
+    /// 进程级单例：跨请求共享失败计数，所以必须是 `AppState` 的一部分而不是
+    /// handler 的局部变量。
+    login_limiter: Arc<LoginLimiter>,
 }
 
 impl AppState {
@@ -104,6 +144,7 @@ impl AppState {
         cfg: Arc<Config>,
         panels: Arc<PanelSessions>,
         task: Arc<task_routes::TaskRuntime>,
+        panel_cfg: PanelConfig,
     ) -> Self {
         let accounts: Vec<wb_gateway::pool::AccountState> =
             match wb_storage::pool_accounts(&cfg.accounts_dir) {
@@ -133,6 +174,8 @@ impl AppState {
             upstream,
             gate,
             task,
+            panel_cfg: Arc::new(panel_cfg),
+            login_limiter: Arc::new(LoginLimiter::new()),
         }
     }
 }
@@ -186,12 +229,30 @@ pub fn app_with(
     panels: Arc<PanelSessions>,
     task: Arc<task_routes::TaskRuntime>,
 ) -> Router {
-    let state = AppState::build(cfg, panels, task);
+    app_with_config(cfg, panels, task, PanelConfig::from_env())
+}
+
+/// 同 [`app_with`]，但可注入面板可调项。
+///
+/// 契约测试用它在**不**等 0.5 秒退避的前提下跑登录失败用例（生产口径的
+/// 退避时长由 [`PanelConfig::from_env`] 给默认值）。
+pub fn app_with_config(
+    cfg: Arc<Config>,
+    panels: Arc<PanelSessions>,
+    task: Arc<task_routes::TaskRuntime>,
+    panel_cfg: PanelConfig,
+) -> Router {
+    let state = AppState::build(cfg, panels, task, panel_cfg);
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/", get(dashboard))
         .route("/realm", get(realm_get).post(realm_post))
         .route("/panel/status", get(panel_status).options(preflight))
+        .route("/panel/login", post(panel_login).options(preflight))
+        .route("/panel/logout", post(panel_logout).options(preflight))
+        .route("/panel/password", post(panel_password).options(preflight))
+        .route("/settings", get(settings_get).options(preflight))
+        .route("/settings/save", post(settings_save).options(preflight))
         .route(
             "/accounts/checkin",
             post(accounts_checkin).options(preflight),
@@ -351,6 +412,76 @@ fn anthropic_error(code: u16, message: &str, err_type: &str) -> Response {
 /// 失败时 401 信封在两协议族下形状不同。
 fn unauthorized(headers: &HeaderMap, params: &HashMap<String, String>, state: &AppState) -> bool {
     !key_ok(headers, params, &state.cfg, &state.panels)
+}
+
+// ---------------------------------------------------------------------------
+// 面板路由的双层门禁（对齐 Python `wb_proxy.py:15709` + `:18318`）
+// ---------------------------------------------------------------------------
+
+/// 取 `X-Panel-Token`（Python `_panel_token` :15655-15658）。
+fn panel_token(headers: &HeaderMap) -> String {
+    headers
+        .get("x-panel-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// 面板会话是否有效（Python `_panel_ok` :15660：`PANEL.valid(token)`）。
+fn panel_session_ok(headers: &HeaderMap, state: &AppState) -> bool {
+    state.panels.valid(&panel_token(headers))
+}
+
+/// 是否命中面板路由前缀表（Python `_is_panel_route` :15661-15689，逐条照抄）。
+fn is_panel_route(path: &str) -> bool {
+    PANEL_ROUTE_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+/// 面板路由是否需要 401（Python 外层门禁 :15709 / :18318）。
+///
+/// 命中面板前缀**且**面板会话无效 ⇒ 需要 401「panel password required」。
+/// 注意：**光有 API key 不算通过** —— 这正是 Python 的双层语义，
+/// 外层只看面板会话。
+fn panel_required(path: &str, headers: &HeaderMap, state: &AppState) -> bool {
+    is_panel_route(path) && !panel_session_ok(headers, state)
+}
+
+/// 面板路由的 401 信封（Python `_error(401, "panel password required",
+/// "invalid_request_error")`）。
+///
+/// ⚠️ 与模型接口的 401（`"invalid api key - …"`）是**两套文案**，不能混用：
+/// 面板路由的 401 说的是「缺面板口令」，模型接口的 401 说的是「key 不对」。
+fn panel_unauthorized() -> Response {
+    openai_error(401, "panel password required", "invalid_request_error")
+}
+
+/// 面板路由的双层门禁：外层面板会话 + 内层 `_authorized()`。
+///
+/// 返回 `Some(response)` 表示应当拒绝请求。
+///
+/// - 外层：命中面板前缀但面板会话无效 ⇒ 401「panel password required」。
+/// - 内层：`_authorized()`（API key 或面板会话）失败 ⇒ 401「invalid api key」。
+///   外层已挡住「只有 API key」的情况，所以内层实际是兜底。
+fn panel_gate(
+    path: &str,
+    headers: &HeaderMap,
+    params: &HashMap<String, String>,
+    state: &AppState,
+) -> Option<Response> {
+    if panel_required(path, headers, state) {
+        return Some(panel_unauthorized());
+    }
+    if unauthorized(headers, params, state) {
+        return Some(openai_error(
+            401,
+            &format!("invalid api key - {}", auth_hint(state)),
+            "invalid_request_error",
+        ));
+    }
+    None
 }
 
 /// 并发闸应答（Python `do_POST` 超限分支）：Anthropic 用 `overloaded_error`，
@@ -1203,28 +1334,311 @@ async fn panel_status(State(state): State<AppState>, headers: HeaderMap) -> Resp
     .into_response()
 }
 
-/// 面板密码是否还是默认值（对齐 Python `wb_settings.panel_password_is_default`）。
+// ---------------------------------------------------------------------------
+// 面板认证三条路由 + 设置两条路由（对齐 Python `wb_proxy.py:17032 _handle_panel`
+// 与 `:16112 _get_settings` / `:16401 _handle_settings_save`）
+// ---------------------------------------------------------------------------
+
+/// 面板路由的请求体解析（Python `_read_payload` + `_payload_or_error`）。
 ///
-/// settings.json 里没有 `panel_password_hash` ⇒ 从没改过 ⇒ 仍是默认值；改过之后
-/// 只有 `panel_password_default == true` 才算「还是默认」。
-fn panel_password_is_default(accounts_dir: &std::path::Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(accounts_dir.join("settings.json")) else {
-        return true;
-    };
-    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
-        return true;
-    };
-    let Some(obj) = doc.as_object() else {
-        return true;
-    };
-    let hash = obj
-        .get("panel_password_hash")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if hash.is_empty() {
-        return true;
+/// - 空体 ⇒ `{}`（Python `:16298`：`raw = ... if length else "{}"`）。
+/// - 坏 JSON ⇒ 400 `"invalid JSON body"`（Python `:16331-16333`，**逐字**）。
+/// - **非对象** JSON（数组/标量）⇒ `{}`（Python `:16323-16328`：`allow_list=False`
+///   时非 dict 一律返回 `{}`，不报错）。
+fn panel_payload(body: &Bytes) -> Result<Value, Box<Response>> {
+    if body.is_empty() {
+        return Ok(json!({}));
     }
-    obj.get("panel_password_default").and_then(Value::as_bool) == Some(true)
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) if value.is_object() => Ok(value),
+        Ok(_) => Ok(json!({})),
+        Err(_) => Err(Box::new(openai_error(
+            400,
+            "invalid JSON body",
+            "invalid_request_error",
+        ))),
+    }
+}
+
+/// Python `str(payload.get(key) or "")` 的等价物。
+///
+/// Python 的 `or ""` 把 `None` / `False` / `0` / `""` 归一成空串，其余按
+/// `str()` 转文本（`True` → `"True"`，数字 → 十进制文本）。
+fn python_str(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Bool(flag)) => {
+            if *flag {
+                "True".to_string()
+            } else {
+                String::new()
+            }
+        }
+        Some(Value::Number(number)) => {
+            if number.as_f64() == Some(0.0) {
+                String::new()
+            } else {
+                number.to_string()
+            }
+        }
+        // 数组/对象当口令没有意义；Python 的 `str()` 给的是 Python repr，
+        // 这里给 JSON 文本（行为不同但两种情况下都会被口令校验拒绝）。
+        Some(other) => other.to_string(),
+    }
+}
+
+/// 面板登录（Python `_handle_panel` 的 `/panel/login` 分支 `:17036-17064`）。
+///
+/// 语义逐条照抄：
+/// - **先限流后验口令**：窗口 60s 内同一 IP 已有 5 次失败 ⇒ 直接 429，
+///   不验口令、**不**再计数（Python `:17042-17047`）。
+/// - 口令错 ⇒ 记一次失败 + 退避 0.5s 再回 401（Python `:17049-17057`）。
+///   Rust 侧退避用 `tokio::time::sleep`，不占 worker 线程。
+/// - 口令对 ⇒ 清零该 IP 的失败计数 + 发新 token（Python `:17058-17064`）。
+async fn panel_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    body: Bytes,
+) -> Response {
+    let payload = match panel_payload(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    // 限流键不能直接取对端地址：反代后对端是代理本身（Python
+    // `login_rate_limit_key` :380-397）。拿不到对端地址时退化成 `"unknown"`
+    // —— 此时所有这类客户端共用一个限流桶（保守方向：更容易被限流）。
+    let peer_ip = peer
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let client_key = LoginLimiter::client_key(&peer_ip, &headers, &state.panel_cfg.trusted_proxies);
+    let now = now_secs();
+    if let Some(wait) = state.login_limiter.is_blocked(&client_key, now) {
+        return openai_error(
+            429,
+            &format!("too many login attempts, please wait {wait}s"),
+            "rate_limit_error",
+        );
+    }
+    let password = python_str(payload.get("password"));
+    if !verify_panel_password(&state.cfg.accounts_dir, &password) {
+        state.login_limiter.record_failure(&client_key, now);
+        tokio::time::sleep(state.panel_cfg.login_backoff).await;
+        return openai_error(401, "invalid panel password", "invalid_request_error");
+    }
+    state.login_limiter.clear(&client_key);
+    let token = state.panels.create();
+    Json(json!({
+        "ok": true,
+        "token": token,
+        "using_default_password": panel_password_is_default(&state.cfg.accounts_dir),
+    }))
+    .into_response()
+}
+
+/// 面板登出（Python `_handle_panel` 的 `/panel/logout` 分支 `:17063-17065`）。
+///
+/// 撤销请求里带来的那个 token（带了才撤），**无条件**回 `{"ok": true}`
+/// —— 不需要已有会话（没有 token 时就是空操作）。
+async fn panel_logout(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // Python 的 `_handle_panel` 先读体再分发（`:17034-17036`），所以坏 JSON
+    // 在这条路由上也是 400。
+    if let Err(response) = panel_payload(&body) {
+        return *response;
+    }
+    state.panels.revoke(&panel_token(&headers));
+    Json(json!({"ok": true})).into_response()
+}
+
+/// 面板改口令（Python `_handle_panel` 的 `/panel/password` 分支 `:17066-17085`）。
+///
+/// - 必须有**有效面板会话**，否则 401「panel password required」。
+/// - 当前口令不对 ⇒ 401「current password is wrong」。
+/// - 新口令不足 4 个**字符** ⇒ 400（Python `len()` 数的是码点，故用
+///   `chars().count()` 而不是字节长度）。
+/// - 改完口令后：新口令不是默认值 ⇒ 撤销**所有**会话（Python `:17078-17081`）；
+///   无论是否撤销都发一个新 token，让当前浏览器用新 token 继续用
+///   （Python `:17082-17085`）。
+async fn panel_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let payload = match panel_payload(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    if !panel_session_ok(&headers, &state) {
+        return panel_unauthorized();
+    }
+    let current = python_str(payload.get("current"));
+    let new_password = python_str(payload.get("new"));
+    if !verify_panel_password(&state.cfg.accounts_dir, &current) {
+        return openai_error(401, "current password is wrong", "invalid_request_error");
+    }
+    if new_password.chars().count() < 4 {
+        return openai_error(
+            400,
+            "new password must be at least 4 characters",
+            "invalid_request_error",
+        );
+    }
+    if let Err(err) = set_panel_password(&state.cfg.accounts_dir, &new_password) {
+        return openai_error(
+            500,
+            &format!("could not set panel password: {err}"),
+            "server_error",
+        );
+    }
+    if new_password != DEFAULT_PANEL_PASSWORD {
+        state.panels.revoke_all();
+    }
+    let token = state.panels.create();
+    Json(json!({"ok": true, "token": token})).into_response()
+}
+
+/// 当前生效的 API key（供 `runtime_settings_view` 用）。
+///
+/// Python 侧是模块全局 `API_KEY`：启动时 = env `API_KEY` > 面板存的 key
+/// （`wb_proxy.py:18722-18737`），面板改过 key 后**立即**变成新值
+/// （`:16709-16711`）。Rust 侧没有可变全局，这里每次请求按 settings 文档里的
+/// `api_key_set` 重算，逼近 Python 的可见行为。
+///
+/// ⚠️ 与 Python 的**唯一**差异：env `API_KEY` 存在时，Python 启动后仍优先用
+/// env 那个（面板改过 key 也一样，直到进程重启），而这里只要文档里
+/// `api_key_set=true` 就用面板存的那个。
+fn effective_api_key(state: &AppState) -> Option<String> {
+    let Ok(doc) = wb_storage::read_settings(&state.cfg.accounts_dir) else {
+        return state.cfg.api_key.clone();
+    };
+    if doc.get("api_key_set").and_then(Value::as_bool) == Some(true) {
+        return Some(
+            doc.get("api_key")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    state.cfg.api_key.clone()
+}
+
+/// 读面板设置（Python `_get_settings` :16112-16116）。
+///
+/// 门禁：Python 侧 `/settings` 命中面板前缀表 ⇒ 外层要面板会话；handler 内部
+/// 再查 `_authorized()`。Rust 侧同样走双层门禁。
+async fn settings_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/settings", &headers, &params, &state) {
+        return response;
+    }
+    let view = runtime_settings_view(
+        &state.cfg.accounts_dir,
+        &state.task.usage_dir,
+        effective_api_key(&state).as_deref(),
+    );
+    Json(view).into_response()
+}
+
+/// 保存面板设置（Python `_handle_settings_save` :16401-16725）。
+///
+/// 门禁：**只认面板会话**（Python `:18264-18267` 明确 `if not self._panel_ok()`），
+/// API key 不能走这条路。
+///
+/// 回包：Python 最后一行的 `reply.update(runtime_settings_view())` ⇒
+/// **视图覆盖增量**；键序与 Python 的 `dict.update` 一致（reply 里已有的键
+/// 保持原位、视图独有的键追加到末尾）。
+async fn settings_save(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(response) = panel_gate("/settings/save", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match panel_payload(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let (_doc, reply) = match save_settings(&state.cfg.accounts_dir, &payload) {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            let err_type = if code >= 500 {
+                "server_error"
+            } else {
+                "invalid_request_error"
+            };
+            return openai_error(code, &message, err_type);
+        }
+    };
+    apply_settings_side_effects(&state, &reply);
+    let view = runtime_settings_view(
+        &state.cfg.accounts_dir,
+        &state.task.usage_dir,
+        effective_api_key(&state).as_deref(),
+    );
+    // `reply.update(view)`：视图覆盖增量，键序与 Python 的 dict.update 一致。
+    let mut body = reply;
+    if let (Some(body_map), Some(view_map)) = (body.as_object_mut(), view.as_object()) {
+        for (key, value) in view_map {
+            body_map.insert(key.clone(), value.clone());
+        }
+    }
+    Json(body).into_response()
+}
+
+/// 设置保存后的运行时副作用（Python `_handle_settings_save` 的副作用分支）。
+///
+/// Python 侧共 12 处副作用；Rust 侧能落地的是定价刷新与更新检查两组：
+/// - `pricing_enabled` ⇒ `PRICING.wake()`（Python `:16506-16513`）
+/// - `pricing_refresh_minutes` ⇒ `PRICING.set_interval(minutes)`（Python `:16530-16534`）
+/// - `pricing_variant_inherit` **且值确实变了** ⇒ 立刻起一次取价
+///   （Python `:16575-16583`）。Rust 侧用 `tokio::spawn` **不阻塞**应答。
+/// - `update_check_enabled` ⇒ `UPDATES.wake()`（Python `:16679-16683`）
+/// - `credits_refresh_hours` ⇒ `CREDITS_REFRESHER.wake()`（Python `:16550-16557`）
+///   —— Rust 侧 `CreditsRefresher` **没有** `wake()` 方法（只有 `start`/`stop`/
+///   `run_once`），此处**跳过**，见交付报告的「待补」清单。
+/// - `restart_scheduler` ⇒ 调度器 stop+start —— 线 B 把该键标成不支持（400），
+///   故这里不处理。
+///
+/// ⚠️ 后台线程默认**不启动**（需 `WB_BACKGROUND_TASKS=1`，见
+/// `start_background_tasks`），所以这些 `wake()` 在默认配置下是空操作 ——
+/// 这是有意的（D49/D66），不要改。
+fn apply_settings_side_effects(state: &AppState, reply: &Value) {
+    let Some(reply_map) = reply.as_object() else {
+        return;
+    };
+    if reply_map.contains_key("pricing_enabled") {
+        if let Some(pricing) = state.task.price_refresher.get() {
+            pricing.wake();
+        }
+    }
+    if let Some(minutes) = reply_map
+        .get("pricing_refresh_minutes")
+        .and_then(Value::as_f64)
+    {
+        if let Some(pricing) = state.task.price_refresher.get() {
+            pricing.set_interval_minutes(minutes);
+        }
+    }
+    if reply_map.contains_key("pricing_variant_inherit")
+        && reply_map
+            .get("pricing_refresh_started")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        if let Some(pricing) = state.task.price_refresher.get() {
+            let pricing = Arc::clone(pricing);
+            // 不阻塞应答：Python 也是起后台线程再继续（`:16578-16583`）。
+            tokio::spawn(async move {
+                pricing.run_once().await;
+            });
+        }
+    }
+    if reply_map.contains_key("update_check_enabled") {
+        if let Some(updater) = state.task.update_checker.get() {
+            updater.wake();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,12 +1650,8 @@ async fn accounts_checkin(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/accounts/checkin", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let payload = match parse_body(&body) {
         Ok(v) => v,
@@ -1261,12 +1671,8 @@ async fn accounts_daily_chat(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/accounts/daily-chat", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let payload = match parse_body(&body) {
         Ok(v) => v,
@@ -1286,12 +1692,13 @@ async fn accounts_daily_chat_web(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate(
+        "/accounts/daily-chat-web",
+        &headers,
+        &HashMap::new(),
+        &state,
+    ) {
+        return response;
     }
     let payload = match parse_body(&body) {
         Ok(v) => v,
@@ -1309,12 +1716,8 @@ async fn tasks_get(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if unauthorized(&headers, &params, &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/tasks", &headers, &params, &state) {
+        return response;
     }
     let uid = params.get("uid").cloned();
     let res = task_routes::route_tasks_get(&state.task, uid.as_deref()).await;
@@ -1322,12 +1725,8 @@ async fn tasks_get(
 }
 
 async fn tasks_run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/tasks/run", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let payload = match parse_body(&body) {
         Ok(v) => v,
@@ -1341,12 +1740,8 @@ async fn tasks_run(State(state): State<AppState>, headers: HeaderMap, body: Byte
 }
 
 async fn tasks_travel(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/tasks/travel", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let payload = match parse_body(&body) {
         Ok(v) => v,
@@ -1364,12 +1759,8 @@ async fn tasks_streak_bonus(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/tasks/streak-bonus", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let payload = match parse_body(&body) {
         Ok(v) => v,
@@ -1387,12 +1778,8 @@ async fn tasks_claim_all(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/tasks/claim-all", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let payload = match parse_body(&body) {
         Ok(v) => v,
@@ -1406,12 +1793,8 @@ async fn tasks_claim_all(
 }
 
 async fn scheduler_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/scheduler", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let res = task_routes::route_scheduler_get(&state.task);
     Json(res).into_response()
@@ -1423,12 +1806,13 @@ async fn scheduler_get(State(state): State<AppState>, headers: HeaderMap) -> Res
 /// 逐字一致：六个键 `ttl_hours / interval_seconds / last_run / last_uid /
 /// last_error / logs`。
 async fn credits_refresher_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate(
+        "/accounts/credits-refresher",
+        &headers,
+        &HashMap::new(),
+        &state,
+    ) {
+        return response;
     }
     let res = task_routes::route_credits_refresher_status(&state.task);
     Json(res).into_response()
@@ -1438,12 +1822,8 @@ async fn credits_refresher_get(State(state): State<AppState>, headers: HeaderMap
 ///
 /// 形状与 Python `PRICING.status()`（`wb_pricing.py:2511-2554`）一致。
 async fn pricing_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/pricing", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let res = task_routes::route_pricing_status(&state.task);
     Json(res).into_response()
@@ -1453,12 +1833,8 @@ async fn pricing_get(State(state): State<AppState>, headers: HeaderMap) -> Respo
 ///
 /// 形状与 Python `UPDATES.status()`（`wb_updates.py:257-271`）一致。
 async fn updates_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/updates", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let res = task_routes::route_updates_status(&state.task);
     Json(res).into_response()
@@ -1469,12 +1845,8 @@ async fn scheduler_trigger(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/scheduler/trigger", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let _ = body;
     let res = task_routes::route_scheduler_trigger(&state.task);
@@ -1486,12 +1858,8 @@ async fn scheduler_toggle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if unauthorized(&headers, &HashMap::new(), &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/scheduler/toggle", &headers, &HashMap::new(), &state) {
+        return response;
     }
     let _ = body;
     let res = task_routes::route_scheduler_toggle(&state.task);
@@ -1540,12 +1908,8 @@ async fn usage_get(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if unauthorized(&headers, &params, &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/usage", &headers, &params, &state) {
+        return response;
     }
     let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
     let now = wb_tasks::activity::now_epoch();
@@ -1666,12 +2030,8 @@ async fn usage_recent_get(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if unauthorized(&headers, &params, &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/usage/recent", &headers, &params, &state) {
+        return response;
     }
     let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
     let limit = parse_int(&params, "limit")
@@ -1702,12 +2062,8 @@ async fn usage_timeseries_get(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if unauthorized(&headers, &params, &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/usage/timeseries", &headers, &params, &state) {
+        return response;
     }
     let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
     let now = wb_tasks::activity::now_epoch();
@@ -1732,12 +2088,8 @@ async fn usage_perf_get(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if unauthorized(&headers, &params, &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/usage/perf", &headers, &params, &state) {
+        return response;
     }
     let realm = realm_filter(&params, &headers, Some(&state.cfg.realm));
     let sample = parse_int(&params, "sample")
@@ -1762,12 +2114,8 @@ async fn activity_history_get(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if unauthorized(&headers, &params, &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/activity/history", &headers, &params, &state) {
+        return response;
     }
     let rows = wb_tasks::activity::history_rows(&state.task.usage_dir);
     let now = wb_tasks::activity::now_epoch();
@@ -1795,12 +2143,8 @@ async fn usage_by_account(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if unauthorized(&headers, &params, &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/usage/by-account", &headers, &params, &state) {
+        return response;
     }
     let rows = read_usage_rows(&state);
     Json(wb_tasks::usage::build_usage_by_account(&rows)).into_response()
@@ -1816,12 +2160,8 @@ async fn usage_analytics(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if unauthorized(&headers, &params, &state) {
-        return openai_error(
-            401,
-            &format!("invalid api key - {}", auth_hint(&state)),
-            "invalid_request_error",
-        );
+    if let Some(response) = panel_gate("/usage/analytics", &headers, &params, &state) {
+        return response;
     }
     let realm = realm_filter(&params, &headers, None);
     let rows: Vec<Value> = read_usage_rows(&state)

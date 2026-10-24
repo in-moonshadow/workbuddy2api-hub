@@ -2,6 +2,10 @@
 pub mod auth;
 pub mod chat;
 pub mod config;
+// 关卡 4.22：面板口令认证（PBKDF2）+ 登录限流。权威源是 Python
+// `wb_settings.verify_panel_password` / `set_panel_password` 与
+// `wb_proxy.login_rate_limit_key`。
+pub mod panel_auth;
 pub mod routes;
 
 use std::sync::Arc;

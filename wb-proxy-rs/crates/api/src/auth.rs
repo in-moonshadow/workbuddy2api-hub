@@ -77,6 +77,26 @@ impl PanelSessions {
             None => false,
         }
     }
+
+    /// 吊销单个会话 token（对齐 Python `PanelSessions.revoke`，:1624-1629）。
+    ///
+    /// token 为空 ⇒ 直接返回（Python 同样先判空）。
+    pub fn revoke(&self, token: &str) {
+        if token.is_empty() {
+            return;
+        }
+        self.tokens
+            .lock()
+            .expect("panel lock poisoned")
+            .remove(token);
+    }
+
+    /// 吊销全部会话 token（对齐 Python `PanelSessions.revoke_all`，:1631-1633）。
+    ///
+    /// 改面板口令时调用：轮换口令要让其它浏览器全部重新登录。
+    pub fn revoke_all(&self) {
+        self.tokens.lock().expect("panel lock poisoned").clear();
+    }
 }
 
 /// 提取调用方呈现的 key（对齐 wb_proxy._supplied_key :15517-15555）。

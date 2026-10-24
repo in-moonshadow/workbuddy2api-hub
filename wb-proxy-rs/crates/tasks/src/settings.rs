@@ -59,6 +59,20 @@
 //! 3. **`pricing_refresh_minutes` 用整分钟**：Python 存浮点分钟（默认 `5.0`），
 //!    Rust 侧字段是 `i64`（本关卡的接口约定），按截断取整；`0 < v < 1` 的
 //!    极小值截断成 `0`（= 关闭），Python 则会当成一个正的刷新间隔。
+//!
+//! ## 写路径：两套口径，别混用
+//!
+//! | | `wb_storage::write_settings` | `wb_storage::replace_settings` |
+//! |---|---|---|
+//! | 口径 | 顶层**浅合并** | **整体替换**（Python `wb_settings.save()`） |
+//! | 坏 JSON | 报错、拒绝写 | 宽容读（当空对象）⇒ 用新数据覆盖掉损坏文件 |
+//! | 删键 | 做不到 | 可以（读出来 → 删 → 整份写回） |
+//!
+//! 面板设置这条线（`crate::settings_view`）走的是 **`replace_settings`**：Python
+//! 的 `wb_settings.save()` 就是「读出来 → 改 → 整份写回」，而且它对**损坏的
+//! JSON 静默当空对象**，于是下一次保存会把损坏的文件整个覆盖掉。Rust 侧保留
+//! `write_settings` 的浅合并 + 拒绝写坏文件，是给「只想改一两个键、又不想在
+//! 文件损坏时丢数据」的场景用的（例如 `update_checker` 写 `update_check`）。
 
 use std::path::Path;
 
@@ -300,6 +314,47 @@ pub fn clamp_pricing_refresh_minutes(minutes: f64) -> i64 {
     minutes
         .clamp(0.0, MAX_PRICING_REFRESH_MINUTES as f64)
         .trunc() as i64
+}
+
+/// 写 `pricing_refresh_minutes` 前的夹取（**保留小数**的浮点版本）。
+///
+/// Python `set_pricing_refresh_minutes()`（`wb_settings.py:938-952`）存的是
+/// **浮点**分钟（`2.5` 分钟就是 `2.5`），夹取口径与
+/// [`clamp_pricing_refresh_minutes`] 相同，但**不截断成整数**。
+///
+/// 面板的读视图 / 写回包必须用这个版本：Python 侧这两个出口给的都是浮点
+/// （JSON 里是 `5.0` / `2.5`），用整数版会把 `2.5` 变成 `2`。
+pub fn clamp_pricing_refresh_minutes_f64(minutes: f64) -> f64 {
+    if minutes.is_nan() {
+        return 0.0;
+    }
+    minutes.clamp(0.0, MAX_PRICING_REFRESH_MINUTES as f64)
+}
+
+/// `pricing_refresh_minutes` 的**浮点**读出口（保留小数）。
+///
+/// Python `wb_settings.pricing_refresh_minutes()`（`wb_settings.py:912-935`）
+/// 返回的永远是 `float`（默认 `5.0`、迁移值 `hours * 60`、关闭时 `0.0`），
+/// JSON 里表现为 `5.0` / `360.0`。
+///
+/// 整数版 [`pricing_refresh_minutes`] 是给后台刷新循环用的（本关卡的接口约定：
+/// 间隔按整分钟计），**不要**拿它填面板的读视图——那会把 `2.5` 分钟显示成 `2`。
+pub fn pricing_refresh_minutes_f64(data: &Value) -> f64 {
+    match data.get(PRICING_REFRESH_MINUTES_KEY) {
+        Some(raw) => match as_f64(raw) {
+            // Python: `value if value > 0 else 0.0`
+            Some(value) if value > 0.0 => value,
+            Some(_) => 0.0,
+            None => DEFAULT_PRICING_REFRESH_MINUTES as f64,
+        },
+        None => {
+            // 旧键迁移（只读换算，不写回，见模块文档的差异登记）
+            match data.get(LEGACY_PRICING_REFRESH_HOURS_KEY).and_then(as_f64) {
+                Some(hours) => clamp_pricing_refresh_minutes_f64(hours * 60.0),
+                None => DEFAULT_PRICING_REFRESH_MINUTES as f64,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

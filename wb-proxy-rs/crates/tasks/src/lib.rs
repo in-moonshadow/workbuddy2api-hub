@@ -72,6 +72,11 @@ pub mod streak_bonus;
 // `CreditsRefresher`。
 pub mod credits_refresher;
 pub mod settings;
+// 面板设置的**读视图与保存**（Python `wb_proxy.runtime_settings_view()` /
+// `wb_proxy._handle_settings_save()` 的等价物）。权威源是 `wb_settings.py` 与
+// `wb_proxy.py`；本模块只负责落盘 + 校验 + 算出生效值，后台线程的副作用由
+// 调用方按返回值里的增量键触发。
+pub mod settings_view;
 // 关卡 4.19：另外两个后台线程 + 用量聚合。`price_refresher` 是 Python
 // `wb_pricing.PriceRefresher` 的移植，`update_checker` 是 Python
 // `wb_updates.UpdateChecker` 的移植，`usage` 是用量落盘与聚合

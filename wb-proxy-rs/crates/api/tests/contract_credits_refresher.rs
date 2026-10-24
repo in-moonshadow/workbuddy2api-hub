@@ -72,11 +72,8 @@ fn runtime(dir: &TempDir) -> Arc<TaskRuntime> {
 async fn credits_refresher_route_requires_auth() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        runtime(&dir),
-    );
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let app = app_with(cfg, panels, runtime(&dir));
     let req = Request::builder()
         .uri("/accounts/credits-refresher")
         .body(Body::empty())
@@ -90,14 +87,13 @@ async fn credits_refresher_route_returns_the_six_python_keys() {
     let dir = TempDir::new().unwrap();
     pool_with_account(&dir, None);
     let cfg = make_cfg(&dir);
-    let app = app_with(
-        cfg,
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        runtime(&dir),
-    );
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    let app = app_with(cfg, panels, runtime(&dir));
     let req = Request::builder()
         .uri("/accounts/credits-refresher")
         .header("authorization", "Bearer test-key")
+        .header("x-panel-token", token.as_str())
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();

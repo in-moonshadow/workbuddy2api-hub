@@ -66,12 +66,10 @@ fn make_task(cfg: &Arc<Config>) -> Arc<TaskRuntime> {
     )
 }
 
-fn make_app(cfg: &Arc<Config>) -> Router {
-    app_with(
-        cfg.clone(),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        make_task(cfg),
-    )
+fn make_app(cfg: &Arc<Config>) -> (Router, String) {
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    (app_with(cfg.clone(), panels, make_task(cfg)), token)
 }
 
 fn usage_dir(cfg: &Config) -> PathBuf {
@@ -79,8 +77,10 @@ fn usage_dir(cfg: &Config) -> PathBuf {
 }
 
 /// 发一次 GET，返回 (状态码, 解析后的 JSON)。
-async fn get(app: &Router, path: &str, with_key: bool) -> (StatusCode, Value) {
-    let mut builder = Request::builder().uri(path);
+async fn get(app: &Router, path: &str, with_key: bool, panel_token: &str) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .uri(path)
+        .header("x-panel-token", panel_token);
     if with_key {
         builder = builder.header("authorization", format!("Bearer {API_KEY}"));
     }
@@ -154,9 +154,9 @@ fn top_keys(body: &Value) -> Vec<&str> {
 async fn new_usage_routes_require_auth() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, _token) = make_app(&cfg);
     for path in NEW_ROUTES {
-        let (status, body) = get(&app, path, false).await;
+        let (status, body) = get(&app, path, false, "").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 未鉴权应回 401");
         assert_eq!(body["error"]["code"], 401);
         assert_eq!(body["error"]["type"], "invalid_request_error");
@@ -172,11 +172,11 @@ async fn every_route_has_the_expected_top_level_keys() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
     wb_tasks::usage::append_usage_row(&usage, &usage_row(T0, "m1", 10)).unwrap();
 
     // 快照（Python `_empty_stats` + 装饰组；`usd_cny` 因无定价表而省略）。
-    let (_, body) = get(&app, "/usage", true).await;
+    let (_, body) = get(&app, "/usage", true, &token).await;
     assert_eq!(
         top_keys(&body),
         vec![
@@ -199,14 +199,14 @@ async fn every_route_has_the_expected_top_level_keys() {
     );
 
     // 最近行（Python `recent_usage`；`usd_cny` 省略）。
-    let (_, body) = get(&app, "/usage/recent", true).await;
+    let (_, body) = get(&app, "/usage/recent", true, &token).await;
     assert_eq!(
         top_keys(&body),
         vec!["total", "page", "limit", "total_pages", "rows"]
     );
 
     // 时间序列（Python `_usage_timeseries_scan`）。
-    let (_, body) = get(&app, "/usage/timeseries", true).await;
+    let (_, body) = get(&app, "/usage/timeseries", true, &token).await;
     assert_eq!(
         top_keys(&body),
         vec![
@@ -221,7 +221,7 @@ async fn every_route_has_the_expected_top_level_keys() {
     );
 
     // 性能统计（Python `_perf_stats_uncached`）。
-    let (_, body) = get(&app, "/usage/perf", true).await;
+    let (_, body) = get(&app, "/usage/perf", true, &token).await;
     assert_eq!(
         top_keys(&body),
         vec![
@@ -242,7 +242,7 @@ async fn every_route_has_the_expected_top_level_keys() {
     );
 
     // 活动历史（Python `wb_activity.query`）。
-    let (_, body) = get(&app, "/activity/history", true).await;
+    let (_, body) = get(&app, "/activity/history", true, &token).await;
     assert_eq!(
         top_keys(&body),
         vec!["rows", "total", "limit", "range", "filters"]
@@ -254,14 +254,14 @@ async fn v1_usage_returns_the_same_body_as_usage() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     wb_tasks::usage::append_usage_row(&usage, &usage_row(T0, "m1", 10)).unwrap();
     wb_tasks::usage::append_usage_row(&usage, &usage_row(T0 + 1.0, "m2", 30)).unwrap();
 
-    let (status, plain) = get(&app, "/usage", true).await;
+    let (status, plain) = get(&app, "/usage", true, &token).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, v1) = get(&app, "/v1/usage", true).await;
+    let (status, v1) = get(&app, "/v1/usage", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(plain, v1, "两条路径必须返回同一份内容");
     assert_eq!(plain["total_requests"], 2);
@@ -272,8 +272,8 @@ async fn v1_usage_returns_the_same_body_as_usage() {
 async fn usage_snapshot_carries_decoration_keys() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
-    let (status, body) = get(&app, "/usage", true).await;
+    let (app, token) = make_app(&cfg);
+    let (status, body) = get(&app, "/usage", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     // 装饰键：`started` / `since` / `log_file` / `realm`；`usd_cny`（定价）
     // 与 `accounts_map` / `account`（池为空时）不出现。
@@ -296,7 +296,7 @@ async fn usage_recent_paginates_newest_first() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     for index in 0..5i64 {
         wb_tasks::usage::append_usage_row(
@@ -306,7 +306,7 @@ async fn usage_recent_paginates_newest_first() {
         .unwrap();
     }
 
-    let (status, body) = get(&app, "/usage/recent?limit=2&page=1", true).await;
+    let (status, body) = get(&app, "/usage/recent?limit=2&page=1", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total"], 5);
     assert_eq!(body["limit"], 2);
@@ -319,14 +319,14 @@ async fn usage_recent_paginates_newest_first() {
     assert_eq!(rows[1]["model"], "m3");
 
     // 第 3 页 = 最旧的一页。
-    let (status, body) = get(&app, "/usage/recent?limit=2&page=3", true).await;
+    let (status, body) = get(&app, "/usage/recent?limit=2&page=3", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     let rows = body["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["model"], "m0");
 
     // 页码越界 ⇒ 夹回最后一页。
-    let (status, body) = get(&app, "/usage/recent?limit=2&page=99", true).await;
+    let (status, body) = get(&app, "/usage/recent?limit=2&page=99", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["page"], 3);
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
@@ -336,16 +336,16 @@ async fn usage_recent_paginates_newest_first() {
 async fn usage_recent_clamps_limit_and_falls_back_on_bad_input() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     // limit 上限 1000、下限 1；解析不了回默认 100。
-    let (_, body) = get(&app, "/usage/recent?limit=99999", true).await;
+    let (_, body) = get(&app, "/usage/recent?limit=99999", true, &token).await;
     assert_eq!(body["limit"], 1000);
-    let (_, body) = get(&app, "/usage/recent?limit=0", true).await;
+    let (_, body) = get(&app, "/usage/recent?limit=0", true, &token).await;
     assert_eq!(body["limit"], 1);
-    let (_, body) = get(&app, "/usage/recent?limit=abc", true).await;
+    let (_, body) = get(&app, "/usage/recent?limit=abc", true, &token).await;
     assert_eq!(body["limit"], 100);
-    let (_, body) = get(&app, "/usage/recent?page=abc", true).await;
+    let (_, body) = get(&app, "/usage/recent?page=abc", true, &token).await;
     assert_eq!(body["page"], 1);
 }
 
@@ -358,7 +358,7 @@ async fn usage_timeseries_bucket_granularity_scales_with_window() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
     wb_tasks::usage::append_usage_row(&usage, &usage_row(T0, "m1", 10)).unwrap();
 
     // 1 小时窗口 ⇒ 60s 桶。
@@ -370,6 +370,7 @@ async fn usage_timeseries_bucket_granularity_scales_with_window() {
             T0 + 3600.0
         ),
         true,
+        &token,
     )
     .await;
     assert_eq!(body["bucket_seconds"], 60);
@@ -387,6 +388,7 @@ async fn usage_timeseries_bucket_granularity_scales_with_window() {
             T0 + 7.0 * 86400.0
         ),
         true,
+        &token,
     )
     .await;
     assert_eq!(body["bucket_seconds"], 3600);
@@ -400,6 +402,7 @@ async fn usage_timeseries_bucket_granularity_scales_with_window() {
             T0 + 30.0 * 86400.0
         ),
         true,
+        &token,
     )
     .await;
     assert_eq!(body["bucket_seconds"], 86400);
@@ -409,7 +412,7 @@ async fn usage_timeseries_bucket_granularity_scales_with_window() {
 async fn usage_timeseries_bucket_parameter_overrides_granularity() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     let (_, body) = get(
         &app,
@@ -419,6 +422,7 @@ async fn usage_timeseries_bucket_parameter_overrides_granularity() {
             T0 + 3600.0
         ),
         true,
+        &token,
     )
     .await;
     assert_eq!(body["bucket_seconds"], 300);
@@ -432,6 +436,7 @@ async fn usage_timeseries_bucket_parameter_overrides_granularity() {
             T0 + 3600.0
         ),
         true,
+        &token,
     )
     .await;
     assert_eq!(body["bucket_seconds"], 60);
@@ -442,7 +447,7 @@ async fn usage_timeseries_bucket_shape_matches_python() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
     wb_tasks::usage::append_usage_row(&usage, &usage_row(T0, "m1", 40)).unwrap();
 
     let (_, body) = get(
@@ -453,6 +458,7 @@ async fn usage_timeseries_bucket_shape_matches_python() {
             T0 + 3600.0
         ),
         true,
+        &token,
     )
     .await;
     let bucket = &body["series"][0];
@@ -474,7 +480,7 @@ async fn usage_perf_blocks_have_python_shape() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
     let usage = usage_dir(&cfg);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     for (index, ttft) in [100.0f64, 200.0, 300.0].iter().enumerate() {
         wb_tasks::usage::append_usage_row(
@@ -484,7 +490,7 @@ async fn usage_perf_blocks_have_python_shape() {
         .unwrap();
     }
 
-    let (status, body) = get(&app, "/usage/perf", true).await;
+    let (status, body) = get(&app, "/usage/perf", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["sampled"], 3);
     assert_eq!(body["success"], 3);
@@ -517,9 +523,9 @@ async fn usage_perf_blocks_have_python_shape() {
 async fn usage_perf_blocks_are_null_without_samples() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
     // 用量日志不存在 ⇒ 一条样本都没有。
-    let (status, body) = get(&app, "/usage/perf", true).await;
+    let (status, body) = get(&app, "/usage/perf", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["sampled"], 0);
     assert!(body["ttft_ms"].is_null(), "无样本时整块必须是 null");
@@ -566,21 +572,21 @@ fn seed_activity(cfg: &Config) {
 async fn activity_history_rejects_invalid_filters() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     // 非法 task ⇒ 400。
-    let (status, body) = get(&app, "/activity/history?task=nope", true).await;
+    let (status, body) = get(&app, "/activity/history?task=nope", true, &token).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], 400);
     assert_eq!(body["error"]["type"], "invalid_request_error");
 
     // 非法 result ⇒ 400。
-    let (status, body) = get(&app, "/activity/history?result=weird", true).await;
+    let (status, body) = get(&app, "/activity/history?result=weird", true, &token).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], 400);
 
     // 非法 range ⇒ 400。
-    let (status, body) = get(&app, "/activity/history?range=nope", true).await;
+    let (status, body) = get(&app, "/activity/history?range=nope", true, &token).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], 400);
 }
@@ -589,10 +595,10 @@ async fn activity_history_rejects_invalid_filters() {
 async fn activity_history_returns_python_shape() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
     seed_activity(&cfg);
 
-    let (status, body) = get(&app, "/activity/history", true).await;
+    let (status, body) = get(&app, "/activity/history", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     // 顶层键序与 Python 逐字一致：rows / total / limit / range / filters。
     let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
@@ -621,15 +627,15 @@ async fn activity_history_returns_python_shape() {
 async fn activity_history_filters_by_task_and_result() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
     seed_activity(&cfg);
 
-    let (_, body) = get(&app, "/activity/history?task=checkin", true).await;
+    let (_, body) = get(&app, "/activity/history?task=checkin", true, &token).await;
     assert_eq!(body["total"], 1);
     assert_eq!(body["filters"]["task"], "checkin");
     assert_eq!(body["rows"][0]["task"], "checkin");
 
-    let (_, body) = get(&app, "/activity/history?result=failed", true).await;
+    let (_, body) = get(&app, "/activity/history?result=failed", true, &token).await;
     assert_eq!(body["total"], 1);
     assert_eq!(body["filters"]["result"], "failed");
     assert_eq!(body["rows"][0]["task"], "daily_chat");
@@ -673,7 +679,7 @@ fn cn_account() -> RunnerAccount<'static> {
 async fn checkin_writes_an_activity_row_that_history_can_read() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     // 账号文件（签到要往里写 lastCheckin）。
     let accounts = cfg.accounts_dir.clone();
@@ -716,7 +722,7 @@ async fn checkin_writes_an_activity_row_that_history_can_read() {
     assert!(history.exists(), "签到应当写一行活动历史");
 
     // 端到端：从 HTTP 接口读回来。
-    let (status, body) = get(&app, "/activity/history?range=all", true).await;
+    let (status, body) = get(&app, "/activity/history?range=all", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total"], 1);
     let row = &body["rows"][0];
@@ -734,7 +740,7 @@ async fn checkin_writes_an_activity_row_that_history_can_read() {
 async fn failed_checkin_also_writes_an_activity_row() {
     let dir = TempDir::new().unwrap();
     let cfg = make_cfg(&dir);
-    let app = make_app(&cfg);
+    let (app, token) = make_app(&cfg);
 
     let accounts = cfg.accounts_dir.clone();
     std::fs::create_dir_all(&accounts).unwrap();
@@ -766,7 +772,7 @@ async fn failed_checkin_also_writes_an_activity_row() {
     .await;
     assert!(!outcome.ok);
 
-    let (status, body) = get(&app, "/activity/history?range=all", true).await;
+    let (status, body) = get(&app, "/activity/history?range=all", true, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total"], 1);
     assert_eq!(body["rows"][0]["ok"], false);

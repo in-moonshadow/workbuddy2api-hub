@@ -134,26 +134,30 @@ fn manual_runtime(dir: &TempDir, base: &'static str, ready: Vec<ReadyAccount>) -
     task
 }
 
-fn app_for(dir: &TempDir, task: Arc<TaskRuntime>) -> axum::Router {
-    app_with(
-        make_cfg(dir),
-        Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600)),
-        task,
-    )
+fn app_for(dir: &TempDir, task: Arc<TaskRuntime>) -> (axum::Router, String) {
+    let panels = Arc::new(wb_api::auth::PanelSessions::new(7 * 24 * 3600));
+    let token = panels.create();
+    (app_with(make_cfg(dir), panels, task), token)
 }
 
-fn post_req(uri: &str, body: Value) -> Request<Body> {
+fn post_req(uri: &str, body: Value, panel_token: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
         .header("authorization", "Bearer test-key")
+        .header("x-panel-token", panel_token)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
 }
 
-async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
-    let resp = app.oneshot(post_req(uri, body)).await.unwrap();
+async fn post_json(
+    app: axum::Router,
+    uri: &str,
+    body: Value,
+    panel_token: &str,
+) -> (StatusCode, Value) {
+    let resp = app.oneshot(post_req(uri, body, panel_token)).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -246,9 +250,9 @@ async fn manual_web_chat_does_not_write_last_daily_chat() {
         Box::leak(server.uri().into_boxed_str()),
         vec![account("u-web", "intl", true)],
     );
-    let app = app_for(&dir, task);
+    let (app, token) = app_for(&dir, task);
 
-    let (status, v) = post_json(app, "/accounts/daily-chat-web", json!({})).await;
+    let (status, v) = post_json(app, "/accounts/daily-chat-web", json!({}), &token).await;
     assert_eq!(status, StatusCode::OK);
     let results = v["results"].as_array().expect("results");
     assert_eq!(results.len(), 1);
@@ -281,9 +285,9 @@ async fn manual_full_chat_writes_last_daily_chat_when_web_ok() {
         Box::leak(server.uri().into_boxed_str()),
         vec![account("u-full", "intl", true)],
     );
-    let app = app_for(&dir, task);
+    let (app, token) = app_for(&dir, task);
 
-    let (status, v) = post_json(app, "/accounts/daily-chat", json!({})).await;
+    let (status, v) = post_json(app, "/accounts/daily-chat", json!({}), &token).await;
     assert_eq!(status, StatusCode::OK);
     let results = v["results"].as_array().expect("results");
     assert_eq!(results.len(), 1);
@@ -315,9 +319,9 @@ async fn manual_web_chat_without_uid_targets_only_intl_enabled() {
             account("u-intl-off", "intl", false),
         ],
     );
-    let app = app_for(&dir, task);
+    let (app, token) = app_for(&dir, task);
 
-    let (status, v) = post_json(app, "/accounts/daily-chat-web", json!({})).await;
+    let (status, v) = post_json(app, "/accounts/daily-chat-web", json!({}), &token).await;
     assert_eq!(status, StatusCode::OK);
     let results = v["results"].as_array().expect("results");
     assert_eq!(results.len(), 1, "只应打 intl 且 enabled 的账号");
@@ -344,12 +348,13 @@ async fn manual_web_chat_with_uid_targets_only_that_account() {
             account("u-intl-off", "intl", false),
         ],
     );
-    let app = app_for(&dir, task);
+    let (app, token) = app_for(&dir, task);
 
     let (status, v) = post_json(
         app,
         "/accounts/daily-chat-web",
         json!({"uid": "u-intl-off"}),
+        &token,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -372,9 +377,15 @@ async fn manual_web_chat_on_cn_account_returns_realm_error() {
         Box::leak(server.uri().into_boxed_str()),
         vec![account("u-cn", "cn", true)],
     );
-    let app = app_for(&dir, task);
+    let (app, token) = app_for(&dir, task);
 
-    let (status, v) = post_json(app, "/accounts/daily-chat-web", json!({"uid": "u-cn"})).await;
+    let (status, v) = post_json(
+        app,
+        "/accounts/daily-chat-web",
+        json!({"uid": "u-cn"}),
+        &token,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let results = v["results"].as_array().expect("results");
     assert_eq!(results.len(), 1);
@@ -402,9 +413,15 @@ async fn manual_web_chat_unknown_uid_returns_empty_results() {
         Box::leak(server.uri().into_boxed_str()),
         vec![account("u-intl", "intl", true)],
     );
-    let app = app_for(&dir, task);
+    let (app, token) = app_for(&dir, task);
 
-    let (status, v) = post_json(app, "/accounts/daily-chat-web", json!({"uid": "ghost"})).await;
+    let (status, v) = post_json(
+        app,
+        "/accounts/daily-chat-web",
+        json!({"uid": "ghost"}),
+        &token,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["results"].as_array().unwrap().len(), 0);
 
@@ -427,9 +444,9 @@ async fn manual_web_chat_failure_is_reported_in_result() {
         Box::leak(server.uri().into_boxed_str()),
         vec![account("u-web", "intl", true)],
     );
-    let app = app_for(&dir, task);
+    let (app, token) = app_for(&dir, task);
 
-    let (status, v) = post_json(app, "/accounts/daily-chat-web", json!({})).await;
+    let (status, v) = post_json(app, "/accounts/daily-chat-web", json!({}), &token).await;
     assert_eq!(status, StatusCode::OK);
     let results = v["results"].as_array().expect("results");
     assert_eq!(results.len(), 1);
@@ -452,7 +469,7 @@ async fn manual_web_chat_failure_is_reported_in_result() {
 async fn panel_status_answers_without_session() {
     let dir = TempDir::new().unwrap();
     let task = manual_runtime(&dir, "http://127.0.0.1:1", vec![]);
-    let app = app_for(&dir, task);
+    let (app, _token) = app_for(&dir, task);
 
     let req = Request::builder()
         .uri("/panel/status")
@@ -482,7 +499,7 @@ async fn manual_endpoints_require_api_key() {
         "http://127.0.0.1:1",
         vec![account("u-intl", "intl", true)],
     );
-    let app = app_for(&dir, task);
+    let (app, _token) = app_for(&dir, task);
 
     for uri in ["/accounts/daily-chat", "/accounts/daily-chat-web"] {
         let req = Request::builder()
