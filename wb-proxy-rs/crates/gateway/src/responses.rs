@@ -2714,3 +2714,331 @@ mod tests {
         assert!(frame.ends_with("\n\n"), "got {frame}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// web-tools（wb_webtools）最小对齐：tool defs 注入 / 检测 / 代跑辅助
+// ---------------------------------------------------------------------------
+
+/// `WEB_SEARCH_NAME` / `WEB_FETCH_NAME`：反代代跑的两个工具名。
+pub const WEB_SEARCH_NAME: &str = "web_search";
+pub const WEB_FETCH_NAME: &str = "web_fetch";
+pub const MAX_WEB_ROUNDS: usize = 3;
+
+const SEARCH_DECL_TYPES: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "web_search_preview_2025_03_11",
+    "web_search",
+    "web_fetch",
+];
+
+/// `client_wants_web`：客户端宣告了哪些网路工具（伺服器端或 function 形状都算）。
+pub fn client_wants_web(tools: &Value) -> Value {
+    let mut search = false;
+    let mut fetch = false;
+    if let Some(arr) = tools.as_array() {
+        for t in arr {
+            if !t.is_object() {
+                continue;
+            }
+            let ty = t
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            let name = {
+                let direct = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let nested = t
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !direct.is_empty() {
+                    direct
+                } else {
+                    nested
+                }
+            }
+            .trim()
+            .to_lowercase();
+            if ["web_search", "web_search_preview", "web_search_preview_2025_03_11", "web_search"]
+                .contains(&ty.as_str())
+                || name == "web_search"
+            {
+                search = true;
+            }
+            if ty == "web_fetch" || name == "web_fetch" {
+                fetch = true;
+            }
+        }
+    }
+    json!({"search": search, "fetch": fetch})
+}
+
+/// `web_search_tool_def`：给上游看的 function 形状。
+pub fn web_search_tool_def() -> Value {
+    json!({
+        "type": "function",
+        "name": WEB_SEARCH_NAME,
+        "description": "Searches the web for real-time information and returns ranked results with titles, URLs and snippets.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query (at least 2 characters)."},
+                "numResults": {"type": "number", "description": "How many results to return (1-10, default 5)."}
+            },
+            "required": ["query"]
+        }
+    })
+}
+
+/// `web_fetch_tool_def`。
+pub fn web_fetch_tool_def() -> Value {
+    json!({
+        "type": "function",
+        "name": WEB_FETCH_NAME,
+        "description": "Fetches a URL and returns its readable text. Use startIndex to page through a long page.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Absolute http:// or https:// URL to fetch."},
+                "startIndex": {"type": "number", "description": "Character offset to continue reading a long page."}
+            },
+            "required": ["url"]
+        }
+    })
+}
+
+/// `install_tool_defs`：把客户端的网路工具宣告换成我们的 function。
+pub fn install_tool_defs(chat_tools: &Value, wants: &Value) -> Vec<Value> {
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if wants.get("search").and_then(|v| v.as_bool()) == Some(true) {
+        names.insert(WEB_SEARCH_NAME.to_string());
+    }
+    if wants.get("fetch").and_then(|v| v.as_bool()) == Some(true) {
+        names.insert(WEB_FETCH_NAME.to_string());
+    }
+
+    let mut kept: Vec<Value> = Vec::new();
+    if let Some(arr) = chat_tools.as_array() {
+        for t in arr {
+            if !t.is_object() {
+                kept.push(t.clone());
+                continue;
+            }
+            let type_name = t
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            let mut name = t
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if name.is_empty() {
+                if let Some(f) = t.get("function") {
+                    name = f
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_lowercase();
+                }
+            }
+            if names.contains(&name) || names.contains(&type_name) {
+                continue;
+            }
+            kept.push(t.clone());
+        }
+    }
+
+    if wants.get("search").and_then(|v| v.as_bool()) == Some(true) {
+        kept.push(web_search_tool_def());
+    }
+    if wants.get("fetch").and_then(|v| v.as_bool()) == Some(true) {
+        kept.push(web_fetch_tool_def());
+    }
+    kept
+}
+
+/// `is_internal_tool`。
+pub fn is_internal_tool(name: &str) -> bool {
+    matches!(name.trim(), "web_search" | "web_fetch")
+}
+
+/// `query_args`：从工具参数取出查询字串。
+pub fn query_args(args: &Value) -> String {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return String::new(),
+    };
+    let raw = obj
+        .get("query")
+        .or_else(|| obj.get("queries"))
+        .or_else(|| obj.get("q"));
+    match raw {
+        None => String::new(),
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" or "),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// `url_arg`。
+pub fn url_arg(args: &Value) -> String {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return String::new(),
+    };
+    if let Some(Value::String(s)) = obj.get("url") {
+        return s.trim().to_string();
+    }
+    if let Some(Value::Array(arr)) = obj.get("urls") {
+        if let Some(Value::String(s)) = arr.first() {
+            return s.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// `web_tools_active`：body 是否被注入网路工具。
+pub fn web_tools_active(body: &Value) -> bool {
+    body.get("_web_tools").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// `tool_name_of`。
+pub fn tool_name_of(tool: &Value) -> String {
+    if !tool.is_object() {
+        return String::new();
+    }
+    if let Some(f) = tool.get("function") {
+        if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+            return n.to_string();
+        }
+    }
+    tool.get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// `internal_calls_from_chat`。
+pub fn internal_calls_from_chat(chat_obj: &Value, web_tools: bool) -> Vec<Value> {
+    if !web_tools {
+        return Vec::new();
+    }
+    let message = chat_obj
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"));
+    let mut out = Vec::new();
+    if let Some(msg) = message {
+        if let Some(calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in calls {
+                let f = match tc.get("function") {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if is_internal_tool(name) {
+                    let args = f
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!("{}"));
+                    out.push(json!({"name": name, "arguments": args}));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 简易 URL 守卫：回 Some(error) 表示拒绝。
+fn guard_url(url: &str) -> Option<String> {
+    let lower = url.trim().to_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Some("Error: web_fetch needs an http:// or https:// URL.".to_string());
+    }
+    // 提取 host
+    let rest = lower
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let host = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
+    if host.is_empty() || !host.contains('.') {
+        return Some("Error: host not allowed.".to_string());
+    }
+    let h = host.trim_end_matches('.');
+    if h == "localhost" || h == "127.0.0.1" || h.starts_with("10.") || h.starts_with("192.168.") {
+        return Some("Error: host not allowed.".to_string());
+    }
+    None
+}
+
+/// `execute`：永不抛例外，永远回一句能喂回模型的字串。
+pub fn execute(name: &str, args_raw: &Value) -> String {
+    let args = match args_raw {
+        Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+        _ => args_raw.clone(),
+    };
+    if !args.is_object() {
+        // non-dict argument blob
+        // still try query
+        if name.trim() == WEB_SEARCH_NAME {
+            // treat as empty
+        }
+        // fall through to handling below with empty object
+    }
+    let obj = args.as_object().cloned().unwrap_or_default();
+    let args_val = Value::Object(obj);
+
+    let name = name.trim();
+    if name == WEB_SEARCH_NAME {
+        let q = query_args(&args_val);
+        if q.chars().count() < 2 {
+            return format!(
+                "Error: web_search needs a query of at least 2 characters; got {:?}.",
+                q
+            );
+        }
+        return "Error: web search is temporarily unavailable.".to_string();
+    }
+    if name == WEB_FETCH_NAME {
+        let url = url_arg(&args_val);
+        if let Some(err) = guard_url(&url) {
+            return err;
+        }
+        return "Error: web fetch is temporarily unavailable.".to_string();
+    }
+    format!("Error: {} is not a tool this gateway runs.", name)
+}
+
+/// `search` / `fetch` 占位。
+pub fn search(_query: &str, _num_results: Option<i64>) -> String {
+    "Error: web search is temporarily unavailable.".to_string()
+}
+
+pub fn fetch(url: &str, _start_index: Option<i64>) -> String {
+    if let Some(err) = guard_url(url) {
+        return err;
+    }
+    "Error: web fetch is temporarily unavailable.".to_string()
+}
+
+pub fn sources_from_result(_result: &str) -> Vec<Value> {
+    Vec::new()
+}
+
+pub fn max_web_rounds() -> usize {
+    MAX_WEB_ROUNDS
+}
