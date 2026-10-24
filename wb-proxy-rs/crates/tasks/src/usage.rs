@@ -53,6 +53,9 @@ use std::sync::LazyLock;
 
 use crate::activity;
 use crate::price::{self, Pricing};
+use crate::pricing_store;
+use crate::pricing_store::Policy;
+use std::collections::HashMap;
 
 /// 用量日志文件名（Python `wb_proxy.USAGE_LOG`：`usage/usage.jsonl`）。
 pub const USAGE_LOG_NAME: &str = "usage.jsonl";
@@ -452,7 +455,7 @@ impl Buckets {
 ///   `cost_cny` / `cost_missing`（**定价表未接入**：本函数不接定价表，
 ///   要成本请用 [`build_usage_snapshot_priced`]）。
 pub fn build_usage_snapshot(rows: &[Value]) -> Value {
-    build_usage_snapshot_priced(rows, None)
+    build_usage_snapshot_priced(rows, &HashMap::new(), None, true)
 }
 
 /// 用量快照（**带成本估算**）。
@@ -467,36 +470,57 @@ pub fn build_usage_snapshot(rows: &[Value]) -> Value {
 /// - 折不进价的行记进 `cost_missing`（模型 id → 次数），**不静默少报**。
 /// - **定价表缺失 ⇒ `cost_cny` / `cost_missing` 整组省略**（不是 0、不是
 ///   空表）——「没有价表」与「价表说这条不要钱」是两回事。
-pub fn build_usage_snapshot_priced(rows: &[Value], pricing: Option<&Pricing>) -> Value {
+pub fn build_usage_snapshot_priced(
+    rows: &[Value],
+    policies: &HashMap<String, Policy>,
+    fallback: Option<&Pricing>,
+    enabled: bool,
+) -> Value {
     let mut totals = Bucket::default();
     let mut by_model = Buckets::new();
     let mut cost = CostFold::default();
 
     for row in rows {
         let outcome = row_outcome(row);
-        // 中止行的 usage 块不完整 ⇒ 不计价（Python 同款）。
-        let row_cost = match pricing {
-            Some(pricing) if outcome != "client_aborted" => Some(price::compute_row(row, pricing)),
-            _ => None,
+        let model = model_of(row);
+        let row_cost = if outcome != "client_aborted" {
+            Some(pricing_store::cost_for_row(
+                row, policies, fallback, enabled,
+            ))
+        } else {
+            None
         };
         if outcome != "completed" {
             totals.fold_failed();
         } else {
             totals.fold_completed(row);
-            let model = model_of(row);
-            let bucket = by_model.entry(model);
+            let bucket = by_model.entry(model.clone());
             bucket.fold_completed(row);
             if let Some(row_cost) = &row_cost {
-                if row_cost.known {
-                    bucket.cny += row_cost.cny;
+                let known = row_cost
+                    .get("known")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let cny = row_cost.get("cny").and_then(Value::as_f64).unwrap_or(0.0);
+                if known {
+                    bucket.cny += cny;
                 }
             }
         }
         if let Some(row_cost) = &row_cost {
-            if row_cost.known {
-                cost.cny += row_cost.cny;
-            } else {
-                cost.bump_missing(model_of(row));
+            let known = row_cost
+                .get("known")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let disabled = row_cost
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let cny = row_cost.get("cny").and_then(Value::as_f64).unwrap_or(0.0);
+            if known {
+                cost.cny += cny;
+            } else if !disabled {
+                cost.bump_missing(model.clone());
             }
         }
     }
@@ -510,7 +534,7 @@ pub fn build_usage_snapshot_priced(rows: &[Value], pricing: Option<&Pricing>) ->
     }
     // 成本键（Python `_empty_stats` 的 `cost_cny` / `cost_missing`，位置也在
     // token 字段之后、`by_model` 之前）。**没有定价表 ⇒ 整组省略**。
-    if pricing.is_some() {
+    if fallback.is_some() || !policies.is_empty() {
         out.insert("cost_cny".into(), Value::from(cost.cny));
         out.insert("cost_missing".into(), Value::Object(cost.missing.clone()));
     }
@@ -523,7 +547,7 @@ pub fn build_usage_snapshot_priced(rows: &[Value], pricing: Option<&Pricing>) ->
         let mut value = Map::new();
         value.insert("requests".into(), Value::from(bucket.requests));
         value.insert("accounts".into(), Value::Object(bucket.accounts.clone()));
-        if pricing.is_some() {
+        if fallback.is_some() || !policies.is_empty() {
             value.insert("cost_cny".into(), Value::from(bucket.cny));
         }
         for (index, field) in TOKEN_FIELDS.iter().enumerate() {
@@ -638,7 +662,7 @@ fn models_list(models: &Map<String, Value>) -> Value {
 /// - 没有 `keys`（Rust 侧拿不到 Python 的 settings key id）与 `usd_cny`。
 /// - `by_date` 是 Rust 侧新增的（Python 的日桶只在窗口聚合内部用，不外露）。
 pub fn build_usage_analytics(rows: &[Value]) -> Value {
-    build_usage_analytics_priced(rows, None)
+    build_usage_analytics_priced(rows, &HashMap::new(), None, true)
 }
 
 /// 用量分析（**带成本估算**）。
@@ -646,7 +670,12 @@ pub fn build_usage_analytics(rows: &[Value]) -> Value {
 /// `pricing` 为 `None` ⇒ 与 [`build_usage_analytics`] 完全一致。
 /// 有定价表 ⇒ `summary` 与 `models` 各桶补上 `cost_cny`（Python 的
 /// `_new_analytics_stat` / `_bump_analytics_models` 同款）。
-pub fn build_usage_analytics_priced(rows: &[Value], pricing: Option<&Pricing>) -> Value {
+pub fn build_usage_analytics_priced(
+    rows: &[Value],
+    policies: &HashMap<String, Policy>,
+    fallback: Option<&Pricing>,
+    enabled: bool,
+) -> Value {
     let mut totals = Bucket::default();
     let mut dates = Buckets::new();
     let mut cost = CostFold::default();
@@ -654,10 +683,14 @@ pub fn build_usage_analytics_priced(rows: &[Value], pricing: Option<&Pricing>) -
     for row in rows {
         let date = row_date(row);
         let outcome = row_outcome(row);
+        let model = model_of(row);
         // 中止行不计价（与快照同口径）。
-        let row_cost = match pricing {
-            Some(pricing) if outcome != "client_aborted" => Some(price::compute_row(row, pricing)),
-            _ => None,
+        let row_cost = if outcome != "client_aborted" {
+            Some(pricing_store::cost_for_row(
+                row, policies, fallback, enabled,
+            ))
+        } else {
+            None
         };
         if outcome == "completed" {
             totals.fold_completed(row);
@@ -667,10 +700,19 @@ pub fn build_usage_analytics_priced(rows: &[Value], pricing: Option<&Pricing>) -
             dates.entry(date).fold_failed();
         }
         if let Some(row_cost) = &row_cost {
-            if row_cost.known {
-                cost.cny += row_cost.cny;
-            } else {
-                cost.bump_missing(model_of(row));
+            let known = row_cost
+                .get("known")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let disabled = row_cost
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let cny = row_cost.get("cny").and_then(Value::as_f64).unwrap_or(0.0);
+            if known {
+                cost.cny += cny;
+            } else if !disabled {
+                cost.bump_missing(model.clone());
             }
         }
     }
@@ -693,12 +735,12 @@ pub fn build_usage_analytics_priced(rows: &[Value], pricing: Option<&Pricing>) -
     };
     summary.insert("total_requests".into(), Value::from(totals.total_rows));
     summary.insert("errors".into(), Value::from(totals.errors));
-    if pricing.is_some() {
+    if fallback.is_some() || !policies.is_empty() {
         summary.insert("cost_cny".into(), Value::from(cost.cny));
     }
 
     let by_account = build_usage_by_account(rows);
-    let snapshot = build_usage_snapshot_priced(rows, pricing);
+    let snapshot = build_usage_snapshot_priced(rows, policies, fallback, enabled);
 
     let mut out = Map::new();
     out.insert("realm".into(), Value::from("all"));
@@ -770,7 +812,7 @@ pub struct SnapshotDecor {
 /// - `account` 里没有 `domain` / `issuer`：Rust 侧拿不到这两个值 ⇒ 省略
 ///   这两个子键，而不是写假的空串。
 pub fn build_usage_snapshot_with(rows: &[Value], decor: &SnapshotDecor) -> Value {
-    build_usage_snapshot_with_priced(rows, decor, None)
+    build_usage_snapshot_with_priced(rows, decor, &HashMap::new(), None, true)
 }
 
 /// 用量快照 + 装饰键（**带成本估算**）。
@@ -782,9 +824,11 @@ pub fn build_usage_snapshot_with(rows: &[Value], decor: &SnapshotDecor) -> Value
 pub fn build_usage_snapshot_with_priced(
     rows: &[Value],
     decor: &SnapshotDecor,
-    pricing: Option<&Pricing>,
+    policies: &HashMap<String, Policy>,
+    fallback: Option<&Pricing>,
+    enabled: bool,
 ) -> Value {
-    let mut out = match build_usage_snapshot_priced(rows, pricing) {
+    let mut out = match build_usage_snapshot_priced(rows, policies, fallback, enabled) {
         Value::Object(map) => map,
         _ => Map::new(),
     };
@@ -804,8 +848,10 @@ pub fn build_usage_snapshot_with_priced(
             decor.realm.clone()
         }),
     );
-    if let Some(pricing) = pricing {
+    if let Some(pricing) = fallback {
         out.insert("usd_cny".into(), Value::from(pricing.usd_cny()));
+    } else if let Some(p) = policies.values().next() {
+        out.insert("usd_cny".into(), Value::from(p.usd_cny));
     }
     if let Some(accounts_map) = &decor.accounts_map {
         out.insert("accounts_map".into(), accounts_map.clone());
@@ -937,7 +983,7 @@ pub fn pick_bucket_seconds(span_secs: f64, requested: Option<i64>) -> i64 {
 /// `cost_band_note` / `cost_via_derived`）依赖定价表 ⇒ 要用它们请调
 /// [`build_usage_recent_priced`]；`usd_cny` 同理。
 pub fn build_usage_recent(rows: &[Value], realm: &str, page: i64, limit: i64) -> Value {
-    build_usage_recent_priced(rows, realm, page, limit, None)
+    build_usage_recent_priced(rows, realm, page, limit, &HashMap::new(), None, true)
 }
 
 /// 分页的最近用量行（**带成本估算**）。
@@ -973,7 +1019,9 @@ pub fn build_usage_recent_priced(
     realm: &str,
     page: i64,
     limit: i64,
-    pricing: Option<&Pricing>,
+    policies: &HashMap<String, Policy>,
+    fallback: Option<&Pricing>,
+    enabled: bool,
 ) -> Value {
     let limit = limit.max(1) as usize;
     let matched: Vec<&Value> = rows
@@ -990,9 +1038,12 @@ pub fn build_usage_recent_priced(
         .rev()
         .skip(start)
         .take(limit)
-        .map(|row| match pricing {
-            Some(pricing) => decorate_cost_row(row, pricing),
-            None => (*row).clone(),
+        .map(|row| {
+            if enabled {
+                decorate_cost_row_policy(row, policies, fallback, enabled)
+            } else {
+                (*row).clone()
+            }
         })
         .collect();
 
@@ -1001,8 +1052,10 @@ pub fn build_usage_recent_priced(
     out.insert("page".into(), Value::from(page as i64));
     out.insert("limit".into(), Value::from(limit as i64));
     out.insert("total_pages".into(), Value::from(total_pages as i64));
-    if let Some(pricing) = pricing {
+    if let Some(pricing) = fallback {
         out.insert("usd_cny".into(), Value::from(pricing.usd_cny()));
+    } else if let Some(p) = policies.values().next() {
+        out.insert("usd_cny".into(), Value::from(p.usd_cny));
     }
     out.insert("rows".into(), Value::Array(page_rows));
     Value::Object(out)
@@ -1764,4 +1817,101 @@ mod tests {
         assert_eq!(py_round(1.5), 2.0);
         assert_eq!(py_round(2.5), 2.0);
     }
+}
+
+/// 给一行补上成本明细键（策略层版本）。
+fn decorate_cost_row_policy(
+    row: &Value,
+    policies: &HashMap<String, Policy>,
+    fallback: Option<&Pricing>,
+    enabled: bool,
+) -> Value {
+    if !enabled {
+        return row.clone();
+    }
+    let cost = pricing_store::cost_for_row(row, policies, fallback, enabled);
+    let known = cost.get("known").and_then(Value::as_bool).unwrap_or(false);
+    if !known {
+        return row.clone();
+    }
+    let mut out = match row {
+        Value::Object(map) => map.clone(),
+        other => return other.clone(),
+    };
+    out.insert(
+        "cost_cny".into(),
+        Value::from(price::round6(
+            cost.get("cny").and_then(Value::as_f64).unwrap_or(0.0),
+        )),
+    );
+    if let Some(v) = cost.get("band") {
+        if !v.is_null() {
+            out.insert("cost_band".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("source") {
+        out.insert("cost_source".into(), v.clone());
+    }
+    if let Some(v) = cost.get("source_at") {
+        if !v.is_null() {
+            out.insert("cost_source_at".into(), v.clone());
+        }
+    }
+    out.insert(
+        "cost_backfilled".into(),
+        Value::Bool(
+            cost.get("backfilled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    if let Some(v) = cost.get("rates") {
+        if !v.is_null() {
+            out.insert("cost_rates".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("unit") {
+        if !v.is_null() {
+            out.insert("cost_unit".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("currency") {
+        if !v.is_null() {
+            out.insert("cost_currency".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("usd_cny") {
+        if !v.is_null() {
+            out.insert("cost_usd_cny".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("or_id") {
+        if !v.is_null() {
+            out.insert("cost_or_id".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("via") {
+        if !v.is_null() {
+            out.insert("cost_via".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("inherited_from") {
+        if !v.is_null() {
+            out.insert("cost_inherited_from".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("override_from") {
+        if !v.is_null() {
+            out.insert("cost_override_from".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("band_note") {
+        if !v.is_null() {
+            out.insert("cost_band_note".into(), v.clone());
+        }
+    }
+    if let Some(v) = cost.get("via_derived") {
+        out.insert("cost_via_derived".into(), v.clone());
+    }
+    Value::Object(out)
 }

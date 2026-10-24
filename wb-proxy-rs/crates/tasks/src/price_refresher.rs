@@ -719,28 +719,143 @@ impl Drop for RunLockGuard<'_> {
 /// **一个价格一行**、时间线只在指派变了时才追加。这里按关卡 4.19 的接口
 /// 约定，每轮各追加一行。
 pub fn write_snapshot_files(usage_dir: &Path, doc: &Value, at: f64) -> Result<(), String> {
-    let policies = usage_dir.join(POLICIES_FILE);
-    let timeline = usage_dir.join(TIMELINE_FILE);
+    let policies_path = usage_dir.join(POLICIES_FILE);
+    let timeline_path = usage_dir.join(TIMELINE_FILE);
 
-    crate::activity::append_row(&policies, doc)?;
-
-    let models = doc
-        .get("models")
-        .and_then(Value::as_object)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let generated_at = doc
+    let usd = doc
         .get("meta")
-        .and_then(|m| m.get("generated_at"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let entry = json!({
-        "at": at,
-        "generated_at": generated_at,
-        "models": models,
-    });
-    crate::activity::append_row(&timeline, &entry)?;
+        .and_then(|m| m.get("usd_cny"))
+        .and_then(Value::as_f64)
+        .unwrap_or(crate::price::USD_CNY);
+    let stamp = at;
+
+    // 已知策略 id（策略表里已有的行）。
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(text) = std::fs::read_to_string(&policies_path) {
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if let Some(id) = v.get("id").and_then(Value::as_str) {
+                    known.insert(id.to_string());
+                }
+            }
+        }
+    }
+
+    // 上一次的指派（时间线最后一行）。
+    let mut previous: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string(&timeline_path) {
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if let Some(pol) = v.get("policies").and_then(Value::as_object) {
+                    previous.clear();
+                    for (k, val) in pol {
+                        if let Some(s) = val.as_str() {
+                            previous.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let models_obj = doc.get("models").and_then(Value::as_object);
+
+    // 计算指派 + 收集新策略行。
+    let mut assignment: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut fresh: Vec<Value> = Vec::new();
+
+    if let Some(models) = models_obj {
+        for (model, entry) in models {
+            let flat =
+                crate::price::RateTable::from_json(entry.get("flat").unwrap_or(&Value::Null));
+            let bands: Vec<crate::price::Band> = entry
+                .get("bands")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(crate::price::parse_band).collect())
+                .unwrap_or_default();
+            let pid = crate::price::policy_id(model, &flat, &bands, usd);
+            assignment.insert(model.clone(), Value::String(pid.clone()));
+
+            if known.contains(&pid) {
+                continue;
+            }
+            known.insert(pid.clone());
+
+            let or_id = entry
+                .get("or_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let currency = entry
+                .get("currency")
+                .and_then(Value::as_str)
+                .unwrap_or("USD")
+                .to_string();
+            let unit = entry
+                .get("unit")
+                .and_then(Value::as_f64)
+                .filter(|u| *u != 0.0)
+                .unwrap_or(1_000_000.0);
+            let via = entry
+                .get("via")
+                .and_then(Value::as_str)
+                .unwrap_or("direct")
+                .to_string();
+            let inherited_from = entry.get("inherited_from").cloned();
+            let override_from = entry.get("override_from").cloned();
+            let entry_flat = entry.get("flat").cloned().unwrap_or_else(|| json!({}));
+            let entry_bands = entry.get("bands").cloned();
+
+            let row = json!({
+                "id": pid,
+                "model": model,
+                "or_id": or_id,
+                "currency": currency,
+                "unit": unit,
+                "usd_cny": usd,
+                "flat": entry_flat,
+                "bands": entry_bands,
+                "via": via,
+                "inherited_from": inherited_from,
+                "override_from": override_from,
+                "first_seen": stamp,
+            });
+            fresh.push(row);
+        }
+    }
+
+    // 写新策略行。
+    for row in &fresh {
+        crate::activity::append_row(&policies_path, row)?;
+    }
+
+    // 指派变了 ⇒ 追加时间线行。
+    let mut changed = false;
+    if !assignment.is_empty() {
+        // 比较 assignment 与 previous
+        let mut cur: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        for (k, v) in &assignment {
+            if let Some(s) = v.as_str() {
+                cur.insert(k.clone(), s.to_string());
+            }
+        }
+        if cur != previous {
+            let tl_entry = json!({
+                "at": stamp,
+                "policies": assignment,
+            });
+            crate::activity::append_row(&timeline_path, &tl_entry)?;
+            changed = true;
+        }
+    }
+    let _ = changed;
     Ok(())
 }
 

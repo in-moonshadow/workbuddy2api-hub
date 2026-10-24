@@ -1922,11 +1922,15 @@ async fn usage_get(
     let decor = snapshot_decor(&state, &realm, now).await;
     // 定价表（关卡 4.21 线 A）：读策略库里的最新一份快照。读不到 ⇒ 传
     // `None` ⇒ 成本相关的键**整键省略**（不是 0），与「无定价表」的口径一致。
+    let policies = wb_tasks::pricing_store::load_policies(&state.task.usage_dir);
     let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
+    wb_tasks::pricing_store::set_usage_dir(&state.task.usage_dir);
     Json(wb_tasks::usage::build_usage_snapshot_with_priced(
         &rows,
         &decor,
+        &policies,
         pricing.as_ref(),
+        true,
     ))
     .into_response()
 }
@@ -2041,13 +2045,17 @@ async fn usage_recent_get(
         .map(|value| value.max(1))
         .unwrap_or(1);
     let rows = read_usage_rows(&state);
+    let policies = wb_tasks::pricing_store::load_policies(&state.task.usage_dir);
     let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
+    wb_tasks::pricing_store::set_usage_dir(&state.task.usage_dir);
     Json(wb_tasks::usage::build_usage_recent_priced(
         &rows,
         &realm,
         page,
         limit,
+        &policies,
         pricing.as_ref(),
+        true,
     ))
     .into_response()
 }
@@ -2168,10 +2176,14 @@ async fn usage_analytics(
         .into_iter()
         .filter(|row| wb_tasks::usage::realm_matches(row, &realm))
         .collect();
+    let policies = wb_tasks::pricing_store::load_policies(&state.task.usage_dir);
     let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
+    wb_tasks::pricing_store::set_usage_dir(&state.task.usage_dir);
     Json(wb_tasks::usage::build_usage_analytics_priced(
         &rows,
+        &policies,
         pricing.as_ref(),
+        true,
     ))
     .into_response()
 }

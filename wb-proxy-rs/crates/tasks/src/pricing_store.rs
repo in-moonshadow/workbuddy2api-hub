@@ -188,3 +188,501 @@ mod tests {
         assert!(load_pricing_from_rows(&[json!({"x": 1}), json!([1, 2])]).is_none());
     }
 }
+
+use crate::price::{Band, PricingEntry, RateTable};
+use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+static LAST_USAGE_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+fn remember_dir(dir: &Path) {
+    if let Ok(mut g) = LAST_USAGE_DIR.lock() {
+        *g = Some(dir.to_path_buf());
+    }
+}
+
+pub fn set_usage_dir(dir: &Path) {
+    remember_dir(dir);
+}
+
+fn current_usage_dir() -> Option<std::path::PathBuf> {
+    LAST_USAGE_DIR.lock().ok().and_then(|g| g.clone())
+}
+
+#[derive(Debug, Clone)]
+pub struct Policy {
+    pub id: String,
+    pub model: String,
+    pub or_id: String,
+    pub currency: String,
+    pub unit: f64,
+    pub usd_cny: f64,
+    pub flat: RateTable,
+    pub bands: Vec<Band>,
+    pub via: Option<String>,
+    pub inherited_from: Option<String>,
+    pub override_from: Option<String>,
+    pub first_seen: Option<f64>,
+}
+
+pub fn load_policies(usage_dir: &Path) -> HashMap<String, Policy> {
+    remember_dir(usage_dir);
+    let mut out = HashMap::new();
+    let path = usage_dir.join(crate::price_refresher::POLICIES_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return out,
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(id) = doc.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let model = doc
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let or_id = doc
+            .get("or_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let currency = doc
+            .get("currency")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("USD")
+            .to_string();
+        let unit = doc
+            .get("unit")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|u| *u != 0.0)
+            .unwrap_or(1_000_000.0);
+        let usd_cny = doc
+            .get("usd_cny")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| *v != 0.0)
+            .unwrap_or(1.0);
+        let flat = doc
+            .get("flat")
+            .map(RateTable::from_json)
+            .unwrap_or_default();
+        let bands = doc
+            .get("bands")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().filter_map(parse_band_local).collect())
+            .unwrap_or_default();
+        let via = nonempty_local(doc.get("via"));
+        let inherited_from = nonempty_local(doc.get("inherited_from"));
+        let override_from = nonempty_local(doc.get("override_from"));
+        let first_seen = doc.get("first_seen").and_then(serde_json::Value::as_f64);
+        out.insert(
+            id.to_string(),
+            Policy {
+                id: id.to_string(),
+                model,
+                or_id,
+                currency,
+                unit,
+                usd_cny,
+                flat,
+                bands,
+                via,
+                inherited_from,
+                override_from,
+                first_seen,
+            },
+        );
+    }
+    out
+}
+
+pub fn load_timeline(usage_dir: &Path) -> Vec<serde_json::Value> {
+    remember_dir(usage_dir);
+    let path = usage_dir.join(crate::price_refresher::TIMELINE_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            out.push(doc);
+        }
+    }
+    out
+}
+
+pub fn policy_ref_at(
+    timeline: &[serde_json::Value],
+    at: f64,
+    model: &str,
+) -> (Option<String>, bool) {
+    if timeline.is_empty() {
+        return (None, false);
+    }
+    let mut idx: isize = -1;
+    for (i, row) in timeline.iter().enumerate() {
+        let t = row
+            .get("at")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        if t <= at {
+            idx = i as isize;
+        } else {
+            break;
+        }
+    }
+    let index = if idx < 0 { 0usize } else { idx as usize };
+
+    if let Some(rows) = timeline.get(index).and_then(|r| r.get("policies")) {
+        if let Some(hit) = rows.get(model).and_then(serde_json::Value::as_str) {
+            return (Some(hit.to_string()), false);
+        }
+    }
+    for row in timeline.iter() {
+        let t = row
+            .get("at")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        if t < at {
+            continue;
+        }
+        if let Some(hit) = row
+            .get("policies")
+            .and_then(|p| p.get(model))
+            .and_then(serde_json::Value::as_str)
+        {
+            return (Some(hit.to_string()), true);
+        }
+    }
+    let end = (index + 1).min(timeline.len());
+    for row in timeline[..end].iter().rev() {
+        if let Some(hit) = row
+            .get("policies")
+            .and_then(|p| p.get(model))
+            .and_then(serde_json::Value::as_str)
+        {
+            return (Some(hit.to_string()), true);
+        }
+    }
+    (None, false)
+}
+
+pub fn cost_for_row(
+    row: &serde_json::Value,
+    policies: &HashMap<String, Policy>,
+    fallback: Option<&Pricing>,
+    enabled: bool,
+) -> serde_json::Value {
+    if !enabled {
+        let mut cost = serde_json::Map::new();
+        cost.insert("cny".into(), json!(0.0));
+        cost.insert("known".into(), json!(false));
+        cost.insert("band".into(), serde_json::Value::Null);
+        cost.insert("source".into(), json!("builtin"));
+        cost.insert("source_at".into(), serde_json::Value::Null);
+        cost.insert("backfilled".into(), json!(false));
+        cost.insert("disabled".into(), json!(true));
+        for k in [
+            "rates",
+            "unit",
+            "currency",
+            "usd_cny",
+            "or_id",
+            "via",
+            "inherited_from",
+            "override_from",
+            "band_note",
+            "via_derived",
+        ] {
+            cost.insert(k.into(), serde_json::Value::Null);
+        }
+        return serde_json::Value::Object(cost);
+    }
+
+    let model = row
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    let mut pid: Option<String> = row
+        .get("cost_policy")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut backfilled = false;
+    if pid.is_none() {
+        let at = row
+            .get("at")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let timeline = current_usage_dir()
+            .map(|d| load_timeline(&d))
+            .unwrap_or_default();
+        let (p, bf) = policy_ref_at(&timeline, at, model);
+        pid = p;
+        backfilled = bf;
+    }
+
+    if let Some(pid) = pid.clone() {
+        if let Some(policy) = policies.get(&pid) {
+            let mut models = std::collections::HashMap::new();
+            models.insert(
+                model.to_string(),
+                PricingEntry {
+                    display: model.to_string(),
+                    source: "openrouter".to_string(),
+                    currency: policy.currency.clone(),
+                    unit: policy.unit,
+                    or_id: policy.or_id.clone(),
+                    flat: policy.flat,
+                    bands: policy.bands.clone(),
+                    via: policy.via.clone(),
+                    inherited_from: policy.inherited_from.clone(),
+                    override_from: policy.override_from.clone(),
+                    id: policy.id.clone(),
+                    usd_cny: policy.usd_cny,
+                    first_seen: policy.first_seen,
+                },
+            );
+            let pricing = Pricing {
+                base_currency: "CNY".to_string(),
+                usd_cny: policy.usd_cny,
+                models,
+            };
+            let cost_res = crate::price::compute_row(row, &pricing);
+            let entry = pricing.models.get(model);
+            let band_note = entry.and_then(|e| crate::price::band_note(e, cost_res.band));
+            let mut cost = serde_json::Map::new();
+            cost.insert("cny".into(), json!(cost_res.cny));
+            cost.insert("known".into(), json!(cost_res.known));
+            cost.insert(
+                "band".into(),
+                cost_res
+                    .band
+                    .map(|b| json!(b))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert("source".into(), json!(pid));
+            cost.insert(
+                "source_at".into(),
+                policy
+                    .first_seen
+                    .map(|v| json!(v))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert("backfilled".into(), json!(backfilled));
+            cost.insert("disabled".into(), json!(false));
+            cost.insert(
+                "rates".into(),
+                cost_res
+                    .rates
+                    .map(|r| r.to_json())
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert(
+                "unit".into(),
+                entry
+                    .map(|e| json!(e.unit))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert(
+                "currency".into(),
+                entry
+                    .map(|e| json!(e.currency.clone()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert("usd_cny".into(), json!(policy.usd_cny));
+            cost.insert(
+                "or_id".into(),
+                entry
+                    .map(|e| json!(e.or_id.clone()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert(
+                "via".into(),
+                json!(entry
+                    .and_then(|e| e.via.clone())
+                    .unwrap_or_else(|| "direct".to_string())),
+            );
+            cost.insert(
+                "inherited_from".into(),
+                entry
+                    .and_then(|e| e.inherited_from.clone())
+                    .map(|v| json!(v))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert(
+                "override_from".into(),
+                entry
+                    .and_then(|e| e.override_from.clone())
+                    .map(|v| json!(v))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert(
+                "band_note".into(),
+                band_note
+                    .map(|v| json!(v))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            cost.insert("via_derived".into(), json!(false));
+            return serde_json::Value::Object(cost);
+        }
+    }
+
+    if let Some(doc) = fallback {
+        let cost_res = crate::price::compute_row(row, doc);
+        let entry = doc.models.get(model);
+        let band_note = entry.and_then(|e| crate::price::band_note(e, cost_res.band));
+        let mut cost = serde_json::Map::new();
+        cost.insert("cny".into(), json!(cost_res.cny));
+        cost.insert("known".into(), json!(cost_res.known));
+        cost.insert(
+            "band".into(),
+            cost_res
+                .band
+                .map(|b| json!(b))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        cost.insert("source".into(), json!("builtin"));
+        cost.insert("source_at".into(), serde_json::Value::Null);
+        cost.insert("backfilled".into(), json!(false));
+        cost.insert("disabled".into(), json!(false));
+        cost.insert(
+            "rates".into(),
+            cost_res
+                .rates
+                .map(|r| r.to_json())
+                .unwrap_or(serde_json::Value::Null),
+        );
+        cost.insert(
+            "unit".into(),
+            entry
+                .map(|e| json!(e.unit))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        cost.insert(
+            "currency".into(),
+            entry
+                .map(|e| json!(e.currency.clone()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        cost.insert("usd_cny".into(), json!(doc.usd_cny));
+        cost.insert(
+            "or_id".into(),
+            entry
+                .map(|e| json!(e.or_id.clone()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        cost.insert(
+            "via".into(),
+            json!(entry
+                .and_then(|e| e.via.clone())
+                .unwrap_or_else(|| "direct".to_string())),
+        );
+        cost.insert(
+            "inherited_from".into(),
+            entry
+                .and_then(|e| e.inherited_from.clone())
+                .map(|v| json!(v))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        cost.insert(
+            "override_from".into(),
+            entry
+                .and_then(|e| e.override_from.clone())
+                .map(|v| json!(v))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        cost.insert(
+            "band_note".into(),
+            band_note
+                .map(|v| json!(v))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        cost.insert("via_derived".into(), json!(false));
+        return serde_json::Value::Object(cost);
+    }
+
+    let mut cost = serde_json::Map::new();
+    cost.insert("cny".into(), json!(0.0));
+    cost.insert("known".into(), json!(false));
+    cost.insert("band".into(), serde_json::Value::Null);
+    cost.insert("source".into(), json!("builtin"));
+    cost.insert("source_at".into(), serde_json::Value::Null);
+    cost.insert("backfilled".into(), json!(false));
+    cost.insert("disabled".into(), json!(false));
+    for k in [
+        "rates",
+        "unit",
+        "currency",
+        "usd_cny",
+        "or_id",
+        "via",
+        "inherited_from",
+        "override_from",
+        "band_note",
+        "via_derived",
+    ] {
+        cost.insert(k.into(), serde_json::Value::Null);
+    }
+    serde_json::Value::Object(cost)
+}
+
+fn parse_band_local(value: &serde_json::Value) -> Option<Band> {
+    if !value.is_object() {
+        return None;
+    }
+    let flat = value
+        .get("flat")
+        .map(RateTable::from_json)
+        .unwrap_or_default();
+    let min_prompt_tokens = value
+        .get("min_prompt_tokens")
+        .and_then(serde_json::Value::as_f64);
+    let days = value
+        .get("days")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
+    let start = value
+        .get("start")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let end = value
+        .get("end")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|e| *e != 0.0)
+        .unwrap_or(2400.0);
+    Some(Band {
+        flat,
+        min_prompt_tokens,
+        days,
+        start,
+        end,
+    })
+}
+
+fn nonempty_local(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}

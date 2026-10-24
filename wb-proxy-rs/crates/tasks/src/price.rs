@@ -158,6 +158,12 @@ pub struct PricingEntry {
     pub or_id: String,
     pub flat: RateTable,
     pub bands: Vec<Band>,
+    /// 策略内容哈希（Python `policy_id()`）。
+    pub id: String,
+    /// 该策略落定时的汇率（Python `entry["usd_cny"]`）。
+    pub usd_cny: f64,
+    /// 该策略首次出现的 epoch（Python `entry["first_seen"]`）。
+    pub first_seen: Option<f64>,
     /// 这条价**怎么匹配来的**（Python `entry["via"]`）：`"variant"`（剥后缀
     /// 继承）/ `"override"`（人工映射表）。
     ///
@@ -210,6 +216,13 @@ impl PricingEntry {
                 .to_string(),
             flat,
             bands,
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            usd_cny: value.get("usd_cny").and_then(Value::as_f64).unwrap_or(0.0),
+            first_seen: value.get("first_seen").and_then(Value::as_f64),
             via: nonempty(value.get("via")),
             inherited_from: nonempty(value.get("inherited_from")),
             override_from: nonempty(value.get("override_from")),
@@ -227,7 +240,7 @@ fn nonempty(value: Option<&Value>) -> Option<String> {
 }
 
 /// 解析一条 band。
-fn parse_band(value: &Value) -> Option<Band> {
+pub fn parse_band(value: &Value) -> Option<Band> {
     if !value.is_object() {
         return None;
     }
@@ -994,6 +1007,171 @@ pub fn build_snapshot(
         unpriced,
         overridden,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 关卡 4.23-甲：策略内容哈希（Python `wb_pricing.policy_id`，`:1612-1622`）
+// ---------------------------------------------------------------------------
+
+/// 内容哈希：相同模型、相同价格、相同汇率 ⇒ 相同 id。
+///
+/// Python `json.dumps({...}, sort_keys=True, ensure_ascii=False)` 默认分隔符
+/// 带空格（`", "` / `": "`），所以这里**手工拼**带空格的 JSON，不能用
+/// `serde_json::to_string`（紧凑无空格）。键递归排序。
+pub fn policy_id(model: &str, flat: &RateTable, bands: &[Band], usd_cny: f64) -> String {
+    let bands_json = if bands.is_empty() {
+        "null".to_string()
+    } else {
+        let items: Vec<String> = bands.iter().map(serialize_band).collect();
+        format!("[{}]", items.join(", "))
+    };
+    let flat_json = serialize_flat(flat);
+    let payload = format!(
+        "{{\"bands\": {}, \"flat\": {}, \"model\": {}, \"usd_cny\": {}}}",
+        bands_json,
+        flat_json,
+        json_string(model),
+        format_number(round6(usd_cny)),
+    );
+    let digest = sha1_hex(payload.as_bytes());
+    digest[..12].to_string()
+}
+
+fn serialize_flat(rt: &RateTable) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = rt.input_cache_hit {
+        parts.push(format!("\"input_cache_hit\": {}", format_number(v)));
+    }
+    if let Some(v) = rt.input_cache_miss {
+        parts.push(format!("\"input_cache_miss\": {}", format_number(v)));
+    }
+    if let Some(v) = rt.output {
+        parts.push(format!("\"output\": {}", format_number(v)));
+    }
+    // 键已按字母序插入（input_cache_hit < input_cache_miss < output）。
+    format!("{{{}}}", parts.join(", "))
+}
+
+fn serialize_band(band: &Band) -> String {
+    if let Some(threshold) = band.min_prompt_tokens {
+        // 长度档：flat + min_prompt_tokens
+        format!(
+            "{{\"flat\": {}, \"min_prompt_tokens\": {}}}",
+            serialize_flat(&band.flat),
+            format_number(threshold),
+        )
+    } else {
+        // 时段档：days + end + flat + start（字母序）
+        let days = match &band.days {
+            Some(list) => {
+                let items: Vec<String> = list.iter().map(|s| json_string(s)).collect();
+                format!("[{}]", items.join(", "))
+            }
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"days\": {}, \"end\": {}, \"flat\": {}, \"start\": {}}}",
+            days,
+            format_number(band.end),
+            serialize_flat(&band.flat),
+            format_number(band.start),
+        )
+    }
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn format_number(x: f64) -> String {
+    // Python json.dumps 的 float 最短表示：始终带小数点。
+    let s = format!("{:.6}", x);
+    let trimmed = s.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        format!("{}0", trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-1（纯 Rust，避免新增依赖）
+// ---------------------------------------------------------------------------
+
+fn sha1_hex(data: &[u8]) -> String {
+    // 标准 SHA-1 实现。
+    let mut h0: u32 = 0x67452301;
+    let mut h1: u32 = 0xEFCDAB89;
+    let mut h2: u32 = 0x98BADCFE;
+    let mut h3: u32 = 0x10325476;
+    let mut h4: u32 = 0xC3D2E1F0;
+
+    // 填充
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64) * 8;
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+        for i in 0..80 {
+            let (f, k) = if i < 20 {
+                ((b & c) | ((!b) & d), 0x5A827999u32)
+            } else if i < 40 {
+                (b ^ c ^ d, 0x6ED9EBA1u32)
+            } else if i < 60 {
+                ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32)
+            } else {
+                (b ^ c ^ d, 0xCA62C1D6u32)
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    format!("{:08x}{:08x}{:08x}{:08x}{:08x}", h0, h1, h2, h3, h4)
 }
 
 #[cfg(test)]

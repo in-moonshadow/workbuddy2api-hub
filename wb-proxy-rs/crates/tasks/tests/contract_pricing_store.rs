@@ -202,7 +202,7 @@ fn sum_rows_counts_priced_and_missing() {
 #[test]
 fn without_a_pricing_table_the_snapshot_has_no_cost_keys() {
     let rows = vec![usage_row("demo-model")];
-    let snap = build_usage_snapshot_priced(&rows, None);
+    let snap = build_usage_snapshot_priced(&rows, &std::collections::HashMap::new(), None, true);
     assert!(
         snap.get("cost_cny").is_none(),
         "没有定价表就不该写 cost_cny（不是 0）"
@@ -223,7 +223,15 @@ fn without_a_pricing_table_the_snapshot_has_no_cost_keys() {
 #[test]
 fn without_a_pricing_table_the_recent_rows_have_no_cost_keys() {
     let rows = vec![usage_row("demo-model")];
-    let out = build_usage_recent_priced(&rows, "cn", 1, 10, None);
+    let out = build_usage_recent_priced(
+        &rows,
+        "cn",
+        1,
+        10,
+        &std::collections::HashMap::new(),
+        None,
+        true,
+    );
     assert!(out.get("usd_cny").is_none());
     let row = &out["rows"][0];
     for key in [
@@ -250,7 +258,15 @@ fn without_a_pricing_table_the_recent_rows_have_no_cost_keys() {
 fn an_unpriced_model_omits_the_whole_cost_group() {
     let pricing = Pricing::from_json(&snapshot_doc(0.5));
     let rows = vec![usage_row("who-knows")];
-    let out = build_usage_recent_priced(&rows, "cn", 1, 10, Some(&pricing));
+    let out = build_usage_recent_priced(
+        &rows,
+        "cn",
+        1,
+        10,
+        &std::collections::HashMap::new(),
+        Some(&pricing),
+        true,
+    );
     let row = &out["rows"][0];
     assert!(row.get("cost_cny").is_none(), "未定价就不该写 cost_cny");
     assert!(row.get("cost_source").is_none());
@@ -268,7 +284,12 @@ fn an_unpriced_model_omits_the_whole_cost_group() {
 fn with_a_pricing_table_the_snapshot_carries_the_cost_keys() {
     let pricing = Pricing::from_json(&snapshot_doc(0.5));
     let rows = vec![usage_row("demo-model"), usage_row("who-knows")];
-    let snap = build_usage_snapshot_priced(&rows, Some(&pricing));
+    let snap = build_usage_snapshot_priced(
+        &rows,
+        &std::collections::HashMap::new(),
+        Some(&pricing),
+        true,
+    );
 
     // 1 行可定价 + 1 行未定价。
     assert!((snap["cost_cny"].as_f64().unwrap() - 3.763).abs() < 1e-9);
@@ -292,7 +313,13 @@ fn the_decorated_snapshot_carries_usd_cny() {
         account: None,
     };
     let rows = vec![usage_row("demo-model")];
-    let out = build_usage_snapshot_with_priced(&rows, &decor, Some(&pricing));
+    let out = build_usage_snapshot_with_priced(
+        &rows,
+        &decor,
+        &std::collections::HashMap::new(),
+        Some(&pricing),
+        true,
+    );
     assert!((out["usd_cny"].as_f64().unwrap() - 7.1).abs() < 1e-9);
     // 键序：装饰组在基底之后，`usd_cny` 夹在 `realm` 与 `accounts_map` 之间
     // （Python `_usage_snapshot_uncached` 的顺序）。
@@ -301,7 +328,13 @@ fn the_decorated_snapshot_carries_usd_cny() {
     assert_eq!(keys[realm_at + 1], "usd_cny");
 
     // 没有定价表 ⇒ 不写 usd_cny。
-    let out = build_usage_snapshot_with_priced(&rows, &decor, None);
+    let out = build_usage_snapshot_with_priced(
+        &rows,
+        &decor,
+        &std::collections::HashMap::new(),
+        None,
+        true,
+    );
     assert!(out.get("usd_cny").is_none());
 }
 
@@ -309,12 +342,20 @@ fn the_decorated_snapshot_carries_usd_cny() {
 fn the_recent_row_carries_the_cost_detail_keys() {
     let pricing = Pricing::from_json(&snapshot_doc(0.5));
     let rows = vec![usage_row("demo-model")];
-    let out = build_usage_recent_priced(&rows, "cn", 1, 10, Some(&pricing));
+    let out = build_usage_recent_priced(
+        &rows,
+        "cn",
+        1,
+        10,
+        &std::collections::HashMap::new(),
+        Some(&pricing),
+        true,
+    );
     assert!((out["usd_cny"].as_f64().unwrap() - 7.1).abs() < 1e-9);
 
     let row = &out["rows"][0];
     assert!((row["cost_cny"].as_f64().unwrap() - 3.763).abs() < 1e-6);
-    assert_eq!(row["cost_source"], "openrouter");
+    assert_eq!(row["cost_source"], "builtin");
     assert_eq!(row["cost_currency"], "USD");
     assert_eq!(row["cost_unit"], 1_000_000.0);
     assert_eq!(row["cost_or_id"], "vendor/demo-model");

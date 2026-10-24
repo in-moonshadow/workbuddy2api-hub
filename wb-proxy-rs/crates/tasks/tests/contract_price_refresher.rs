@@ -223,11 +223,16 @@ async fn first_run_fetches_immediately_and_writes_both_files() {
     assert_eq!(source.fetch_count(), 1, "首次 run_once 立刻抓一次");
     assert_eq!(refresher.status()["last_error"], Value::Null);
 
-    // 策略表：一行 = 整份快照
+    // 策略表：一行 = 一个策略（Python record_policies 口径）
     let policies = read_lines(&policies_path(tmp.path()));
-    assert_eq!(policies.len(), 1, "策略表追加一行快照");
+    assert_eq!(policies.len(), 1, "策略表追加一行策略");
     assert_eq!(
-        policies[0]["models"]["gpt-4o"]["or_id"],
+        policies[0]["model"],
+        json!("gpt-4o"),
+        "策略表里是塑形后的价格条目"
+    );
+    assert_eq!(
+        policies[0]["or_id"],
         json!("openai/gpt-4o"),
         "策略表里是塑形后的价格条目"
     );
@@ -236,7 +241,7 @@ async fn first_run_fetches_immediately_and_writes_both_files() {
     let timeline = read_lines(&timeline_path(tmp.path()));
     assert_eq!(timeline.len(), 1, "时间线追加一行时间戳条目");
     assert_eq!(timeline[0]["at"], json!(1_800_000_000.0));
-    assert_eq!(timeline[0]["models"], json!(1));
+    assert!(timeline[0]["policies"].is_object(), "policies 是对象");
 
     assert_eq!(refresher.status()["last_run"], json!(1_800_000_000.0));
 }
@@ -362,14 +367,13 @@ async fn live_ids_join_the_price_input_list() {
     assert_eq!(result, Some(String::new()), "成功 ⇒ 空文案");
 
     let policies = read_lines(&policies_path(tmp.path()));
-    assert_eq!(policies.len(), 1, "策略表追加一行快照");
-    let models = policies[0]["models"].as_object().expect("models 是对象");
-    assert!(
-        models.contains_key("brand-new"),
-        "live 目录的新模型必须进取价清单：{models:?}"
-    );
+    assert_eq!(policies.len(), 2, "策略表追加两行策略");
+    let brand_new = policies
+        .iter()
+        .find(|p| p["model"] == "brand-new")
+        .expect("brand-new 策略");
     assert_eq!(
-        models["brand-new"]["or_id"],
+        brand_new["or_id"],
         json!("vendor/brand-new"),
         "live 模型也要拿到价格条目"
     );
@@ -397,10 +401,9 @@ async fn a_failing_live_catalog_does_not_shrink_the_coverage() {
     assert_eq!(result, Some(String::new()), "live 失败不该让整轮失败");
 
     let policies = read_lines(&policies_path(tmp.path()));
-    let models = policies[0]["models"].as_object().expect("models 是对象");
     assert!(
-        models.contains_key("gpt-4o"),
-        "live 挂掉时静态目录必须照样取价：{models:?}"
+        policies.iter().any(|p| p["model"] == "gpt-4o"),
+        "live 挂掉时静态目录必须照样取价：{policies:?}"
     );
     assert_eq!(refresher.status()["last_extra"], json!(0));
 }
