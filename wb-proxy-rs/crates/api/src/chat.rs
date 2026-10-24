@@ -210,8 +210,9 @@ pub struct UsageContext<'a> {
 /// 这个字段，而它的折叠把 `outcome != "completed"` 一律当失败 —— 写 `ok`
 /// 会被 Python 记成失败，成功率直接算错。
 ///
-/// ⚠️ 没有 `cost_policy`（Python 从定价表取 policy id，Rust 侧定价表未接入）
-/// 与 `reasoning_effort`（Rust 侧不解析推理档位）。
+/// `cost_policy`：从定价表取 policy id（Python `current_policy_id`，:717）；
+/// 定价表未接入或模型无价时省略（与 Python 一致）。
+/// `reasoning_effort`（Rust 侧不解析推理档位）暂不写。
 pub fn build_usage_row(ctx: &UsageContext<'_>) -> Value {
     let failed = ctx.status.is_some();
     let at = now_epoch();
@@ -291,6 +292,10 @@ pub fn build_usage_row(ctx: &UsageContext<'_>) -> Value {
     row.insert("account".into(), Value::from(ctx.account.unwrap_or("")));
     row.insert("realm".into(), Value::from(ctx.realm));
     row.insert("key".into(), Value::from(ctx.key));
+    // cost_policy：从定价表取 policy id（Python `current_policy_id`，:717）。
+    if let Some(pid) = wb_tasks::pricing_store::current_policy_id(ctx.model) {
+        row.insert("cost_policy".into(), Value::from(pid));
+    }
     Value::Object(row)
 }
 

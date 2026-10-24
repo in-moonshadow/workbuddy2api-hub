@@ -686,3 +686,35 @@ fn nonempty_local(value: Option<&serde_json::Value>) -> Option<String> {
         .filter(|t| !t.is_empty())
         .map(str::to_string)
 }
+
+/// 当前策略指派表：`(at, assignment)`，at 是时间线最后一行的时刻，
+/// assignment 是 `{model: pid}`。时间线为空 ⇒ `(0.0, {})`。
+pub fn current_assignment() -> (f64, std::collections::HashMap<String, String>) {
+    // 需要 usage_dir；若未设置则返回空
+    let dir = match current_usage_dir() {
+        Some(d) => d,
+        None => return (0.0, std::collections::HashMap::new()),
+    };
+    let timeline = load_timeline(&dir);
+    if timeline.is_empty() {
+        return (0.0, std::collections::HashMap::new());
+    }
+    let last = &timeline[timeline.len() - 1];
+    let at = last.get("at").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+    let mut assignment = std::collections::HashMap::new();
+    if let Some(pol) = last.get("policies").and_then(serde_json::Value::as_object) {
+        for (k, v) in pol {
+            if let Some(s) = v.as_str() {
+                assignment.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    (at, assignment)
+}
+
+/// 模型的当前策略 id：先查 current_assignment，没有则返回 None
+/// （ensure_policy 需要 live_index，暂未移植，留后续关卡）。
+pub fn current_policy_id(model: &str) -> Option<String> {
+    let (_at, assignment) = current_assignment();
+    assignment.get(model).cloned()
+}
