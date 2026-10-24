@@ -712,6 +712,7 @@ async fn chat_openai_entry(
                         status: reply.status,
                         message: reply.message.as_deref(),
                         started: now,
+                        or_models: None,
                     },
                 );
                 reply.response
@@ -736,6 +737,7 @@ async fn chat_openai_entry(
             status: reply.status,
             message: reply.message.as_deref(),
             started: now,
+            or_models: None,
         },
     );
     let response = reply.response;
@@ -909,6 +911,7 @@ fn responses_sse_response(
                 status: failure.as_ref().map(|_| 502),
                 message: failure.as_deref(),
                 started: now,
+                or_models: None,
             },
         );
     });
@@ -1055,6 +1058,7 @@ async fn chat_anthropic_entry(
             status: reply.status,
             message: reply.message.as_deref(),
             started: now,
+            or_models: None,
         },
     );
     reply.response
@@ -1064,7 +1068,14 @@ async fn chat_anthropic_entry(
 ///
 /// **记账失败不影响原响应**（落盘失败只打日志，Python `_persist_usage`
 /// 同款）。成功行记 `completed`，失败行记 `failed` + `status`。
-fn record_chat_usage(state: &AppState, ctx: UsageContext<'_>) {
+fn record_chat_usage(state: &AppState, mut ctx: UsageContext<'_>) {
+    // 从 PriceRefresher 取 OpenRouter 索引，供 ensure_policy / current_policy_id 使用。
+    let or_models = state
+        .task
+        .price_refresher
+        .get()
+        .and_then(|p| p.last_or_models());
+    ctx.or_models = or_models;
     crate::chat::record_usage(&state.task.usage_dir, &ctx);
 }
 

@@ -195,6 +195,11 @@ pub struct UsageContext<'a> {
     pub message: Option<&'a str>,
     /// 请求开始时刻（epoch 秒），用来算墙钟耗时。
     pub started: f64,
+    /// OpenRouter 模型索引（供 ensure_policy / current_policy_id 使用）。
+    ///
+    /// `None` 表示尚未取价或取价失败；调用方（`record_chat_usage`）会在落盘前
+    /// 从 `PriceRefresher` 填入。
+    pub or_models: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 /// 造一行与 Python `record_usage`（`wb_proxy.py:665-740`）同形的用量行。
@@ -293,7 +298,7 @@ pub fn build_usage_row(ctx: &UsageContext<'_>) -> Value {
     row.insert("realm".into(), Value::from(ctx.realm));
     row.insert("key".into(), Value::from(ctx.key));
     // cost_policy：从定价表取 policy id（Python `current_policy_id`，:717）。
-    if let Some(pid) = wb_tasks::pricing_store::current_policy_id(ctx.model) {
+    if let Some(pid) = wb_tasks::pricing_store::current_policy_id(ctx.model, ctx.or_models.as_ref()) {
         row.insert("cost_policy".into(), Value::from(pid));
     }
     Value::Object(row)

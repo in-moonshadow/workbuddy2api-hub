@@ -712,11 +712,85 @@ pub fn current_assignment() -> (f64, std::collections::HashMap<String, String>) 
     (at, assignment)
 }
 
-/// 模型的当前策略 id：先查 current_assignment，没有则返回 None
-/// （ensure_policy 需要 live_index，暂未移植，留后续关卡）。
-pub fn current_policy_id(model: &str) -> Option<String> {
+/// 模型的当前策略 id：先查 current_assignment，没有则尝试 ensure_policy
+/// （需要 OpenRouter 索引）。
+pub fn current_policy_id(
+    model: &str,
+    or_models: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> Option<String> {
     let (_at, assignment) = current_assignment();
-    assignment.get(model).cloned()
+    if let Some(pid) = assignment.get(model).cloned() {
+        return Some(pid);
+    }
+    let or_models = or_models?;
+    let usage_dir = current_usage_dir()?;
+    ensure_policy(model, or_models, &usage_dir)
+}
+
+/// ensure_policy：按 Python `wb_pricing.ensure_policy` 的移植。
+///
+/// - pricing 未启用 ⇒ None（调用方自行判断；本函数不读 settings，由调用方保证）
+/// - or_models 为空 ⇒ None
+/// - 解析不到 OpenRouter id ⇒ None
+/// - 否则构造单模型快照，merge 写入策略库，返回 assignment 中的 pid
+pub fn ensure_policy(
+    model: &str,
+    or_models: &std::collections::HashMap<String, serde_json::Value>,
+    usage_dir: &std::path::Path,
+) -> Option<String> {
+    use serde_json::json;
+    if or_models.is_empty() {
+        return None;
+    }
+    let mid = model.trim().to_string();
+    if mid.is_empty() {
+        return None;
+    }
+    let by_norm = crate::price::index_openrouter(or_models);
+    let inherited = crate::price::inherited_from(&mid, or_models, &by_norm, &std::collections::HashMap::new());
+    let (reference, via_override) = crate::price::resolve(
+        &mid,
+        or_models,
+        &by_norm,
+        &std::collections::HashMap::new(),
+        true,
+    );
+    let reference = reference?;
+    let entry = crate::price::entry_for(
+        &mid,
+        &reference,
+        or_models,
+        inherited.as_deref(),
+        via_override,
+    );
+    let doc = json!({
+        "meta": {"base_currency": "CNY", "usd_cny": crate::price::USD_CNY},
+        "models": { mid.clone(): entry }
+    });
+    // 落盘（merge=True）。
+    if crate::price_refresher::write_snapshot_files(usage_dir, &doc, crate::activity::now_epoch(), true)
+        .is_err()
+    {
+        return None;
+    }
+    // 计算 pid（与 write_snapshot_files 内部一致）。
+    let flat = crate::price::RateTable::from_json(
+        doc.get("models")
+            .and_then(|m| m.get(&mid))
+            .and_then(|e| e.get("flat"))
+            .unwrap_or(&serde_json::Value::Null),
+    );
+    let bands: Vec<crate::price::Band> = doc
+        .get("models")
+        .and_then(|m| m.get(&mid))
+        .and_then(|e| e.get("bands"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(crate::price::parse_band).collect())
+        .unwrap_or_default();
+    let pid = crate::price::policy_id(&mid, &flat, &bands, crate::price::USD_CNY);
+    // 记住 usage_dir 供 current_assignment 使用。
+    remember_dir(usage_dir);
+    Some(pid)
 }
 
 /// usage 日志里所有行引用到的策略 id 集合。

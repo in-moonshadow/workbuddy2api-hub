@@ -228,6 +228,9 @@ struct State {
     next_run: Option<f64>,
     /// 环形日志。Python `:2333`。
     logs: VecDeque<String>,
+    /// 最近一次成功取价的 OpenRouter 模型索引（`{id: pricing}`），供
+    /// `ensure_policy` / `current_policy_id` 使用。取价失败或尚未取价时为 `None`。
+    last_or_models: Option<HashMap<String, Value>>,
 }
 
 impl State {
@@ -407,6 +410,8 @@ impl PriceRefresher {
 
         // 塑形（Python `build_snapshot()`，`:1368-1408`）。
         let table = openrouter_table(&raw);
+        // 缓存 OpenRouter 索引，供 ensure_policy / current_policy_id 使用。
+        self.lock_state().last_or_models = Some(table.clone());
         let catalog = self.source.catalog();
         // live 目录（Python `live_ids()`，`:2368-2387`）：静态目录之外的新增 id。
         // 失败只留缺口、不缩小覆盖 ⇒ 清单照样能用静态目录。
@@ -628,6 +633,14 @@ impl PriceRefresher {
         } else {
             SleepOutcome::Elapsed
         }
+    }
+
+    /// 最近一次成功取价的 OpenRouter 模型索引（`{id: pricing}`）。
+    ///
+    /// 取价失败或尚未取价时为 `None`。供 `ensure_policy` / `current_policy_id`
+    /// 使用。
+    pub fn last_or_models(&self) -> Option<HashMap<String, Value>> {
+        self.lock_state().last_or_models.clone()
     }
 
     /// 后台任务是否还活着。
