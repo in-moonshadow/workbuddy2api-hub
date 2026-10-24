@@ -25,7 +25,7 @@
 //! 3. 支持 `stream: true` —— 上游 chat SSE → Responses 事件帧
 //!    （`ResponsesStreamTranslator` / `stream_responses_events`）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{json, Map, Value};
 
@@ -561,6 +561,230 @@ pub fn is_truthy(v: &Value) -> bool {
         Value::Object(o) => !o.is_empty(),
         Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
     }
+}
+
+// ---------------------------------------------------------------------------
+// namespace 工具展开 / 还原（Python expand_namespace_tools / apply_namespace_to_calls）
+// ---------------------------------------------------------------------------
+
+/// `NAMESPACE_MAX_DEPTH`：namespace 最大展开深度。
+const NAMESPACE_MAX_DEPTH: usize = 4;
+
+/// `_NS_SEP`：namespace 与子工具名之间的分隔符。
+const NS_SEP: &str = "__";
+
+/// `expand_namespace_tools`：把 namespace 展开成 flat function 清单，其余工具原样保留。
+///
+/// 返回 `(flat_tools, name_to_namespace)`：
+/// - `flat_tools`：展开后的扁平工具列表（namespace 被拆成其子 function）；
+/// - `name_to_namespace`：子工具名 → 所属 namespace 名的映射，供回程还原使用。
+///
+/// 规则（与 Python `expand_namespace_tools` 逐条对齐）：
+/// - 子工具可能在 `tools` / `children` / `functions` 任一栏位；
+/// - namespace 子工具常常没有 `type` 栏位，展开时补成上游认得的 flat function；
+/// - custom / web_search 等非 function 项目原样留下；
+/// - 同名只留第一个。
+pub fn expand_namespace_tools(
+    tools: impl AsRef<Value>,
+    depth: impl Into<i64>,
+) -> (Vec<Value>, HashMap<String, String>) {
+    let tools = tools.as_ref();
+    let depth = depth.into();
+    let mut flat: Vec<Value> = Vec::new();
+    let mut mapping: HashMap<String, String> = HashMap::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let max_depth = (depth.max(0) as usize) + NAMESPACE_MAX_DEPTH;
+    // max(0, ...) 已由 depth.max(0) 保证非负
+
+    fn collect(
+        entry: &Value,
+        depth: usize,
+        ns_name: &str,
+        max_depth: usize,
+        flat: &mut Vec<Value>,
+        mapping: &mut HashMap<String, String>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if !entry.is_object() || depth > max_depth {
+            return;
+        }
+        let obj = entry.as_object().unwrap();
+        let etype = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        // namespace：递归展开子工具
+        if etype == "namespace" {
+            let subs = obj
+                .get("tools")
+                .or_else(|| obj.get("children"))
+                .or_else(|| obj.get("functions"));
+            let subs = subs.and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let child_ns = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| ns_name.to_string());
+            for sub in &subs {
+                collect(sub, depth + 1, &child_ns, max_depth, flat, mapping, seen);
+            }
+            return;
+        }
+
+        // 在 namespace 内的 function 形子工具：展开成 flat function
+        if !ns_name.is_empty() && (etype.is_empty() || etype == "function") {
+            let fn_obj = obj.get("function").and_then(|v| v.as_object());
+            let fn_map: Map<String, Value> = if let Some(f) = fn_obj {
+                f.clone()
+            } else {
+                let mut m = Map::new();
+                m.insert("name".into(), obj.get("name").cloned().unwrap_or(Value::Null));
+                m.insert(
+                    "description".into(),
+                    obj.get("description").cloned().unwrap_or(json!("")),
+                );
+                let params = obj
+                    .get("parameters")
+                    .or_else(|| obj.get("input_schema"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                m.insert("parameters".into(), params);
+                m
+            };
+            let name = fn_map
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if name.is_empty() || seen.contains(&name) {
+                return;
+            }
+            seen.insert(name.clone());
+            mapping.insert(name.clone(), ns_name.to_string());
+            let description = fn_map
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let parameters = fn_map
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            let mut flat_fn = Map::new();
+            flat_fn.insert("type".into(), json!("function"));
+            flat_fn.insert("name".into(), json!(name));
+            flat_fn.insert("description".into(), json!(description));
+            flat_fn.insert("parameters".into(), parameters);
+            if fn_map.contains_key("strict") {
+                flat_fn.insert("strict".into(), fn_map.get("strict").cloned().unwrap_or(Value::Null));
+            }
+            flat.push(Value::Object(flat_fn));
+            return;
+        }
+
+        // 其余：保留原样，仅在 namespace 内登记映射
+        let fn_obj = obj.get("function").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                fn_obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !name.is_empty() {
+            if seen.contains(&name) {
+                return;
+            }
+            seen.insert(name.clone());
+            if !ns_name.is_empty() {
+                mapping.insert(name, ns_name.to_string());
+            }
+        }
+        flat.push(entry.clone());
+    }
+
+    let entries = tools.as_array().cloned().unwrap_or_default();
+    for entry in &entries {
+        collect(entry, 0, "", max_depth, &mut flat, &mut mapping, &mut seen);
+    }
+    // tools 可能不是数组（None/非数组）→ 视为空
+    let _ = tools;
+    (flat, mapping)
+}
+
+/// `resolve_namespaced_name`：把模型回传的名字解析回 (bare_name, namespace)。
+pub fn resolve_namespaced_name(name: Option<&Value>, mapping: &HashMap<String, String>) -> (String, String) {
+    let name = name
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return (name, String::new());
+    }
+    if let Some(ns) = mapping.get(&name) {
+        return (name.clone(), ns.clone());
+    }
+    if name.contains("::") {
+        let idx = name.find("::").unwrap();
+        if idx > 0 {
+            let tail = &name[idx + 2..];
+            let head = &name[..idx];
+            if let Some(ns) = mapping.get(tail) {
+                return (tail.to_string(), ns.clone());
+            }
+            return (tail.to_string(), head.to_string());
+        }
+    }
+    // ns__tool 精确比对
+    for (tool, ns) in mapping.iter() {
+        if name == format!("{ns}{NS_SEP}{tool}") {
+            return (tool.clone(), ns.clone());
+        }
+    }
+    (name, String::new())
+}
+
+/// `apply_namespace_to_calls`：替 Responses 的 function_call / custom_tool_call 补上 namespace。
+///
+/// 返回还原后的 calls 列表。
+pub fn apply_namespace_to_calls(
+    calls: impl Into<Vec<Value>>,
+    name_to_namespace: impl AsRef<HashMap<String, String>>,
+) -> Vec<Value> {
+    let name_to_namespace = name_to_namespace.as_ref();
+    let mut calls: Vec<Value> = calls.into();
+    if name_to_namespace.is_empty() {
+        return calls;
+    }
+    for item in calls.iter_mut() {
+        let obj = match item.as_object_mut() {
+            Some(o) => o,
+            None => continue,
+        };
+        let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if typ != "function_call" && typ != "custom_tool_call" {
+            continue;
+        }
+        if obj.get("namespace").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false) {
+            continue;
+        }
+        let name_val = obj.get("name").cloned();
+        let (bare, ns) = resolve_namespaced_name(name_val.as_ref(), name_to_namespace);
+        if !ns.is_empty() {
+            obj.insert("name".into(), Value::String(bare));
+            obj.insert("namespace".into(), Value::String(ns));
+        }
+    }
+    calls
 }
 
 // ---------------------------------------------------------------------------
