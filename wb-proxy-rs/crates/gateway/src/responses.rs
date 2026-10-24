@@ -27,6 +27,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use crate::anthropic::{anthropic_json_text, new_id};
@@ -1001,7 +1002,7 @@ pub fn chat_to_response(
         let content = if text.is_empty() {
             json!([])
         } else {
-            json!([{"type": "output_text", "text": text, "annotations": []}])
+            json!([{"type": "output_text", "text": text, "annotations": build_citations(text, &[])}])
         };
         output.push(json!({
             "id": new_id("msg_"),
@@ -1081,6 +1082,141 @@ pub fn unwrap_custom_input(args: &str) -> String {
         Value::String(s) => s,
         _ => args.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// build_citations（Python build_citations，:13388-13441）
+// ---------------------------------------------------------------------------
+
+/// `build_citations`：把模型实际引用到的来源转成 `url_citation` annotations。
+///
+/// 只标注真的有出现在工具输出里的网址 —— 模型自己编的连结不会被当成引用。
+pub fn build_citations(response_text: &str, sources: &[Value]) -> Vec<Value> {
+    let text = response_text;
+    if text.is_empty() || sources.is_empty() {
+        return Vec::new();
+    }
+    // by_url：url → source（setdefault 语义，先到先得）
+    let mut by_url: HashMap<String, Value> = HashMap::new();
+    for s in sources {
+        if !s.is_object() {
+            continue;
+        }
+        let url = s
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if url.is_empty() {
+            continue;
+        }
+        by_url.entry(url.clone()).or_insert_with(|| s.clone());
+        by_url
+            .entry(url.trim_end_matches('/').to_string())
+            .or_insert_with(|| s.clone());
+    }
+    if by_url.is_empty() {
+        return Vec::new();
+    }
+
+    // 字节偏移 → 字符（code point）偏移，对齐 Python 的 str 索引
+    let byte_to_char = |byte: usize| -> usize { text[..byte].chars().count() };
+
+    let md_re = Regex::new(r"\[([^\]\n]{1,200})\]\((https?://[^)\s]+)\)").unwrap();
+    let url_re = Regex::new(r"https?://[^\s<>()\[\]]+").unwrap();
+
+    let mut anns: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, usize, usize)> =
+        std::collections::HashSet::new();
+    let mut md_spans: Vec<(usize, usize)> = Vec::new();
+
+    let mut add = |url: String, title: Option<String>, start: usize, end: usize| {
+        if end <= start {
+            return;
+        }
+        let key = (url.clone(), start, end);
+        if seen.contains(&key) {
+            return;
+        }
+        seen.insert(key);
+        let title = match title {
+            Some(t) if !t.is_empty() => t,
+            _ => url.clone(),
+        };
+        anns.push(json!({
+            "type": "url_citation",
+            "url": url,
+            "title": title,
+            "start_index": start,
+            "end_index": end,
+        }));
+    };
+
+    // 1. Markdown 链接 [title](url)
+    for caps in md_re.captures_iter(text) {
+        let m = caps.get(0).unwrap();
+        let group1 = caps.get(1).map(|g| g.as_str()).unwrap_or("");
+        let url_raw = caps.get(2).map(|g| g.as_str()).unwrap_or("");
+        let src = by_url
+            .get(url_raw)
+            .or_else(|| by_url.get(url_raw.trim_end_matches('/')))
+            .cloned();
+        if src.is_none() {
+            continue;
+        }
+        let src = src.unwrap();
+        let start = byte_to_char(m.start());
+        let end = byte_to_char(m.end());
+        md_spans.push((start, end));
+        let src_title = src.get("title").and_then(|v| v.as_str()).map(str::to_string);
+        // Python: src.get("title") or group1
+        let title = src_title.filter(|t| !t.is_empty()).or_else(|| Some(group1.to_string()));
+        add(url_raw.to_string(), title, start, end);
+    }
+
+    // 2. 裸 URL
+    for m in url_re.find_iter(text) {
+        let start = byte_to_char(m.start());
+        let end_full = byte_to_char(m.end());
+        // 是否落在某个 md span 内
+        let in_md = md_spans
+            .iter()
+            .any(|(s, e)| start >= *s && end_full <= *e);
+        if in_md {
+            continue;
+        }
+        let raw = m.as_str();
+        // rstrip(".,;:!?")
+        let url = raw
+            .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
+            .to_string();
+
+        let src = by_url
+            .get(&url)
+            .or_else(|| by_url.get(url.trim_end_matches('/')))
+            .cloned();
+        if src.is_none() {
+            continue;
+        }
+        let src = src.unwrap();
+        let src_title = src.get("title").and_then(|v| v.as_str()).map(str::to_string);
+        let end = start + url.chars().count();
+        // start 已对应 raw 起点；url 可能比 raw 短，end 按 url 长度
+        add(url, src_title, start, end);
+    }
+
+    anns.sort_by(|a, b| {
+        let sa = a.get("start_index").and_then(|v| v.as_i64()).unwrap_or(0);
+        let sb = b.get("start_index").and_then(|v| v.as_i64()).unwrap_or(0);
+        if sa != sb {
+            return sa.cmp(&sb);
+        }
+        let ea = a.get("end_index").and_then(|v| v.as_i64()).unwrap_or(0);
+        let eb = b.get("end_index").and_then(|v| v.as_i64()).unwrap_or(0);
+        ea.cmp(&eb)
+    });
+    anns
 }
 
 // ---------------------------------------------------------------------------
