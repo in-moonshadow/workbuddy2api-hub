@@ -718,3 +718,141 @@ pub fn current_policy_id(model: &str) -> Option<String> {
     let (_at, assignment) = current_assignment();
     assignment.get(model).cloned()
 }
+
+/// usage 日志里所有行引用到的策略 id 集合。
+pub fn referenced_policy_ids(usage_dir: &Path) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    let path = crate::usage::usage_log_path(usage_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return ids,
+    };
+    for line in text.lines() {
+        if !line.contains("\"cost_policy\"") {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(pid) = row.get("cost_policy").and_then(serde_json::Value::as_str) {
+            if !pid.trim().is_empty() {
+                ids.insert(pid.to_string());
+            }
+        }
+    }
+    ids
+}
+
+/// 丢弃没有任何引用的策略行。
+pub fn prune_policies(usage_dir: &Path, protect: &[String]) -> Vec<String> {
+    remember_dir(usage_dir);
+
+    let policies = load_policies(usage_dir);
+    if policies.is_empty() {
+        return Vec::new();
+    }
+
+    let (_at, assignment) = current_assignment();
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for v in assignment.values() {
+        keep.insert(v.clone());
+    }
+    for id in referenced_policy_ids(usage_dir) {
+        keep.insert(id);
+    }
+    for p in protect {
+        keep.insert(p.clone());
+    }
+
+    let mut by_model: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (pid, policy) in &policies {
+        by_model
+            .entry(policy.model.clone())
+            .or_default()
+            .push(pid.clone());
+    }
+    for ids in by_model.values() {
+        if ids.iter().any(|pid| keep.contains(pid)) {
+            continue;
+        }
+        let mut newest: Option<String> = None;
+        let mut newest_ts: f64 = f64::MIN;
+        for pid in ids {
+            let ts = policies
+                .get(pid)
+                .and_then(|p| p.first_seen)
+                .unwrap_or(0.0);
+            if ts >= newest_ts {
+                newest_ts = ts;
+                newest = Some(pid.clone());
+            }
+        }
+        if let Some(n) = newest {
+            keep.insert(n);
+        }
+    }
+
+    let path = policies_path(usage_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut seen_removed: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(id) = doc.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !keep.contains(id) && !seen_removed.contains(id) {
+            removed.push(id.to_string());
+            seen_removed.insert(id.to_string());
+        }
+    }
+
+    if removed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(id) = doc.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if keep.contains(id) {
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+    }
+
+    let tmp = {
+        let mut p = path.clone();
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        p.set_file_name(format!("{}.tmp", name));
+        p
+    };
+    if std::fs::write(&tmp, &out).is_err() {
+        return Vec::new();
+    }
+    let _ = std::fs::rename(&tmp, &path);
+    removed
+}

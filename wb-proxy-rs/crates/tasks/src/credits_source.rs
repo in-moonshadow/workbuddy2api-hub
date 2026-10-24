@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::api_routes::TaskRuntime;
-use crate::credits::{aggregate_detailed, packages_from_accounts};
+use crate::credits::{aggregate_detailed, aggregate_enterprise, packages_from_accounts};
 use crate::credits_refresher::{CreditsSource, RefresherAccount};
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -93,6 +93,24 @@ impl CreditsSource for ProductionCreditsSource {
             let realm_cfg = wb_gateway::endpoints::realm_config(&ra.state.realm);
             let chat_upstream = wb_gateway::endpoints::chat_base_url(&ra.state.realm, "workbuddy");
             let headers = ra.creds.billing_headers(ra.device_token.as_deref());
+            let now = now_epoch();
+            if !ra.state.enterprise_id.is_empty() {
+                // 企业账号积分路径（Python `_fetch_credits_enterprise`）
+                let ent = wb_gateway::credits::fetch_credits_enterprise(
+                    &task.client,
+                    realm_cfg.billing_upstream,
+                    &headers,
+                )
+                .await?;
+                let credits = aggregate_enterprise(
+                    ent.used,
+                    ent.size,
+                    &ent.cycle_start,
+                    &ent.cycle_end,
+                    now,
+                );
+                return Ok(credits.to_json());
+            }
             let detailed = wb_gateway::credits::fetch_credits_detailed(
                 &task.client,
                 realm_cfg.billing_upstream,
@@ -100,7 +118,6 @@ impl CreditsSource for ProductionCreditsSource {
                 &headers,
             )
             .await?;
-            let now = now_epoch();
             let packages = packages_from_accounts(&detailed.accounts, now);
             let credits = aggregate_detailed(
                 packages,

@@ -577,6 +577,87 @@ pub fn aggregate_detailed(
     }
 }
 
+
+/// 企业账号积分聚合（Python `_fetch_credits_enterprise` 的归一化）。
+///
+/// 上游只回 `credit`（本周期已用）/ `limitNum`（周期额度）/
+/// `cycleStartTime` / `cycleEndTime`。合成一个包条目：
+/// - remain = max(0, size - used)（size<=0 时 remain=0）
+/// - 包名：size>0 时 "企业额度"，否则 "企业周期额度"
+/// - package_code = "enterprise"，days_left=None，is_expired=false，no_expiry=true
+/// - is_paid_user=false，checkin=None，earliest_expiring=None（不参与到期倒计时）
+pub fn aggregate_enterprise(
+    used: f64,
+    size: f64,
+    cycle_start: &str,
+    cycle_end: &str,
+    now_epoch: f64,
+) -> Credits {
+    let used = round2(used);
+    let size = round2(size);
+    let remain = if size > 0.0 {
+        let r = size - used;
+        if r > 0.0 {
+            round2(r)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    // max(0, ...) 兜底
+    let remain = if remain < 0.0 { 0.0 } else { remain };
+
+    let name = if size > 0.0 {
+        "企业额度".to_string()
+    } else {
+        "企业周期额度".to_string()
+    };
+
+    let pkg = Package {
+        name,
+        package_code: "enterprise".to_string(),
+        product_name: String::new(),
+        sub_product_name: String::new(),
+        grant_reason: String::new(),
+        resource_id: String::new(),
+        deal_name: String::new(),
+        create_time: String::new(),
+        remain,
+        used,
+        size,
+        unit: String::new(),
+        in_usage: true,
+        auto_renew: false,
+        cycle_start_time: cycle_start.to_string(),
+        cycle_end_time: cycle_end.to_string(),
+        expire_time: String::new(),
+        no_expiry: true,
+        days_left: None,
+        is_expired: false,
+        status: serde_json::Value::Null,
+    };
+
+    let packages = vec![pkg];
+    let tot_remain = remain;
+    let tot_used = used;
+    let tot_size = size;
+
+    Credits {
+        remain: tot_remain,
+        used: tot_used,
+        size: tot_size,
+        used_percent: percent(tot_used, tot_size, "0.0%"),
+        remain_percent: percent(tot_remain, tot_size, "100.0%"),
+        is_paid_user: false,
+        checkin: None,
+        earliest_expiring: None,
+        packages,
+        updated_at: now_epoch,
+        updated_iso: local_text(now_epoch),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -159,7 +159,7 @@ pub trait PriceSource: Send + Sync {
     /// 默认实现写数据目录下的两个文件（策略表 + 时间线），见
     /// [`write_snapshot_files`]。实现方可以覆盖（例如接到别处的存储）。
     fn save_snapshot(&self, doc: &Value) -> Result<(), String> {
-        write_snapshot_files(self.usage_dir(), doc, self.now())
+        write_snapshot_files(self.usage_dir(), doc, self.now(), false)
     }
 
     /// 当前 epoch 秒（等价 Python 的 `time.time()`）。
@@ -718,7 +718,7 @@ impl Drop for RunLockGuard<'_> {
 /// ⚠️ 与 Python 的行粒度不同（见模块文档的差异 2）：Python 的策略表是
 /// **一个价格一行**、时间线只在指派变了时才追加。这里按关卡 4.19 的接口
 /// 约定，每轮各追加一行。
-pub fn write_snapshot_files(usage_dir: &Path, doc: &Value, at: f64) -> Result<(), String> {
+pub fn write_snapshot_files(usage_dir: &Path, doc: &Value, at: f64, merge: bool) -> Result<(), String> {
     let policies_path = usage_dir.join(POLICIES_FILE);
     let timeline_path = usage_dir.join(TIMELINE_FILE);
 
@@ -768,7 +768,13 @@ pub fn write_snapshot_files(usage_dir: &Path, doc: &Value, at: f64) -> Result<()
     let models_obj = doc.get("models").and_then(Value::as_object);
 
     // 计算指派 + 收集新策略行。
+    // merge=True：从上一次的指派出发，叠加本次 doc（避免单模型注册时把其他模型挤掉）。
     let mut assignment: serde_json::Map<String, Value> = serde_json::Map::new();
+    if merge {
+        for (k, v) in &previous {
+            assignment.insert(k.clone(), Value::String(v.clone()));
+        }
+    }
     let mut fresh: Vec<Value> = Vec::new();
 
     if let Some(models) = models_obj {

@@ -24,6 +24,8 @@ pub const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-
 pub const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
 /// 每日签到状态（详细口径第四步）。
 pub const CHECKIN_STATUS_PATH: &str = "/v2/billing/meter/checkin-activity-status";
+/// 企业账号积分端点（Python `_fetch_credits_enterprise`）。
+pub const ENTERPRISE_USAGE_PATH: &str = "/billing/meter/get-enterprise-user-usage";
 
 /// 计费端点的超时（Python `http_json(..., timeout=15)`）。
 pub const BILLING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -48,6 +50,23 @@ pub struct DetailedCredits {
     pub accounts: Vec<Value>,
     /// 签到状态（`None` = 这一步没取到）。
     pub checkin: Option<Value>,
+}
+
+
+/// 企业账号积分（Python `_fetch_credits_enterprise`）。
+///
+/// 上游只回 4 个字段：`credit`（本周期已消耗）、`limitNum`（周期额度）、
+/// `cycleStartTime` / `cycleEndTime`（周期起止）。剩余 = 额度 - 已用。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EnterpriseCredits {
+    /// 本周期已消耗（`credit`）。
+    pub used: f64,
+    /// 周期额度（`limitNum`）。
+    pub size: f64,
+    /// 周期开始时间（`cycleStartTime`）。
+    pub cycle_start: String,
+    /// 周期结束时间（`cycleEndTime`）。
+    pub cycle_end: String,
 }
 
 /// POST 一个 JSON body 并解析回 JSON。
@@ -297,6 +316,65 @@ pub async fn fetch_credits_fallback(
         .cloned()
         .unwrap_or_default())
 }
+
+
+/// 企业账号积分抓取（Python `_fetch_credits_enterprise`）。
+///
+/// POST 到 `billing_upstream + ENTERPRISE_USAGE_PATH`，body `{}`，超时 15s。
+/// 解析 `data.credit` / `data.limitNum`，round 到 2 位小数；
+/// `cycleStartTime` / `cycleEndTime` 作为字符串。
+pub async fn fetch_credits_enterprise(
+    client: &UpstreamClient,
+    billing_upstream: &str,
+    headers: &HashMap<String, String>,
+) -> Result<EnterpriseCredits, String> {
+    let res = post_json(
+        client,
+        &format!("{billing_upstream}{ENTERPRISE_USAGE_PATH}"),
+        headers,
+        &serde_json::json!({}),
+        BILLING_TIMEOUT,
+    )
+    .await?;
+    let data = res.get("data").cloned().unwrap_or(serde_json::Value::Null);
+
+    fn as_f64(v: &serde_json::Value, key: &str) -> f64 {
+        match v.get(key) {
+            Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+            Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
+            Some(serde_json::Value::Bool(b)) => {
+                if *b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        }
+    }
+    fn as_string(v: &serde_json::Value, key: &str) -> String {
+        match v.get(key) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(serde_json::Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        }
+    }
+    fn round2(x: f64) -> f64 {
+        if !x.is_finite() {
+            return x;
+        }
+        format!("{x:.2}").parse::<f64>().unwrap_or(x)
+    }
+
+    Ok(EnterpriseCredits {
+        used: round2(as_f64(&data, "credit")),
+        size: round2(as_f64(&data, "limitNum")),
+        cycle_start: as_string(&data, "cycleStartTime"),
+        cycle_end: as_string(&data, "cycleEndTime"),
+    })
+}
+
 
 #[cfg(test)]
 mod tests {
