@@ -1334,6 +1334,69 @@ fn success_rate(ok: i64, err: i64) -> Value {
     Value::from(py_round1(ok as f64 * 100.0 / (ok + err) as f64))
 }
 
+/// 一行的 realm（Python `row_realm`，:493-513）。
+///
+/// 行里带 `realm` 就直接用；老行没有时按模型推断（Python 的账号推断链
+/// Rust 侧拿不到账号池，跳过），最后回退到 `detect_model_realm`。
+fn realm_of(row: &Value) -> String {
+    if let Some(realm) = row.get("realm").and_then(Value::as_str) {
+        let realm = realm.trim();
+        if !realm.is_empty() {
+            return realm.to_string();
+        }
+    }
+    let model = model_of(row);
+    detect_model_realm(&model)
+}
+
+/// 模型归属的 realm（Python `detect_model_realm`，:152-180）。
+fn detect_model_realm(model_id: &str) -> String {
+    let current = std::env::var("WB_PROXY_DEFAULT_REALM").unwrap_or_else(|_| "intl".to_string());
+    if model_id.is_empty() {
+        return current;
+    }
+    let m = model_id.to_lowercase();
+    let intl_only = [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gemini-3.5-flash",
+        "grok-4.7",
+    ];
+    if intl_only.contains(&m.as_str())
+        || m.starts_with("gpt-")
+        || m.starts_with("gemini-")
+    {
+        return "intl".to_string();
+    }
+    let cn_only = [
+        "deepseek-v4-pro",
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+        "glm-5.1",
+        "glm-5.0-turbo",
+        "glm-4.6v",
+        "kimi-k3-1",
+        "kimi-k2.7",
+        "kimi-k2-thinking",
+        "hy3-x",
+        "hy4-preview-dev",
+        "hy4-preview-x",
+    ];
+    if cn_only.contains(&m.as_str())
+        || m.starts_with("minimax-")
+        || m.starts_with("deepseek-v4-pro")
+    {
+        return "cn".to_string();
+    }
+    current
+}
+
 /// 性能统计（Python `perf_stats` / `_perf_stats_uncached`）。
 ///
 /// `sample` 是「日志**末尾**多少行」参与统计（Python 读文件尾部），不是时间
@@ -1368,6 +1431,8 @@ pub fn build_usage_perf(
     let mut aborted = 0i64;
     let mut samples = PerfSamples::default();
     let mut models: Vec<(String, PerfModelBucket)> = Vec::new();
+    // 按 (model, realm) 二维分组的性能桶（Python `mr_buckets`）。
+    let mut model_realms: Vec<(String, Vec<(String, PerfModelBucket)>)> = Vec::new();
 
     for row in tail {
         if !realm_matches(row, realm) {
@@ -1397,52 +1462,95 @@ pub fn build_usage_perf(
         let bucket = &mut models[model_index].1;
         bucket.total += 1;
 
+        // 按 (model, realm) 二维桶：取（必要时建）对应桶。
+        let row_realm = realm_of(row);
+        let mr_model_index = match model_realms
+            .iter()
+            .position(|(name, _)| name == &model)
+        {
+            Some(found) => found,
+            None => {
+                model_realms.push((model.clone(), Vec::new()));
+                model_realms.len() - 1
+            }
+        };
+        let mr_realms = &mut model_realms[mr_model_index].1;
+        let mr_realm_index = match mr_realms.iter().position(|(name, _)| name == &row_realm) {
+            Some(found) => found,
+            None => {
+                mr_realms.push((row_realm.clone(), PerfModelBucket::default()));
+                mr_realms.len() - 1
+            }
+        };
+        let mr_bucket = &mut mr_realms[mr_realm_index].1;
+        mr_bucket.total += 1;
+
         // 客户端自己走掉的请求既不是成功也不是失败，单独一档。
         if outcome == "client_aborted" {
             aborted += 1;
             bucket.aborted += 1;
+            mr_bucket.aborted += 1;
             if let Some(value) = row.get("elapsed_ms").and_then(Value::as_f64) {
                 samples.walls.push(value);
                 bucket.samples.walls.push(value);
+                mr_bucket.samples.walls.push(value);
             }
             continue;
         }
         if outcome != "completed" {
             err += 1;
             bucket.err += 1;
+            mr_bucket.err += 1;
             if let Some(value) = row.get("elapsed_ms").and_then(Value::as_f64) {
                 samples.walls.push(value);
                 bucket.samples.walls.push(value);
+                mr_bucket.samples.walls.push(value);
             }
             continue;
         }
         ok += 1;
         bucket.ok += 1;
+        mr_bucket.ok += 1;
         if let Some(value) = row.get("ttft_ms").and_then(Value::as_f64) {
             samples.ttfts.push(value);
             bucket.samples.ttfts.push(value);
+            mr_bucket.samples.ttfts.push(value);
         }
         if let Some(value) = row.get("gen_ms").and_then(Value::as_f64) {
             samples.gens.push(value);
             bucket.samples.gens.push(value);
+            mr_bucket.samples.gens.push(value);
         }
         if let Some(value) = row.get("elapsed_ms").and_then(Value::as_f64) {
             samples.walls.push(value);
             bucket.samples.walls.push(value);
+            mr_bucket.samples.walls.push(value);
         }
         if let Some(value) = row.get("tokens_per_sec").and_then(Value::as_f64) {
             samples.tok_rates.push(value);
             bucket.samples.tok_rates.push(value);
+            mr_bucket.samples.tok_rates.push(value);
         }
         if let Some(value) = row.get("cache_hit_pct").and_then(Value::as_f64) {
             samples.hits.push(value);
             bucket.samples.hits.push(value);
+            mr_bucket.samples.hits.push(value);
         }
     }
 
     let mut by_model = Map::new();
     for (name, bucket) in &models {
         by_model.insert(name.clone(), perf_model_json(bucket));
+    }
+
+    // 按 (model, realm) 二维分组（Python `by_model_realm`）。
+    let mut by_model_realm = Map::new();
+    for (name, realms) in &model_realms {
+        let mut realm_map = Map::new();
+        for (realm_name, bucket) in realms {
+            realm_map.insert(realm_name.clone(), perf_model_json(bucket));
+        }
+        by_model_realm.insert(name.clone(), Value::Object(realm_map));
     }
 
     let mut out = Map::new();
@@ -1459,6 +1567,7 @@ pub fn build_usage_perf(
     out.insert("tokens_per_sec".into(), perf_block(&samples.tok_rates));
     out.insert("cache_hit_pct".into(), perf_block(&samples.hits));
     out.insert("by_model".into(), Value::Object(by_model));
+    out.insert("by_model_realm".into(), Value::Object(by_model_realm));
     Value::Object(out)
 }
 

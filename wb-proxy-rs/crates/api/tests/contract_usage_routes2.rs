@@ -238,6 +238,7 @@ async fn every_route_has_the_expected_top_level_keys() {
             "tokens_per_sec",
             "cache_hit_pct",
             "by_model",
+            "by_model_realm",
         ]
     );
 
