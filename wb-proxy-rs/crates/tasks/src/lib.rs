@@ -91,6 +91,8 @@ pub mod price_refresher;
 // `lib.rs`。
 pub mod live_catalog;
 pub mod live_source;
+// 关卡 4.25：面板日志缓冲（ApiPanelSink 接入；/logs、/logs/export、/logs/clear）。
+pub mod logs;
 pub mod pricing_store;
 // 关卡 4.19（主会话）：`price_refresher` 的**生产数据源**——settings 读总
 // 开关（缺键=开）、`usage/` 写盘、OpenRouter 取价。

@@ -321,6 +321,13 @@ pub fn app_with_config(
         .route("/scheduler", get(scheduler_get).options(preflight))
         .route("/pricing", get(pricing_get).options(preflight))
         .route("/updates", get(updates_get).options(preflight))
+        .route("/updates/check", post(update_check).options(preflight))
+        .route("/pricing/mapping", post(pricing_mapping).options(preflight))
+        .route("/pricing/refresh", post(pricing_refresh).options(preflight))
+        .route("/logs", get(logs_get).options(preflight))
+        .route("/logs/export", get(logs_export).options(preflight))
+        .route("/logs/clear", post(logs_clear).options(preflight))
+        .route("/settings/reveal", get(settings_reveal).options(preflight))
         .route("/usage", get(usage_get).options(preflight))
         .route("/v1/usage", get(usage_get).options(preflight))
         .route(
@@ -1352,13 +1359,13 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
     response
 }
 
-/// 生产面板 sink：no-op（面板日志暂未接入 dashboard，M5 对齐）。
+/// 生产面板 sink：把后台线程/路由日志写入 `wb_tasks::logs` 缓冲（/logs 面）。
 #[derive(Clone, Default)]
 pub struct ApiPanelSink;
 
 impl PanelSink for ApiPanelSink {
-    fn add_log_entry(&self, _msg: &str, _tag: &str) {
-        // no-op
+    fn add_log_entry(&self, msg: &str, tag: &str) {
+        wb_tasks::logs::append(msg, None, Some(tag));
     }
 }
 
@@ -2331,4 +2338,131 @@ fn realm_filter(
         })
         .or_else(|| fallback.map(str::to_string))
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// 关卡 4.25：logs / pricing 管理 / updates 管理 / settings reveal
+// ---------------------------------------------------------------------------
+
+/// `/logs`：面板日志列表（Python `_get_logs` :16136-16149）。
+async fn logs_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/logs", &headers, &params, &state) {
+        return response;
+    }
+    Json(task_routes::route_logs_get(&state.task, &params)).into_response()
+}
+
+/// `/logs/export`：导出纯文本日志（Python `_get_logs_export` :16152-16165）。
+async fn logs_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/logs/export", &headers, &params, &state) {
+        return response;
+    }
+    let text = task_routes::route_logs_export(&state.task, &params);
+    let filename = format!(
+        "wb-proxy-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let mut response = text.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+/// `/logs/clear`：清空日志缓冲（Python `_route_logs_clear` :17477-17479）。
+async fn logs_clear(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(response) = panel_gate("/logs/clear", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    Json(task_routes::route_logs_clear(&state.task, &payload)).into_response()
+}
+
+/// `/settings/reveal`：按 id 返回未脱敏 key（Python `_get_settings_reveal`
+/// :16169-16178）。找不到 ⇒ 404 信封。
+async fn settings_reveal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/settings/reveal", &headers, &params, &state) {
+        return response;
+    }
+    let out = task_routes::route_settings_reveal(&state.task, &params);
+    if out.is_null() {
+        return openai_error(404, "no such key", "invalid_request_error").into_response();
+    }
+    Json(out).into_response()
+}
+
+/// `/pricing/mapping`：面板手填「hub 模型 → OpenRouter id」映射
+/// （Python `_route_pricing_mapping` :17481-17520）。
+async fn pricing_mapping(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = panel_gate("/pricing/mapping", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let out = task_routes::route_pricing_mapping(&state.task, &payload).await;
+    if let Some(status) = out.get("status").and_then(Value::as_i64) {
+        return openai_error(
+            status as u16,
+            out["error"].as_str().unwrap_or("bad request"),
+            "invalid_request_error",
+        )
+        .into_response();
+    }
+    Json(out).into_response()
+}
+
+/// `/pricing/refresh`：后台触发一次取价（Python `_route_pricing_refresh`
+/// :17463-17476）。
+async fn pricing_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = panel_gate("/pricing/refresh", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    Json(task_routes::route_pricing_refresh(&state.task, &payload).await).into_response()
+}
+
+/// `/updates/check`：立即检查一次发布（Python `_route_update_check` :17438-17450）。
+async fn update_check(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(response) = panel_gate("/updates/check", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    Json(task_routes::route_update_check(&state.task, &payload).await).into_response()
 }

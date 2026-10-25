@@ -935,3 +935,35 @@ pub fn prune_policies(usage_dir: &Path, protect: &[String]) -> Vec<String> {
     let _ = std::fs::rename(&tmp, &path);
     removed
 }
+
+/// 面板手填覆盖表路径（Python `_data_paths()[3]` = `pricing-overrides.json`）。
+pub fn overrides_path(usage_dir: &Path) -> PathBuf {
+    usage_dir.join("pricing-overrides.json")
+}
+
+/// 写入/清除一条面板手填映射（Python `save_runtime_override`，:1527-1538）。
+///
+/// `or_id` 为空表示删除该映射（回到源码覆盖表与自动匹配）。
+pub fn save_runtime_override(usage_dir: &Path, model: &str, or_id: &str) -> Result<(), String> {
+    use serde_json::Map;
+    let path = overrides_path(usage_dir);
+    std::fs::create_dir_all(usage_dir).map_err(|e| e.to_string())?;
+    let mut data: Map<String, Value> = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    } else {
+        Map::new()
+    };
+    if or_id.trim().is_empty() {
+        data.remove(model);
+    } else {
+        data.insert(model.to_string(), json!(or_id));
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}

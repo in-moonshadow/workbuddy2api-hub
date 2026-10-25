@@ -10,6 +10,7 @@ axum = { version = "0.7", features = ["macros"] }
 # 任务内跨 await 持有；time：ConcurrencyGate::acquire 的槽位等待超时。
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "time"] }
 serde_json.workspace = true
+chrono.workspace = true
 base64.workspace = true
 getrandom = "0.2"
 # SSE 响应体：axum 的 `Body::from_stream` 要求流实现 `futures_core::Stream`，

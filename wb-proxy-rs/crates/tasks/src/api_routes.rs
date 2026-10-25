@@ -3104,3 +3104,165 @@ pub async fn route_accounts_test(task: &TaskRuntime, payload: &Value) -> Value {
         },
     })
 }
+
+// ---------------------------------------------------------------------------
+// 关卡 4.25：logs / pricing 管理 / updates 管理 / settings reveal
+// ---------------------------------------------------------------------------
+
+/// `/logs`：面板日志列表（Python `_get_logs` :16136-16149）。
+pub fn route_logs_get(_task: &TaskRuntime, query: &HashMap<String, String>) -> Value {
+    let limit: usize = parse_int(query, "limit")
+        .map(|v| v.max(1) as usize)
+        .unwrap_or(200);
+    let level = query.get("level").cloned().unwrap_or_default();
+    let tag = query.get("tag").cloned().unwrap_or_default();
+    let search = query.get("search").cloned().unwrap_or_default();
+    let since_id = parse_u64(query, "since_id").unwrap_or(0);
+    crate::logs::get_logs(Some(limit), &level, &tag, &search, since_id)
+}
+
+/// `/logs/export`：导出文本（Python `_get_logs_export` :16152-16165）。
+pub fn route_logs_export(_task: &TaskRuntime, _query: &HashMap<String, String>) -> String {
+    crate::logs::export_text()
+}
+
+/// `/logs/clear`：清空日志缓冲（Python `_route_logs_clear` :17477-17479）。
+pub fn route_logs_clear(_task: &TaskRuntime, _payload: &Value) -> Value {
+    crate::logs::clear();
+    json!({"ok": true})
+}
+
+/// `/settings/reveal`：按 id 返回未脱敏的 key（Python `_get_settings_reveal`
+/// :16169-16178）。面板会话已由路由层鉴权。
+pub fn route_settings_reveal(task: &TaskRuntime, query: &HashMap<String, String>) -> Value {
+    let wanted = query.get("id").cloned().unwrap_or_default();
+    let doc = wb_storage::read_settings(&task.accounts_dir).unwrap_or_else(|_| json!({}));
+    // 生效 key + 面板 api_keys 两条线都要查（Python configured_keys()）。
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Some(key) = doc.get("api_key").and_then(Value::as_str) {
+        if !key.is_empty() {
+            candidates.push(("api_key".to_string(), key.to_string()));
+        }
+    }
+    if let Some(keys) = doc.get("api_keys").and_then(Value::as_array) {
+        for entry in keys {
+            let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
+            let key = entry.get("key").and_then(Value::as_str).unwrap_or("");
+            if !id.is_empty() {
+                candidates.push((id.to_string(), key.to_string()));
+            }
+        }
+    }
+    for (id, key) in candidates {
+        if id == wanted {
+            return json!({"id": id, "key": key});
+        }
+    }
+    Value::Null // 路由层转 404
+}
+
+/// `/pricing/refresh`：后台触发一次取价（Python `_route_pricing_refresh`
+/// :17463-17476）。取价耗时数十秒，由 run_once 的异步执行承担，面板轮询
+/// `/pricing` 看结果。
+pub async fn route_pricing_refresh(task: &TaskRuntime, _payload: &Value) -> Value {
+    let Some(refresher) = task.price_refresher.get().cloned() else {
+        return json!({"ok": false, "msg": "价格刷新未运行"});
+    };
+    let doc = wb_storage::read_settings(&task.accounts_dir).unwrap_or_else(|_| json!({}));
+    if !crate::settings::pricing_enabled(&doc) {
+        return json!({"ok": false, "msg": "价估算已关闭，请先启用"});
+    }
+    let worker = refresher.clone();
+    tokio::spawn(async move {
+        let _ = worker.run_once().await;
+    });
+    let mut out = refresher.status();
+    out["ok"] = json!(true);
+    out["msg"] = json!("已开始抓取，稍候刷新查看结果");
+    out
+}
+
+/// `/pricing/mapping`：面板手填「hub 模型 → OpenRouter id」映射
+/// （Python `_route_pricing_mapping` :17481-17520）。写
+/// `pricing-overrides.json`（运行期覆盖），随后触发一次取价。
+pub async fn route_pricing_mapping(task: &TaskRuntime, payload: &Value) -> Value {
+    let Some(refresher) = task.price_refresher.get().cloned() else {
+        return json!({"ok": false, "msg": "价格刷新未运行"});
+    };
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if model.is_empty() {
+        return json!({"ok": false, "error": "model is required", "status": 400});
+    }
+    let or_id = payload
+        .get("or_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !or_id.is_empty() && !looks_like_or_id(&or_id) {
+        return json!({"ok": false, "error": "or_id must look like 'vendor/model'", "status": 400});
+    }
+    // 写运行期覆盖（usage/pricing-overrides.json）。
+    if let Err(err) = crate::pricing_store::save_runtime_override(&task.usage_dir, &model, &or_id) {
+        return json!({"ok": false, "error": err, "status": 500});
+    }
+    // 触发取价（后台）。
+    let worker = refresher.clone();
+    tokio::spawn(async move {
+        let _ = worker.run_once().await;
+    });
+    let msg = if or_id.is_empty() {
+        format!("已删除 {model} 的手填映射，下次取价起按自动匹配")
+    } else {
+        format!("已记录 {model} → {or_id}，正在重新取价")
+    };
+    crate::logs::append(
+        &format!(
+            "[定价] 面板手填映射：{model} → {}",
+            if or_id.is_empty() { "(清除)" } else { &or_id }
+        ),
+        None,
+        Some("pricing"),
+    );
+    json!({"ok": true, "model": model, "or_id": or_id, "known": false, "msg": msg})
+}
+
+/// `/updates/check`：立即检查一次发布（Python `_route_update_check` :17438-17450）。
+pub async fn route_update_check(task: &TaskRuntime, _payload: &Value) -> Value {
+    let Some(updater) = task.update_checker.get().cloned() else {
+        return json!({"ok": false, "msg": "更新检查未运行"});
+    };
+    let mut status = updater.check_manual().await;
+    status["ok"] = json!(true);
+    status
+}
+
+/// or_id 形状校验（Python `re.match(r"^[A-Za-z0-9._\-]+/[A-Za-z0-9._\-:]+$", or_id)`）。
+fn looks_like_or_id(s: &str) -> bool {
+    let mut parts = s.splitn(2, '/');
+    let vendor = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    !vendor.is_empty()
+        && !name.is_empty()
+        && vendor.chars().all(is_or_id_char)
+        && name.chars().all(is_or_id_char)
+}
+
+fn is_or_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == ':'
+}
+
+/// 解析无符号整数查询参数。
+fn parse_u64(query: &HashMap<String, String>, key: &str) -> Option<u64> {
+    query.get(key).and_then(|v| v.parse::<u64>().ok())
+}
+
+/// 解析整数查询参数（与 api crate routes.rs 的 parse_int 同名同义）。
+fn parse_int(query: &HashMap<String, String>, key: &str) -> Option<i64> {
+    query.get(key).and_then(|v| v.parse::<i64>().ok())
+}
