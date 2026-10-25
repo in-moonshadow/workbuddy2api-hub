@@ -102,13 +102,8 @@ impl CreditsSource for ProductionCreditsSource {
                     &headers,
                 )
                 .await?;
-                let credits = aggregate_enterprise(
-                    ent.used,
-                    ent.size,
-                    &ent.cycle_start,
-                    &ent.cycle_end,
-                    now,
-                );
+                let credits =
+                    aggregate_enterprise(ent.used, ent.size, &ent.cycle_start, &ent.cycle_end, now);
                 return Ok(credits.to_json());
             }
             let detailed = wb_gateway::credits::fetch_credits_detailed(

@@ -298,7 +298,8 @@ pub fn build_usage_row(ctx: &UsageContext<'_>) -> Value {
     row.insert("realm".into(), Value::from(ctx.realm));
     row.insert("key".into(), Value::from(ctx.key));
     // cost_policy：从定价表取 policy id（Python `current_policy_id`，:717）。
-    if let Some(pid) = wb_tasks::pricing_store::current_policy_id(ctx.model, ctx.or_models.as_ref()) {
+    if let Some(pid) = wb_tasks::pricing_store::current_policy_id(ctx.model, ctx.or_models.as_ref())
+    {
         row.insert("cost_policy".into(), Value::from(pid));
     }
     Value::Object(row)

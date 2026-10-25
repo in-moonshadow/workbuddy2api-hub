@@ -577,7 +577,6 @@ pub fn aggregate_detailed(
     }
 }
 
-
 /// 企业账号积分聚合（Python `_fetch_credits_enterprise` 的归一化）。
 ///
 /// 上游只回 `credit`（本周期已用）/ `limitNum`（周期额度）/

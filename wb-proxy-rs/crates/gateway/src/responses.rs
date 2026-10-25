@@ -641,7 +641,10 @@ pub fn expand_namespace_tools(
                 f.clone()
             } else {
                 let mut m = Map::new();
-                m.insert("name".into(), obj.get("name").cloned().unwrap_or(Value::Null));
+                m.insert(
+                    "name".into(),
+                    obj.get("name").cloned().unwrap_or(Value::Null),
+                );
                 m.insert(
                     "description".into(),
                     obj.get("description").cloned().unwrap_or(json!("")),
@@ -680,14 +683,21 @@ pub fn expand_namespace_tools(
             flat_fn.insert("description".into(), json!(description));
             flat_fn.insert("parameters".into(), parameters);
             if fn_map.contains_key("strict") {
-                flat_fn.insert("strict".into(), fn_map.get("strict").cloned().unwrap_or(Value::Null));
+                flat_fn.insert(
+                    "strict".into(),
+                    fn_map.get("strict").cloned().unwrap_or(Value::Null),
+                );
             }
             flat.push(Value::Object(flat_fn));
             return;
         }
 
         // 其余：保留原样，仅在 namespace 内登记映射
-        let fn_obj = obj.get("function").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        let fn_obj = obj
+            .get("function")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
         let name = obj
             .get("name")
             .and_then(|v| v.as_str())
@@ -723,11 +733,11 @@ pub fn expand_namespace_tools(
 }
 
 /// `resolve_namespaced_name`：把模型回传的名字解析回 (bare_name, namespace)。
-pub fn resolve_namespaced_name(name: Option<&Value>, mapping: &HashMap<String, String>) -> (String, String) {
-    let name = name
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+pub fn resolve_namespaced_name(
+    name: Option<&Value>,
+    mapping: &HashMap<String, String>,
+) -> (String, String) {
+    let name = name.and_then(|v| v.as_str()).unwrap_or("").to_string();
     if name.is_empty() {
         return (name, String::new());
     }
@@ -775,7 +785,12 @@ pub fn apply_namespace_to_calls(
         if typ != "function_call" && typ != "custom_tool_call" {
             continue;
         }
-        if obj.get("namespace").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false) {
+        if obj
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+        {
             continue;
         }
         let name_val = obj.get("name").cloned();
@@ -1169,9 +1184,14 @@ pub fn build_citations(response_text: &str, sources: &[Value]) -> Vec<Value> {
         let start = byte_to_char(m.start());
         let end = byte_to_char(m.end());
         md_spans.push((start, end));
-        let src_title = src.get("title").and_then(|v| v.as_str()).map(str::to_string);
+        let src_title = src
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         // Python: src.get("title") or group1
-        let title = src_title.filter(|t| !t.is_empty()).or_else(|| Some(group1.to_string()));
+        let title = src_title
+            .filter(|t| !t.is_empty())
+            .or_else(|| Some(group1.to_string()));
         add(url_raw.to_string(), title, start, end);
     }
 
@@ -1180,9 +1200,7 @@ pub fn build_citations(response_text: &str, sources: &[Value]) -> Vec<Value> {
         let start = byte_to_char(m.start());
         let end_full = byte_to_char(m.end());
         // 是否落在某个 md span 内
-        let in_md = md_spans
-            .iter()
-            .any(|(s, e)| start >= *s && end_full <= *e);
+        let in_md = md_spans.iter().any(|(s, e)| start >= *s && end_full <= *e);
         if in_md {
             continue;
         }
@@ -1200,7 +1218,10 @@ pub fn build_citations(response_text: &str, sources: &[Value]) -> Vec<Value> {
             continue;
         }
         let src = src.unwrap();
-        let src_title = src.get("title").and_then(|v| v.as_str()).map(str::to_string);
+        let src_title = src
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let end = start + url.chars().count();
         // start 已对应 raw 起点；url 可能比 raw 短，end 按 url 长度
         add(url, src_title, start, end);
@@ -2762,8 +2783,13 @@ pub fn client_wants_web(tools: &Value) -> Value {
             }
             .trim()
             .to_lowercase();
-            if ["web_search", "web_search_preview", "web_search_preview_2025_03_11", "web_search"]
-                .contains(&ty.as_str())
+            if [
+                "web_search",
+                "web_search_preview",
+                "web_search_preview_2025_03_11",
+                "web_search",
+            ]
+            .contains(&ty.as_str())
                 || name == "web_search"
             {
                 search = true;
@@ -2952,10 +2978,7 @@ pub fn internal_calls_from_chat(chat_obj: &Value, web_tools: bool) -> Vec<Value>
                 };
                 let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if is_internal_tool(name) {
-                    let args = f
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| json!("{}"));
+                    let args = f.get("arguments").cloned().unwrap_or_else(|| json!("{}"));
                     out.push(json!({"name": name, "arguments": args}));
                 }
             }
@@ -2974,7 +2997,13 @@ fn guard_url(url: &str) -> Option<String> {
     let rest = lower
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let host = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
     if host.is_empty() || !host.contains('.') {
         return Some("Error: host not allowed.".to_string());
     }

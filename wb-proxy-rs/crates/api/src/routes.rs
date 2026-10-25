@@ -265,6 +265,51 @@ pub fn app_with_config(
             "/accounts/daily-chat-web",
             post(accounts_daily_chat_web).options(preflight),
         )
+        // 账户管理 17 条 POST 路由（关卡 4.24 线 C）：统一收口到 `accounts_mgmt`，
+        // 由 `inject_path` 中间件写进 `x-wb-path` 头的原始路径区分子路由，再
+        // dispatch 到 wb_tasks::api_routes::route_accounts_*（线 B 实现）。
+        // 与 /accounts/checkin 等既有路由同为「面板路由 + POST + OPTIONS preflight」。
+        .route("/accounts/credits", post(accounts_mgmt).options(preflight))
+        .route(
+            "/accounts/credits/fetch",
+            post(accounts_mgmt).options(preflight),
+        )
+        .route(
+            "/accounts/credits/detail",
+            post(accounts_mgmt).options(preflight),
+        )
+        .route(
+            "/accounts/credits/grants",
+            post(accounts_mgmt).options(preflight),
+        )
+        .route("/accounts/delete", post(accounts_mgmt).options(preflight))
+        .route("/accounts/export", post(accounts_mgmt).options(preflight))
+        .route("/accounts/import", post(accounts_mgmt).options(preflight))
+        .route(
+            "/accounts/import/desktop",
+            post(accounts_mgmt).options(preflight),
+        )
+        .route(
+            "/accounts/login/start",
+            post(accounts_mgmt).options(preflight),
+        )
+        .route(
+            "/accounts/login/poll",
+            post(accounts_mgmt).options(preflight),
+        )
+        .route(
+            "/accounts/login/cancel",
+            post(accounts_mgmt).options(preflight),
+        )
+        .route("/accounts/product", post(accounts_mgmt).options(preflight))
+        .route("/accounts/refresh", post(accounts_mgmt).options(preflight))
+        .route("/accounts/set", post(accounts_mgmt).options(preflight))
+        .route("/accounts/set-all", post(accounts_mgmt).options(preflight))
+        .route(
+            "/accounts/sync-profile",
+            post(accounts_mgmt).options(preflight),
+        )
+        .route("/accounts/test", post(accounts_mgmt).options(preflight))
         .route("/tasks", get(tasks_get).options(preflight))
         .route("/tasks/run", post(tasks_run).options(preflight))
         .route("/tasks/travel", post(tasks_travel).options(preflight))
@@ -1719,6 +1764,70 @@ async fn accounts_daily_chat_web(
         return openai_error(400, "expected a JSON object", "invalid_request_error");
     }
     let res = task_routes::route_accounts_daily_chat_web(&state.task, &payload).await;
+    Json(res).into_response()
+}
+
+/// 账户管理路由的统一入口（关卡 4.24 线 C）。
+///
+/// 对齐 Python `_handle_accounts`（wb_proxy.py:17087-17138）的「按子路径 dispatch」
+/// 风格：17 条 `/accounts/*` POST 路由都注册到这个 handler，靠 `inject_path`
+/// 中间件写进 `x-wb-path` 头的原始路径区分子路由，再 dispatch 到
+/// wb_tasks::api_routes::route_accounts_*（线 B 实现）。
+///
+/// 门禁与其它面板路由一致：`panel_gate` 双层（外层面板会话 + 内层 API key）。
+///
+/// ⚠️ 线 B（api_routes.rs 的 route_accounts_* 实现）尚未就绪：当前各分支先回
+/// 「not implemented」占位信封，编译期可过；线 B 落地后把对应分支替换成
+/// `task_routes::route_accounts_xxx(&state.task, &payload).await` 即可。
+async fn accounts_mgmt(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let path = request_path(&headers).unwrap_or_default();
+    if let Some(response) = panel_gate(&path, &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if !payload.is_object() {
+        return openai_error(400, "expected a JSON object", "invalid_request_error");
+    }
+    let res = match path.as_str() {
+        "/accounts/credits" | "/accounts/credits/fetch" => {
+            task_routes::route_accounts_credits_fetch(&state.task, &payload).await
+        }
+        "/accounts/credits/detail" => {
+            task_routes::route_account_credits_detail(&state.task, &payload).await
+        }
+        "/accounts/credits/grants" => {
+            task_routes::route_accounts_credits_grants(&state.task, &payload).await
+        }
+        "/accounts/delete" => task_routes::route_accounts_delete(&state.task, &payload).await,
+        "/accounts/export" => task_routes::route_accounts_export(&state.task, &payload).await,
+        "/accounts/import" => task_routes::route_accounts_import(&state.task, &payload).await,
+        "/accounts/import/desktop" => {
+            task_routes::route_accounts_import_desktop(&state.task, &payload).await
+        }
+        "/accounts/login/start" => {
+            task_routes::route_accounts_login_start(&state.task, &payload).await
+        }
+        "/accounts/login/poll" => {
+            task_routes::route_accounts_login_poll(&state.task, &payload).await
+        }
+        "/accounts/login/cancel" => {
+            task_routes::route_accounts_login_cancel(&state.task, &payload).await
+        }
+        "/accounts/product" => task_routes::route_accounts_product(&state.task, &payload).await,
+        "/accounts/refresh" => task_routes::route_accounts_refresh(&state.task, &payload).await,
+        "/accounts/set" => task_routes::route_accounts_set(&state.task, &payload).await,
+        "/accounts/set-all" => task_routes::route_accounts_set_all(&state.task, &payload).await,
+        "/accounts/sync-profile" => {
+            task_routes::route_accounts_sync_profile(&state.task, &payload).await
+        }
+        "/accounts/test" => task_routes::route_accounts_test(&state.task, &payload).await,
+        _ => {
+            return openai_error(404, "not found", "invalid_request_error");
+        }
+    };
     Json(res).into_response()
 }
 

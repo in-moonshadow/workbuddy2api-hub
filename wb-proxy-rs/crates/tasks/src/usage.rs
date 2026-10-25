@@ -1367,10 +1367,7 @@ fn detect_model_realm(model_id: &str) -> String {
         "gemini-3.5-flash",
         "grok-4.7",
     ];
-    if intl_only.contains(&m.as_str())
-        || m.starts_with("gpt-")
-        || m.starts_with("gemini-")
-    {
+    if intl_only.contains(&m.as_str()) || m.starts_with("gpt-") || m.starts_with("gemini-") {
         return "intl".to_string();
     }
     let cn_only = [
@@ -1464,10 +1461,7 @@ pub fn build_usage_perf(
 
         // 按 (model, realm) 二维桶：取（必要时建）对应桶。
         let row_realm = realm_of(row);
-        let mr_model_index = match model_realms
-            .iter()
-            .position(|(name, _)| name == &model)
-        {
+        let mr_model_index = match model_realms.iter().position(|(name, _)| name == &model) {
             Some(found) => found,
             None => {
                 model_realms.push((model.clone(), Vec::new()));

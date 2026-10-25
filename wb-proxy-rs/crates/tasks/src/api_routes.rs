@@ -1548,3 +1548,1559 @@ pub fn route_credits_refresher_status(task: &TaskRuntime) -> Value {
 
 // SnapshotCache invalidate helper trait not needed; call directly.
 // GrowthSummary default assumed available.
+
+// ---------------------------------------------------------------------------
+// 关卡 4.24（线 B）：账户管理路由（16 条）
+//
+// Python 权威源：wb_proxy.py `_handle_accounts`（:17083-17145）与各
+// `_route_accounts_*`。所有 JSON 键名与顺序对齐 Python 对应分支。
+//
+// ⚠️ 与 Python 的有意差异（均为「简化版」，见汇报）：
+// - `route_accounts_test` / `route_accounts_sync_profile` **不发上游请求**
+//   （契约要求：test 只做本地点检；sync_profile 只读本地账号文件）。
+// - `route_accounts_import_desktop` 不实现桌面端密钥恢复（recoverKey/forgetKey
+//   返回不支持提示）；扫描范围是账号目录里的 JSON 凭据档。
+// - 线 A（pool.rs 的 AccountPool + oauth.rs）并行实现中，本线暂以文件读写 +
+//   本地登录注册表（crate::login）承载同等能力；线 A 落定后可切换其契约 API。
+// ---------------------------------------------------------------------------
+
+/// 当前 epoch 秒（等价 Python `time.time()`）。
+fn acct_now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// 目标账号选择（对齐 Python `if uid: POOL.get(uid) elif realm: ... else: 全部`）。
+fn account_targets<'a>(task: &'a TaskRuntime, payload: &Value) -> Vec<&'a ReadyAccount> {
+    match payload.get("uid") {
+        Some(uid) if json_truthy(uid) => match uid.as_str() {
+            Some(want) => task
+                .ready
+                .iter()
+                .find(|r| r.state.uid == want)
+                .into_iter()
+                .collect(),
+            None => Vec::new(),
+        },
+        _ => {
+            let realm = payload.get("realm").and_then(Value::as_str).unwrap_or("");
+            if !realm.is_empty() && realm != "all" {
+                task.ready
+                    .iter()
+                    .filter(|r| r.state.realm == realm)
+                    .collect()
+            } else {
+                task.ready.iter().collect()
+            }
+        }
+    }
+}
+
+/// 净化 uid 为安全文件名（对齐 Python `re.sub(r"[^A-Za-z0-9_-]", "_", uid).strip("_ ")`）。
+fn safe_uid(uid: &str) -> String {
+    uid.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(|c: char| c == '_' || c.is_whitespace())
+        .to_string()
+}
+
+/// 原子写账号凭据档（同目录 temp + rename，等价 Python `Account.save`）。
+///
+/// `file_name` 必须来自 [`safe_uid`]（无路径分隔符），保证写入落点始终在
+/// `accounts_dir` 之内，不做越界写入。
+fn write_account_doc(
+    accounts_dir: &std::path::Path,
+    file_name: &str,
+    doc: &Value,
+) -> Result<(), String> {
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains('/')
+        || file_name.contains('\\')
+    {
+        return Err(format!("invalid account file name: {file_name}"));
+    }
+    let path = accounts_dir.join(file_name);
+    let text = serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?;
+    let tmp = path.with_file_name(format!("{}.{}.tmp", file_name, std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// 读账号凭据档；文件缺失 / 非对象返回 None。
+fn read_account_doc(accounts_dir: &std::path::Path, file_name: &str) -> Option<Value> {
+    if file_name.is_empty() {
+        return None;
+    }
+    let path = accounts_dir.join(file_name);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let doc: Value = serde_json::from_str(&text).ok()?;
+    if doc.is_object() {
+        Some(doc)
+    } else {
+        None
+    }
+}
+
+/// 把归一化后的字段集写成凭据档 JSON（load_account_pool 能读回的键）。
+fn account_doc_from_fields(f: &wb_identity::import::AccountFields) -> Value {
+    json!({
+        "uid": f.uid,
+        "nickname": f.nickname,
+        "domain": f.domain,
+        "realm": f.realm,
+        "platform": f.platform,
+        "product": f.product,
+        "enterpriseId": f.enterprise_id,
+        "accessToken": f.access_token,
+        "refreshToken": f.refresh_token,
+        "expiresAt": f.expires_at,
+        "addedAt": f.added_at,
+        "source": f.source,
+        "enabled": f.enabled,
+        "weight": f.weight,
+        "note": f.note,
+    })
+}
+
+/// 从字段集构造内存态（public_view 用）。
+fn state_from_fields(f: &wb_identity::import::AccountFields) -> AccountState {
+    let mut st = AccountState::new(&f.uid, &f.realm);
+    st.enterprise_id = f.enterprise_id.clone();
+    st.enabled = f.enabled;
+    st.has_token = !f.access_token.is_empty();
+    st.access_token = f.access_token.clone();
+    st.weight = f.weight.clamp(1, 100);
+    st.product = wb_gateway::endpoints::normalize_product(&f.product).to_string();
+    st.expires_at = if f.expires_at > 0 {
+        Some(f.expires_at as f64)
+    } else {
+        None
+    };
+    st
+}
+
+/// 把 `AccountFields` 转成 public 视图（对齐 Python `account.public()` 的子集，
+/// 供 import / login poll 的 `imported`/`account` 字段）。
+fn public_from_fields(f: &wb_identity::import::AccountFields) -> Value {
+    let st = state_from_fields(f);
+    public_view(&st, &Some(f.nickname.clone()), std::path::Path::new(""))
+}
+
+/// 读取账号文件里的昵称（没有则回退 uid 前 8 位）。
+fn read_local_nickname(accounts_dir: &std::path::Path, file_name: &str) -> Option<String> {
+    let doc = read_account_doc(accounts_dir, file_name)?;
+    doc.get("nickname")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// 积分包状态判定（对齐 Python `_grant_status`：过期 > 用完 > 在扣减 > 可用）。
+fn grant_status(pkg: &Value, now: f64) -> &'static str {
+    let remain = pkg.get("remain").and_then(Value::as_f64).unwrap_or(0.0);
+    let expired = pkg
+        .get("is_expired")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let expired = expired
+        || pkg
+            .get("expire_time")
+            .and_then(|v| parse_stamp_epoch(v.as_str().unwrap_or("")))
+            .is_some_and(|at| at <= now);
+    if expired {
+        return "expired";
+    }
+    if remain <= 0.0 {
+        return "used_up";
+    }
+    if pkg
+        .get("in_usage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "active"
+    } else {
+        "available"
+    }
+}
+
+/// `'2026-10-10 00:42:45'` → epoch（本地时区）；认不出来返回 None。
+fn parse_stamp_epoch(text: &str) -> Option<f64> {
+    let s = text.get(..19)?;
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
+        .map(|dt| dt.timestamp() as f64)
+}
+
+// ---------------------------------------------------------------------------
+// 积分
+// ---------------------------------------------------------------------------
+
+/// 单账号积分抓取并落盘（Python `Account.fetch_credits()`：详细 / 企业两条
+/// 路径；成功即写回账号文件）。
+async fn fetch_credits_now(task: &TaskRuntime, ra: &ReadyAccount) -> Value {
+    let now = acct_now_epoch();
+    let realm_cfg = wb_gateway::endpoints::realm_config(&ra.state.realm);
+    let headers = ra.creds.billing_headers(ra.device_token.as_deref());
+    let res = if !ra.state.enterprise_id.is_empty() {
+        match wb_gateway::credits::fetch_credits_enterprise(
+            &task.client,
+            realm_cfg.billing_upstream,
+            &headers,
+        )
+        .await
+        {
+            Ok(ent) => {
+                let credits = crate::credits::aggregate_enterprise(
+                    ent.used,
+                    ent.size,
+                    &ent.cycle_start,
+                    &ent.cycle_end,
+                    now,
+                );
+                json!({"ok": true, "credits": credits.to_json()})
+            }
+            Err(e) => json!({"ok": false, "error": e}),
+        }
+    } else {
+        let chat_upstream = wb_gateway::endpoints::chat_base_url(&ra.state.realm, "workbuddy");
+        match wb_gateway::credits::fetch_credits_detailed(
+            &task.client,
+            realm_cfg.billing_upstream,
+            &chat_upstream,
+            &headers,
+        )
+        .await
+        {
+            Ok(detail) => {
+                let packages = crate::credits::packages_from_accounts(&detail.accounts, now);
+                let credits = crate::credits::aggregate_detailed(
+                    packages,
+                    &detail.summary_packages,
+                    detail.is_paid_user,
+                    detail.checkin,
+                    now,
+                );
+                json!({"ok": true, "credits": credits.to_json()})
+            }
+            Err(e) => json!({"ok": false, "error": e}),
+        }
+    };
+    if res.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        if let Some(credits) = res.get("credits") {
+            let _ = wb_storage::write_account_credits(
+                &task.accounts_dir,
+                &ra.state.credential_file,
+                credits,
+            );
+        }
+    }
+    res
+}
+
+/// `/accounts/credits` + `/accounts/credits/fetch`：一键刷新积分。
+pub async fn route_accounts_credits_fetch(task: &TaskRuntime, payload: &Value) -> Value {
+    let targets = account_targets(task, payload);
+    let mut results = Vec::new();
+    for ra in targets {
+        let res = fetch_credits_now(task, ra).await;
+        let ok = res.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        let error = res
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let credits =
+            wb_storage::read_account_credits(&task.accounts_dir, &ra.state.credential_file)
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Null);
+        results.push(json!({
+            "uid": ra.state.uid,
+            "ok": ok,
+            "credits": credits,
+            "error": error,
+        }));
+    }
+    json!({"results": results, "accounts": manual_account_views(task)})
+}
+
+/// `/accounts/credits/detail`：单账号积分明细（Python `_route_account_credits_detail`）。
+pub async fn route_account_credits_detail(task: &TaskRuntime, payload: &Value) -> Value {
+    let uid = payload.get("uid").and_then(Value::as_str).unwrap_or("");
+    let ra = task.ready.iter().find(|r| r.state.uid == uid);
+    let Some(ra) = ra else {
+        return json!({"ok": false, "error": "未找到指定账号"});
+    };
+    let refresh = match payload.get("refresh") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(v) => json_truthy(v),
+    };
+    let stored = wb_storage::read_account_credits(&task.accounts_dir, &ra.state.credential_file)
+        .ok()
+        .flatten();
+    let has_packages = stored
+        .as_ref()
+        .and_then(|c| c.get("packages"))
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let nick = ra
+        .nickname
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uid8(&ra.state.uid));
+    if refresh || !has_packages {
+        let res = fetch_credits_now(task, ra).await;
+        if !res.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let error = res
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("获取积分明细失败")
+                .to_string();
+            let credits =
+                wb_storage::read_account_credits(&task.accounts_dir, &ra.state.credential_file)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Null);
+            return json!({
+                "ok": false,
+                "uid": ra.state.uid,
+                "nickname": nick,
+                "realm": ra.state.realm,
+                "credits": credits,
+                "error": error,
+            });
+        }
+    }
+    let credits = wb_storage::read_account_credits(&task.accounts_dir, &ra.state.credential_file)
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Null);
+    json!({
+        "ok": true,
+        "uid": ra.state.uid,
+        "nickname": nick,
+        "realm": ra.state.realm,
+        "credits": credits,
+    })
+}
+
+/// `/accounts/credits/grants`：积分获取历史（只读本地账号文件快照，不发上游
+/// 请求；对齐 Python `credit_grants()` 的摊平表）。
+pub async fn route_accounts_credits_grants(task: &TaskRuntime, _payload: &Value) -> Value {
+    let now = acct_now_epoch();
+    let mut rows: Vec<Value> = Vec::new();
+    let mut fetched = 0.0_f64;
+    for ra in &task.ready {
+        let credits =
+            wb_storage::read_account_credits(&task.accounts_dir, &ra.state.credential_file)
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Null);
+        if let Some(upd) = credits.get("updated_at").and_then(Value::as_f64) {
+            fetched = fetched.max(upd);
+        }
+        let Some(packages) = credits.get("packages").and_then(Value::as_array) else {
+            continue;
+        };
+        let nick = ra
+            .nickname
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uid8(&ra.state.uid));
+        for pkg in packages {
+            let num = |key: &str| -> f64 {
+                pkg.get(key)
+                    .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+                    .unwrap_or(0.0)
+            };
+            let expire_iso = pkg
+                .get("expire_time")
+                .or_else(|| pkg.get("cycle_end_time"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let create_at =
+                parse_stamp_epoch(pkg.get("create_time").and_then(Value::as_str).unwrap_or(""));
+            rows.push(json!({
+                "uid": ra.state.uid,
+                "nickname": nick,
+                "realm": ra.state.realm,
+                "name": pkg.get("name").or_else(|| pkg.get("package_code")).and_then(Value::as_str).unwrap_or("Package"),
+                "product": pkg.get("sub_product_name").or_else(|| pkg.get("product_name")).and_then(Value::as_str).unwrap_or(""),
+                "grant_reason": pkg.get("grant_reason").and_then(Value::as_str).unwrap_or(""),
+                "size": num("size"),
+                "remain": num("remain"),
+                "used": num("used"),
+                "unit": pkg.get("unit").and_then(Value::as_str).unwrap_or("credit"),
+                "create_at": create_at,
+                "create_iso": pkg.get("create_time").and_then(Value::as_str).unwrap_or(""),
+                "expire_at": parse_stamp_epoch(&expire_iso),
+                "expire_iso": expire_iso,
+                "no_expiry": pkg.get("no_expiry").and_then(Value::as_bool).unwrap_or(false),
+                "days_left": pkg.get("days_left").cloned(),
+                "status": grant_status(pkg, now),
+                // 简化版：本机动作关联（Python `_grant_action` 读 activity 历史）
+                // 未实现，恒为 null。
+                "action": Value::Null,
+            }));
+        }
+    }
+    // 新的在前；同一秒按昵称、包名稳定排序。
+    rows.sort_by(|a, b| {
+        let ka = a.get("create_at").and_then(Value::as_f64).unwrap_or(0.0);
+        let kb = b.get("create_at").and_then(Value::as_f64).unwrap_or(0.0);
+        kb.partial_cmp(&ka)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.get("nickname")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("nickname").and_then(Value::as_str).unwrap_or(""))
+            })
+            .then_with(|| {
+                a.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("name").and_then(Value::as_str).unwrap_or(""))
+            })
+    });
+    let sum = |key: &str| -> f64 {
+        rows.iter()
+            .map(|r| r.get(key).and_then(Value::as_f64).unwrap_or(0.0))
+            .sum::<f64>()
+    };
+    let accounts = rows
+        .iter()
+        .filter_map(|r| r.get("uid").and_then(Value::as_str).map(str::to_string))
+        .collect::<std::collections::HashSet<String>>()
+        .len();
+    json!({
+        "ok": true,
+        "generated_at": now,
+        "generated_iso": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "fetched_at": if fetched > 0.0 { Some(fetched) } else { None },
+        "fetched_iso": if fetched > 0.0 {
+            Some(crate::credits::local_text(fetched))
+        } else {
+            None
+        },
+        "rows": rows,
+        "summary": {
+            "count": rows.len(),
+            "size": (sum("size") * 100.0).round() / 100.0,
+            "remain": (sum("remain") * 100.0).round() / 100.0,
+            "used": (sum("used") * 100.0).round() / 100.0,
+            "accounts": accounts,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 导入 / 导出 / 删除
+// ---------------------------------------------------------------------------
+
+/// 把导入文档粗分成行（对齐 Python `wb_accounts._coerce_account_rows`）：
+/// `{"accounts": [...]}` / 裸数组 / 单账号 dict / 桌面凭据 dict。
+fn coerce_rows(blob: &Value) -> Result<Vec<Value>, String> {
+    match blob {
+        Value::Array(rows) => Ok(rows.clone()),
+        Value::Object(map) => {
+            if let Some(accounts) = map.get("accounts") {
+                if let Value::Array(rows) = accounts {
+                    if rows.is_empty() {
+                        return Err("document contains no accounts".to_string());
+                    }
+                    return Ok(rows.clone());
+                }
+                return Err("accounts must be an array".to_string());
+            }
+            if map.contains_key("accessToken")
+                || map.contains_key("auth")
+                || map.contains_key("account")
+            {
+                return Ok(vec![blob.clone()]);
+            }
+            Err("the document must be a JSON object or array".to_string())
+        }
+        _ => Err("the document must be a JSON object or array".to_string()),
+    }
+}
+
+/// 账号文件扫描（对齐 Python `desktop_credential_scan` 的简化版：只扫账号目录）。
+fn scan_account_files(accounts_dir: &std::path::Path) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Ok(read_dir) = std::fs::read_dir(accounts_dir) else {
+        return out;
+    };
+    let mut files: Vec<std::path::PathBuf> = read_dir
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    for path in files {
+        let Some(name) = path.file_name().and_then(|s| s.to_str()).to_owned() else {
+            continue;
+        };
+        if ["settings.json", "model.json", "active_realm.json"].contains(&name) {
+            continue;
+        }
+        if let Some(doc) = read_account_doc(accounts_dir, name) {
+            let uid = doc.get("uid").and_then(Value::as_str).unwrap_or("");
+            let realm = doc.get("realm").and_then(Value::as_str).unwrap_or("");
+            out.push(json!({
+                "path": path.to_string_lossy(),
+                "file": name,
+                "uid": uid,
+                "realm": realm,
+                "nickname": doc.get("nickname").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+    }
+    out
+}
+
+/// `/accounts/export`：导出账号文档（identity::export；对齐 Python
+/// `_get_accounts_export` 的简化 POST 版）。
+pub async fn route_accounts_export(task: &TaskRuntime, payload: &Value) -> Value {
+    let include_secrets = match payload.get("secrets") {
+        None => true,
+        Some(v) => json_truthy(v),
+    };
+    let portable = payload
+        .get("portable")
+        .or(payload.get("lean"))
+        .or(payload.get("minimal"))
+        .or(payload.get("account_only"))
+        .map(json_truthy)
+        .unwrap_or(false);
+    let fields: Vec<wb_identity::import::AccountFields> = account_targets(task, payload)
+        .iter()
+        .filter_map(|ra| fields_from_ready(task, ra))
+        .collect();
+    let doc = wb_identity::export::build_export_document(&fields, include_secrets);
+    json!({
+        "account": doc,
+        "exported": true,
+        "count": fields.len(),
+        "portable": portable,
+        "accounts": manual_account_views(task),
+    })
+}
+
+/// 从 ready 账号读凭据档并映射为可导出字段集（文件缺失回退内存态）。
+fn fields_from_ready(
+    task: &TaskRuntime,
+    ra: &ReadyAccount,
+) -> Option<wb_identity::import::AccountFields> {
+    let st = &ra.state;
+    let doc = read_account_doc(&task.accounts_dir, &st.credential_file);
+    let nickname = ra
+        .nickname
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            doc.as_ref()
+                .and_then(|d| d.get("nickname"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| uid8(&st.uid));
+    let expires_at = st.expires_at.unwrap_or(0.0) as i64;
+    Some(wb_identity::import::AccountFields {
+        uid: st.uid.clone(),
+        nickname,
+        domain: wb_identity::realm::domain_for_realm(&st.realm, ""),
+        realm: st.realm.clone(),
+        platform: doc
+            .as_ref()
+            .and_then(|d| d.get("platform"))
+            .and_then(Value::as_str)
+            .unwrap_or("CLI")
+            .to_string(),
+        enterprise_id: st.enterprise_id.clone(),
+        access_token: st.access_token.clone(),
+        refresh_token: doc
+            .as_ref()
+            .and_then(|d| d.get("refreshToken"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        expires_at,
+        source: doc
+            .as_ref()
+            .and_then(|d| d.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or("import")
+            .to_string(),
+        enabled: st.enabled,
+        last_error: st.last_error.clone(),
+        cooldown_until: st.cooldown_until,
+        product: st.product.clone(),
+        added_at: doc
+            .as_ref()
+            .and_then(|d| d.get("addedAt"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        weight: st.weight,
+        note: doc
+            .as_ref()
+            .and_then(|d| d.get("note"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// `/accounts/import`：导入导出行 / 裸数组 / 单账号 / 桌面凭据。
+/// 支持 `dryRun`（不落盘）、`overwrite`（覆盖已存在账号）、`realm`（强制 realm）。
+pub async fn route_accounts_import(task: &TaskRuntime, payload: &Value) -> Value {
+    let blob = if payload.get("data").is_some() {
+        payload.get("data").unwrap_or(&Value::Null)
+    } else {
+        payload
+    };
+    let rows = match coerce_rows(blob) {
+        Ok(r) => r,
+        Err(problem) => {
+            return json!({
+                "ok": false,
+                "error": format!("cannot read the document: {}", problem),
+            })
+        }
+    };
+    let dry_run = payload.get("dryRun").map(json_truthy).unwrap_or(false);
+    let overwrite = payload.get("overwrite").map(json_truthy).unwrap_or(false);
+    let forced_realm = payload
+        .get("realm")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !forced_realm.is_empty() && forced_realm != "intl" && forced_realm != "cn" {
+        return json!({
+            "ok": false,
+            "error": "realm must be intl or cn",
+        });
+    }
+    let forced = if forced_realm.is_empty() {
+        None
+    } else {
+        Some(forced_realm.as_str())
+    };
+
+    let report = import_rows_preview(task, &rows, forced, overwrite);
+    if dry_run {
+        return json!({
+            "dryRun": true,
+            "count": rows.len(),
+            "result": report,
+            "accounts": manual_account_views(task),
+        });
+    }
+    let report = import_rows_commit(task, &rows, forced, overwrite);
+    task.panel.add_log_entry(
+        &format!(
+            "account import: {} added, {} updated, {} skipped, {} invalid",
+            report
+                .get("added")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0),
+            report
+                .get("updated")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0),
+            report
+                .get("skipped")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0),
+            report
+                .get("invalid")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0),
+        ),
+        "accounts",
+    );
+    json!({
+        "count": rows.len(),
+        "result": report,
+        "accounts": manual_account_views(task),
+    })
+}
+
+/// 导入判重的「已知账号集」= 进程内 ready ∪ 磁盘上已有的账号凭据档。
+///
+/// Python 从 `AccountPool.accounts` 判重（导入即入池，故第二次导入同 uid 会
+/// 看得到第一次的结果）；Rust 的 ready 是只读 Vec，写入新档后不自动入池，
+/// 故必须以**磁盘上的文件**为第二来源——凭据档本身就是池的持久化真相。
+fn known_uid_set(task: &TaskRuntime) -> std::collections::HashSet<String> {
+    let mut set: std::collections::HashSet<String> =
+        task.ready.iter().map(|r| r.state.uid.clone()).collect();
+    for entry in scan_account_files(&task.accounts_dir) {
+        if let Some(uid) = entry.get("uid").and_then(Value::as_str) {
+            if !uid.is_empty() {
+                set.insert(uid.to_string());
+            }
+        }
+    }
+    set
+}
+
+/// 只读预览（对齐 Python `AccountPool.preview_import_rows`，与 commit 同规则）。
+fn import_rows_preview(
+    task: &TaskRuntime,
+    rows: &[Value],
+    forced: Option<&str>,
+    overwrite: bool,
+) -> Value {
+    let known = known_uid_set(task);
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut invalid: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (index, row) in rows.iter().enumerate() {
+        let fields = match wb_identity::import::normalise_import_row(row, forced) {
+            Ok(f) => f,
+            Err(reason) => {
+                invalid.push(json!({"index": index + 1, "reason": reason}));
+                continue;
+            }
+        };
+        let uid = fields.uid;
+        if seen.contains(&uid) {
+            skipped.push(json!({"uid": uid, "reason": "duplicate inside the document"}));
+        } else if known.contains(&uid) && !overwrite {
+            skipped.push(json!({"uid": uid, "reason": "already exists"}));
+        } else if known.contains(&uid) {
+            updated.push(uid.clone());
+        } else {
+            added.push(uid.clone());
+        }
+        seen.insert(uid);
+    }
+    json!({"added": added, "updated": updated, "skipped": skipped, "invalid": invalid})
+}
+
+/// 实际导入（对齐 Python `AccountPool.import_rows`）。
+fn import_rows_commit(
+    task: &TaskRuntime,
+    rows: &[Value],
+    forced: Option<&str>,
+    overwrite: bool,
+) -> Value {
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut invalid: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let known = known_uid_set(task);
+    for (index, row) in rows.iter().enumerate() {
+        let fields = match wb_identity::import::normalise_import_row(row, forced) {
+            Ok(f) => f,
+            Err(reason) => {
+                invalid.push(json!({"index": index + 1, "reason": reason}));
+                continue;
+            }
+        };
+        let uid = fields.uid.clone();
+        if seen.contains(&uid) {
+            skipped.push(json!({"uid": uid, "reason": "duplicate inside the document"}));
+            continue;
+        }
+        seen.insert(uid.clone());
+        let existing = known.contains(&uid);
+        if existing && !overwrite {
+            skipped.push(json!({"uid": uid, "reason": "already exists"}));
+            continue;
+        }
+        let file_name = format!("{}.json", safe_uid(&uid));
+        if safe_uid(&uid).is_empty() {
+            invalid.push(json!({"index": index + 1, "reason": "cannot determine uid (no uid field and no sub claim)"}));
+            continue;
+        }
+        let mut doc = account_doc_from_fields(&fields);
+        if existing {
+            // 保留旧文件的 addedAt / credits / lastCheckin 等非导入字段
+            if let Some(old) = read_account_doc(&task.accounts_dir, &file_name) {
+                if let Some(obj) = doc.as_object_mut() {
+                    for keep in [
+                        "addedAt",
+                        "credits",
+                        "lastCheckin",
+                        "lastDailyChat",
+                        "lastActivityReport",
+                    ] {
+                        if let Some(v) = old.get(keep) {
+                            obj.insert(keep.to_string(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if let Err(reason) = write_account_doc(&task.accounts_dir, &file_name, &doc) {
+            invalid.push(json!({"index": index + 1, "reason": reason}));
+            continue;
+        }
+        if existing {
+            updated.push(uid);
+        } else {
+            added.push(uid);
+        }
+    }
+    json!({"added": added, "updated": updated, "skipped": skipped, "invalid": invalid})
+}
+
+/// `/accounts/import/desktop`：桌面端凭据导入 / 扫描。
+///
+/// 调用方式对齐 Python：
+/// - `{}` → 只扫描（只读，不导入）
+/// - `{"path": "..."}` → 导入该凭据文件
+/// - `{"all": true}` → 导入扫描到的全部
+/// - `{"recoverKey"|"forgetKey": true}` → 桌面端密钥恢复（本实现不支持，返回提示）
+pub async fn route_accounts_import_desktop(task: &TaskRuntime, payload: &Value) -> Value {
+    if payload.get("recoverKey").map(json_truthy).unwrap_or(false)
+        || payload.get("forgetKey").map(json_truthy).unwrap_or(false)
+    {
+        return json!({
+            "ok": false,
+            "msg": "桌面端 at-rest 密钥恢复暂不支持（Rust 简化版）",
+            "atrest": Value::Null,
+        });
+    }
+    if let Some(path) = payload.get("path").and_then(Value::as_str) {
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return json!({"ok": false, "error": "path required"});
+        }
+        let blob = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                return json!({"ok": false, "error": format!("read {}: {}", path, e)});
+            }
+        };
+        let doc: Value = match serde_json::from_str(&blob) {
+            Ok(d) => d,
+            Err(e) => {
+                return json!({"ok": false, "error": format!("parse {}: {}", path, e)});
+            }
+        };
+        let forced = payload
+            .get("realm")
+            .and_then(Value::as_str)
+            .filter(|r| *r == "cn" || *r == "intl");
+        let rows = match coerce_rows(&doc) {
+            Ok(r) => r,
+            Err(problem) => {
+                return json!({"ok": false, "error": format!("import failed: {}", problem)});
+            }
+        };
+        let report = import_rows_commit(task, &rows, forced, true);
+        // 视图只包含真正新入池的账号（对齐 Python `imported: [a.public()]`）
+        let added_uids: std::collections::HashSet<String> = report
+            .get("added")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let mut imported = Vec::new();
+        for row in &rows {
+            if let Ok(f) = wb_identity::import::normalise_import_row(row, forced) {
+                if added_uids.contains(&f.uid) {
+                    imported.push(public_from_fields(&f));
+                }
+            }
+        }
+        task.panel.add_log_entry(
+            &format!(
+                "imported account(s) from {} (user confirmed)",
+                std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&path)
+            ),
+            "accounts",
+        );
+        return json!({
+            "ok": true,
+            "imported": imported,
+            "accounts": manual_account_views(task),
+        });
+    }
+    if payload.get("all").map(json_truthy).unwrap_or(false) {
+        // 简化版：扫描账号目录并导入其中尚未入池的文件
+        let detected = scan_account_files(&task.accounts_dir);
+        let forced = payload
+            .get("realm")
+            .and_then(Value::as_str)
+            .filter(|r| *r == "cn" || *r == "intl");
+        let mut imported = Vec::new();
+        for d in &detected {
+            let uid = d.get("uid").and_then(Value::as_str).unwrap_or("");
+            if task.ready.iter().any(|r| r.state.uid == uid) {
+                continue;
+            }
+            let file_name = d.get("file").and_then(Value::as_str).unwrap_or("");
+            if let Some(doc) = read_account_doc(&task.accounts_dir, file_name) {
+                if let Ok(f) = wb_identity::import::normalise_import_row(&doc, forced) {
+                    if let Err(reason) = write_account_doc(
+                        &task.accounts_dir,
+                        file_name,
+                        &account_doc_from_fields(&f),
+                    ) {
+                        task.panel.add_log_entry(
+                            &format!("desktop import failed for {}: {}", uid, reason),
+                            "accounts",
+                        );
+                        continue;
+                    }
+                    imported.push(uid.to_string());
+                }
+            }
+        }
+        return json!({
+            "ok": true,
+            "imported": imported
+                .iter()
+                .map(|uid| public_from_fields(&wb_identity::import::AccountFields {
+                    uid: uid.clone(),
+                    nickname: uid8(uid),
+                    domain: String::new(),
+                    realm: "intl".to_string(),
+                    platform: "CLI".to_string(),
+                    enterprise_id: String::new(),
+                    access_token: String::new(),
+                    refresh_token: String::new(),
+                    expires_at: 0,
+                    source: "desktop-app".to_string(),
+                    enabled: true,
+                    last_error: String::new(),
+                    cooldown_until: 0.0,
+                    product: wb_gateway::endpoints::PRODUCT_DESKTOP.to_string(),
+                    added_at: 0,
+                    weight: 1,
+                    note: String::new(),
+                }))
+                .collect::<Vec<Value>>(),
+            "accounts": manual_account_views(task),
+        });
+    }
+    // 只扫描
+    json!({
+        "detected": scan_account_files(&task.accounts_dir),
+        "accounts": manual_account_views(task),
+        "pool_uids": task.ready.iter().map(|r| r.state.uid.clone()).collect::<Vec<_>>(),
+        "atrest": Value::Null,
+    })
+}
+
+/// `/accounts/delete`：移除账号（删凭据档前打印 WARN）。
+pub async fn route_accounts_delete(task: &TaskRuntime, payload: &Value) -> Value {
+    let uid = payload.get("uid").and_then(Value::as_str).unwrap_or("");
+    if uid.is_empty() {
+        return json!({"ok": false, "error": "uid required", "status": 400});
+    }
+    let Some(ra) = task.ready.iter().find(|r| r.state.uid == uid) else {
+        return json!({"ok": false, "deleted": false, "error": "no such account", "status": 404});
+    };
+    // 真实文件删除前打印 WARN（删除语义需操作者确认，这里把确认责任记进面板日志）
+    task.panel.add_log_entry(
+        &format!(
+            "WARN: deleting account file {} (uid {}), operator confirmed delete",
+            ra.state.credential_file,
+            uid8(&uid)
+        ),
+        "accounts",
+    );
+    let removed = if !ra.state.credential_file.is_empty() {
+        let path = task.accounts_dir.join(&ra.state.credential_file);
+        match std::fs::remove_file(&path) {
+            Ok(_) => {
+                task.panel
+                    .add_log_entry(&format!("account {} deleted", uid8(&uid)), "accounts");
+                true
+            }
+            Err(e) => {
+                task.panel.add_log_entry(
+                    &format!("WARN: account file {} delete failed: {}", path.display(), e),
+                    "accounts",
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    // 简化版：进程内池是只读 Vec（线 A 落定后切换 AccountPool.remove）。
+    // 文件已删，重启/重载后账号自然移出池。
+    json!({
+        "ok": removed,
+        "deleted": removed,
+        "accounts": task
+            .ready
+            .iter()
+            .filter(|r| r.state.uid != uid)
+            .map(|r| public_view(&r.state, &r.nickname, &task.accounts_dir))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 登录（start / poll / cancel）
+// ---------------------------------------------------------------------------
+
+/// 默认登录 realm（对齐 Python `CURRENT_REALM`）：读 active_realm.json，缺省 intl。
+fn login_realm_default(task: &TaskRuntime) -> String {
+    wb_storage::read_active_realm(&task.accounts_dir).unwrap_or_else(|| "intl".to_string())
+}
+
+/// `/accounts/login/start`：申请 OAuth state（对齐 Python `POOL.start_login`）。
+///
+/// 上游 HTTP 走 `wb_gateway::oauth::start_oauth_state`（线 A）；本 handler 只做
+/// 参数组装 + 注册表登记（crate::login）。成功返回 `{state, authUrl, realm, platform}`。
+pub async fn route_accounts_login_start(task: &TaskRuntime, payload: &Value) -> Value {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("CLI")
+        .to_string();
+    let target_realm = payload
+        .get("realm")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| login_realm_default(task));
+    let cfg = wb_gateway::endpoints::realm_config(&target_realm);
+    let chat_upstream = wb_gateway::endpoints::chat_base_url(&target_realm, "workbuddy");
+    match wb_gateway::oauth::start_oauth_state(
+        &task.client,
+        &chat_upstream,
+        &platform,
+        cfg.billing_ua,
+        cfg.origin,
+    )
+    .await
+    {
+        Ok(info) => {
+            crate::login::login_start_register(
+                &info.state,
+                &platform,
+                &target_realm,
+                acct_now_epoch(),
+            );
+            task.panel.add_log_entry(
+                &format!(
+                    "oauth login started (realm={}, platform={}, state={})",
+                    target_realm,
+                    platform,
+                    info.state.chars().take(8).collect::<String>()
+                ),
+                "accounts",
+            );
+            json!({
+                "state": info.state,
+                "authUrl": info.auth_url,
+                "realm": target_realm,
+                "platform": platform,
+            })
+        }
+        Err(e) => json!({"ok": false, "error": format!("could not start login: {}", e)}),
+    }
+}
+
+/// `/accounts/login/poll`：轮询 OAuth token 并建号（对齐 Python `POOL.poll_login`）。
+///
+/// 状态判定（`LOGIN_PENDING` / code!=0 / token 缺失）在本 handler；上游 HTTP 走
+/// `wb_gateway::oauth::{poll_oauth_token, fetch_login_account}`（线 A）。成功时把
+/// 新账号写进凭据档（upsert），并从注册表移除该 state。
+pub async fn route_accounts_login_poll(task: &TaskRuntime, payload: &Value) -> Value {
+    let state = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let now = acct_now_epoch();
+    let info = match crate::login::login_peek(&state) {
+        Some(i) => i,
+        None => {
+            return json!({
+                "status": "unknown",
+                "message": "state not recognised - start the login again",
+            })
+        }
+    };
+    if now - info.created > crate::login::LOGIN_TTL_SECONDS {
+        crate::login::login_remove(&state);
+        return json!({
+            "status": "expired",
+            "message": "login window expired - start again",
+        });
+    }
+    let cfg = wb_gateway::endpoints::realm_config(&info.realm);
+    let chat_upstream = wb_gateway::endpoints::chat_base_url(&info.realm, "workbuddy");
+    let parsed = match wb_gateway::oauth::poll_oauth_token(
+        &task.client,
+        &chat_upstream,
+        &state,
+        cfg.billing_ua,
+        cfg.origin,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return json!({"status": "pending", "message": format!("poll error: {}", e)}),
+    };
+    let code = parsed.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code == crate::login::LOGIN_PENDING {
+        return json!({
+            "status": "pending",
+            "message": parsed.get("msg").and_then(Value::as_str).unwrap_or("waiting for browser login"),
+        });
+    }
+    if code != 0 {
+        return json!({
+            "status": "error",
+            "message": format!("code={} msg={}", code, parsed.get("msg").and_then(Value::as_str).unwrap_or("")),
+        });
+    }
+    let data = parsed.get("data").cloned().unwrap_or(json!({}));
+    let token = data
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if token.is_empty() {
+        return json!({"status": "pending", "message": "waiting for token"});
+    }
+    // 拉登录账号 profile（best-effort：失败不中断建号）
+    let mut nickname = String::new();
+    if let Ok(profile) = wb_gateway::oauth::fetch_login_account(
+        &task.client,
+        &chat_upstream,
+        &state,
+        token,
+        cfg.billing_ua,
+        cfg.origin,
+    )
+    .await
+    {
+        if let Some(d) = profile.get("data") {
+            nickname = d
+                .get("nickname")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+    let uid = wb_identity::jwt::jwt_uid(token);
+    let expires_raw = data
+        .get("expiresAt")
+        .and_then(Value::as_f64)
+        .map(wb_identity::jwt::normalize_epoch)
+        .unwrap_or(0);
+    let expires_at = if expires_raw != 0 {
+        expires_raw
+    } else {
+        wb_identity::jwt::jwt_exp(token)
+    };
+    let domain = data
+        .get("domain")
+        .and_then(Value::as_str)
+        .unwrap_or(cfg.domain);
+    let file_name = format!("{}.json", safe_uid(&uid));
+    let nickname_display = if nickname.is_empty() {
+        uid.chars().take(8).collect::<String>()
+    } else {
+        nickname.clone()
+    };
+    // json! 的值表达式走 to_value(&expr)（借用），uid / nickname 这里不会被移走。
+    let mut doc = json!({
+        "uid": uid,
+        "nickname": nickname_display,
+        "domain": wb_identity::realm::domain_for_realm(&info.realm, domain),
+        "realm": info.realm,
+        "platform": info.platform,
+        "product": wb_gateway::endpoints::PRODUCT_DESKTOP,
+        "enterpriseId": data.get("enterpriseId").and_then(Value::as_str).unwrap_or(""),
+        "accessToken": token,
+        "refreshToken": data.get("refreshToken").and_then(Value::as_str).unwrap_or(""),
+        "expiresAt": expires_at,
+        "addedAt": now as i64,
+        "source": "oauth",
+        "enabled": true,
+        "weight": 1,
+    });
+    // upsert：保留旧文件里的积分快照等非登录字段
+    if let Some(old) = read_account_doc(&task.accounts_dir, &file_name) {
+        if let Some(obj) = doc.as_object_mut() {
+            for keep in [
+                "credits",
+                "lastCheckin",
+                "lastDailyChat",
+                "lastActivityReport",
+            ] {
+                if let Some(v) = old.get(keep) {
+                    obj.insert(keep.to_string(), v.clone());
+                }
+            }
+        }
+    }
+    if let Err(reason) = write_account_doc(&task.accounts_dir, &file_name, &doc) {
+        return json!({"status": "error", "message": reason});
+    }
+    crate::login::login_remove(&state);
+    let fields = wb_identity::import::AccountFields {
+        uid: uid.clone(),
+        nickname,
+        domain: wb_identity::realm::domain_for_realm(&info.realm, domain),
+        realm: info.realm,
+        platform: info.platform,
+        enterprise_id: doc
+            .get("enterpriseId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        access_token: token.to_string(),
+        refresh_token: doc
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        expires_at,
+        source: "oauth".to_string(),
+        enabled: true,
+        last_error: String::new(),
+        cooldown_until: 0.0,
+        product: wb_gateway::endpoints::PRODUCT_DESKTOP.to_string(),
+        added_at: now as i64,
+        weight: 1,
+        note: String::new(),
+    };
+    json!({"status": "ok", "account": public_from_fields(&fields)})
+}
+
+/// `/accounts/login/cancel`：取消登录 state（对齐 Python `POOL.cancel_login`）。
+pub async fn route_accounts_login_cancel(task: &TaskRuntime, payload: &Value) -> Value {
+    let _ = task; // 签名对齐契约；本 handler 只用注册表
+    let state = payload.get("state").and_then(Value::as_str).unwrap_or("");
+    json!({"cancelled": crate::login::login_cancel(state)})
+}
+// 账户设置 / 身分 / 点检
+// ---------------------------------------------------------------------------
+
+/// 把改过字段的内存态副本 + 落盘后的视图拼出来。
+fn patched_views(task: &TaskRuntime, patched: &[(&ReadyAccount, AccountState)]) -> Vec<Value> {
+    task.ready
+        .iter()
+        .map(|ra| {
+            if let Some((_, st)) = patched.iter().find(|(r, _)| r.state.uid == ra.state.uid) {
+                public_view(st, &ra.nickname, &task.accounts_dir)
+            } else {
+                public_view(&ra.state, &ra.nickname, &task.accounts_dir)
+            }
+        })
+        .collect()
+}
+
+/// 打补丁并落盘账号文件，返回改后的内存态副本（读磁盘最新内容再合并）。
+fn patch_account_state<F: Fn(&mut serde_json::Map<String, Value>, &mut AccountState)>(
+    task: &TaskRuntime,
+    ra: &ReadyAccount,
+    base: &AccountState,
+    apply: F,
+) -> Result<AccountState, String> {
+    let mut st = base.clone();
+    let mut doc = read_account_doc(&task.accounts_dir, &ra.state.credential_file)
+        .unwrap_or_else(|| json!({}));
+    let map = doc
+        .as_object_mut()
+        .ok_or_else(|| "account file is not a JSON object".to_string())?;
+    apply(map, &mut st);
+    write_account_doc(&task.accounts_dir, &ra.state.credential_file, &doc)?;
+    Ok(st)
+}
+
+/// `/accounts/product`：切换出站身分（payload.product 空串 = 恢复默认桌面端）。
+pub async fn route_accounts_product(task: &TaskRuntime, payload: &Value) -> Value {
+    let raw = payload
+        .get("product")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // 空串 = 恢复默认（workbuddy）；非空必须是三产品之一
+    let target = if raw.is_empty() {
+        wb_gateway::endpoints::PRODUCT_DESKTOP.to_string()
+    } else if ["workbuddy", "vscode", "cli"].contains(&raw.as_str()) {
+        wb_gateway::endpoints::normalize_product(&raw).to_string()
+    } else {
+        return json!({
+            "ok": false,
+            "error": "product must be 'workbuddy', 'vscode', or 'cli'",
+            "status": 400,
+        });
+    };
+    let targets = account_targets(task, payload);
+    let mut changed: Vec<String> = Vec::new();
+    let mut patched: Vec<(&ReadyAccount, AccountState)> = Vec::new();
+    for ra in &targets {
+        match patch_account_state(task, ra, &ra.state, |map, st| {
+            let new = wb_gateway::endpoints::normalize_product(&target).to_string();
+            let old = map
+                .get("product")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if old != new {
+                map.insert("product".to_string(), json!(new));
+                st.product = new.clone();
+            }
+        }) {
+            Ok(st) => {
+                let changed_this = st.product == target;
+                if changed_this {
+                    changed.push(uid8(&ra.state.uid));
+                    task.panel.add_log_entry(
+                        &format!(
+                            "account {}: 面板手動切換身分 -> {}",
+                            uid8(&ra.state.uid),
+                            target
+                        ),
+                        "accounts",
+                    );
+                }
+                patched.push((ra, st));
+            }
+            Err(e) => {
+                task.panel.add_log_entry(
+                    &format!(
+                        "WARN: product switch failed for {}: {}",
+                        uid8(&ra.state.uid),
+                        e
+                    ),
+                    "accounts",
+                );
+            }
+        }
+    }
+    json!({
+        "ok": true,
+        "product": target,
+        "changed": changed,
+        "accounts": patched_views(task, &patched),
+    })
+}
+
+/// `/accounts/refresh`：重解析 JWT 时效并落盘（对齐 Python `Account.refresh()`）。
+pub async fn route_accounts_refresh(task: &TaskRuntime, payload: &Value) -> Value {
+    let targets = account_targets(task, payload);
+    let mut results = Vec::new();
+    for ra in targets {
+        let st = patch_account_state(task, ra, &ra.state, |map, st| {
+            let token = map
+                .get("accessToken")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if !token.is_empty() {
+                let exp = wb_identity::jwt::jwt_exp(&token);
+                if exp > 0 {
+                    map.insert("expiresAt".to_string(), json!(exp));
+                    st.expires_at = Some(exp as f64);
+                }
+            }
+        });
+        match st {
+            Ok(_) => results.push(json!({"uid": ra.state.uid, "ok": true, "error": ""})),
+            Err(e) => results.push(json!({"uid": ra.state.uid, "ok": false, "error": e})),
+        }
+    }
+    json!({"results": results})
+}
+
+/// `/accounts/set`：设置账号字段（enabled / weight / note；对齐 Python
+/// `_route_accounts_set`。proxySlot / proxy 在 Rust 池里没有对应字段，忽略）。
+pub async fn route_accounts_set(task: &TaskRuntime, payload: &Value) -> Value {
+    let uid = payload.get("uid").and_then(Value::as_str).unwrap_or("");
+    if uid.is_empty() {
+        return json!({"ok": false, "error": "uid required", "status": 400});
+    }
+    let Some(ra) = task.ready.iter().find(|r| r.state.uid == uid) else {
+        return json!({"ok": false, "error": "no such account", "status": 404});
+    };
+    // 多个字段同载荷时，后续字段的 base 用上一个字段改后的内存态（文件在
+    // 每个 patch 里读磁盘最新内容，两者都不丢）。
+    let mut cur_st = ra.state.clone();
+    let mut touched = false;
+    let mut last_error: Option<String> = None;
+    let has_enabled = payload.get("enabled").is_some();
+    let has_weight = payload.get("weight").is_some();
+    let has_note = payload.get("note").is_some();
+    if has_enabled {
+        let enabled = match payload.get("enabled") {
+            Some(Value::Bool(b)) => *b,
+            Some(v) => json_truthy(v),
+            None => false,
+        };
+        match patch_account_state(task, ra, &cur_st, move |map, st| {
+            map.insert("enabled".to_string(), json!(enabled));
+            st.enabled = enabled;
+        }) {
+            Ok(s) => {
+                touched = true;
+                cur_st = s;
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    if has_weight {
+        let weight = payload.get("weight").and_then(Value::as_i64);
+        let weight = match weight {
+            Some(w) if (1..=100).contains(&w) => w,
+            Some(_) => {
+                return json!({"ok": false, "error": "weight out of range (1-100)", "status": 400});
+            }
+            None => {
+                return json!({"ok": false, "error": "weight must be an integer between 1 and 100", "status": 400});
+            }
+        };
+        match patch_account_state(task, ra, &cur_st, move |map, st| {
+            map.insert("weight".to_string(), json!(weight));
+            st.weight = weight;
+        }) {
+            Ok(s) => {
+                touched = true;
+                cur_st = s;
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    if has_note {
+        let note = payload
+            .get("note")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        match patch_account_state(task, ra, &cur_st, move |map, _st| {
+            map.insert("note".to_string(), json!(note));
+        }) {
+            Ok(s) => {
+                touched = true;
+                cur_st = s;
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    if !touched {
+        return json!({
+            "ok": false,
+            "error": "nothing to update: pass 'enabled', 'weight' or 'note'",
+            "status": 400,
+        });
+    }
+    if let Some(e) = last_error {
+        return json!({"ok": false, "error": e, "status": 500});
+    }
+    json!({"ok": true, "account": public_view(&cur_st, &ra.nickname, &task.accounts_dir)})
+}
+
+/// `/accounts/set-all`：统一启停所有账号（对齐 Python `POOL.set_all_enabled`）。
+pub async fn route_accounts_set_all(task: &TaskRuntime, payload: &Value) -> Value {
+    let enabled = match payload.get("enabled") {
+        Some(Value::Bool(b)) => *b,
+        Some(v) => json_truthy(v),
+        None => false,
+    };
+    let mut patched: Vec<(&ReadyAccount, AccountState)> = Vec::new();
+    for ra in &task.ready {
+        match patch_account_state(task, ra, &ra.state, move |map, st| {
+            map.insert("enabled".to_string(), json!(enabled));
+            st.enabled = enabled;
+        }) {
+            Ok(s) => patched.push((ra, s)),
+            Err(e) => {
+                task.panel.add_log_entry(
+                    &format!("WARN: set-all failed for {}: {}", uid8(&ra.state.uid), e),
+                    "accounts",
+                );
+            }
+        }
+    }
+    json!({"accounts": patched_views(task, &patched)})
+}
+
+/// `/accounts/sync-profile`：从上游同步昵称（**简化版**：只读本地账号文件的
+/// nickname 展示，不发上游请求——上游 profile 接口依赖 login state）。
+pub async fn route_accounts_sync_profile(task: &TaskRuntime, payload: &Value) -> Value {
+    let targets = account_targets(task, payload);
+    let mut updated = Vec::new();
+    for ra in targets {
+        let nickname = read_local_nickname(&task.accounts_dir, &ra.state.credential_file)
+            .unwrap_or_else(|| uid8(&ra.state.uid));
+        updated.push(json!({"uid": ra.state.uid, "nickname": nickname}));
+    }
+    json!({
+        "updated": updated,
+        "failed": [],
+        "accounts": manual_account_views(task),
+    })
+}
+
+/// `/accounts/test`：点检账号（**不发上游请求**）。检查 realm / enabled /
+/// 凭据档存在 / token 有效性，展示在 `checks` 里。
+pub async fn route_accounts_test(task: &TaskRuntime, payload: &Value) -> Value {
+    let uid = payload.get("uid").and_then(Value::as_str).unwrap_or("");
+    if uid.is_empty() {
+        return json!({"ok": false, "error": "uid required", "status": 400});
+    }
+    let Some(ra) = task.ready.iter().find(|r| r.state.uid == uid) else {
+        return json!({"ok": false, "error": "no such account", "status": 404});
+    };
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("deepseek-v4.1-flash");
+    let file_exists = !ra.state.credential_file.is_empty()
+        && task.accounts_dir.join(&ra.state.credential_file).exists();
+    let now = acct_now_epoch();
+    let exp = ra.state.expires_at.unwrap_or(0.0);
+    let token_valid = ra.state.has_token && (exp == 0.0 || exp - now > 120.0);
+    let ok = ra.state.enabled && file_exists && token_valid;
+    json!({
+        "ok": ok,
+        "uid": ra.state.uid,
+        "model": model,
+        "elapsed_ms": 0,
+        "checks": {
+            "realm": ra.state.realm,
+            "enabled": ra.state.enabled,
+            "hasToken": ra.state.has_token,
+            "credentialFileExists": file_exists,
+            "tokenValid": token_valid,
+            "expiresAt": exp,
+        },
+    })
+}

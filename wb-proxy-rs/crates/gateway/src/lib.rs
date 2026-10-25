@@ -15,6 +15,9 @@ pub mod forward;
 pub mod headers;
 pub mod leaked;
 pub mod notes;
+// 关卡 4.24（线 A）：OAuth 登录的上游 HTTP 那一半（Python `start_login`/
+// `poll_login` 的网络请求；状态机与账号落地在 tasks 侧 login 路径）。
+pub mod oauth;
 pub mod outbound;
 pub mod pool;
 pub mod prompt;

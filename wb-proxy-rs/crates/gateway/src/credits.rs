@@ -52,7 +52,6 @@ pub struct DetailedCredits {
     pub checkin: Option<Value>,
 }
 
-
 /// 企业账号积分（Python `_fetch_credits_enterprise`）。
 ///
 /// 上游只回 4 个字段：`credit`（本周期已消耗）、`limitNum`（周期额度）、
@@ -317,7 +316,6 @@ pub async fn fetch_credits_fallback(
         .unwrap_or_default())
 }
 
-
 /// 企业账号积分抓取（Python `_fetch_credits_enterprise`）。
 ///
 /// POST 到 `billing_upstream + ENTERPRISE_USAGE_PATH`，body `{}`，超时 15s。
@@ -374,7 +372,6 @@ pub async fn fetch_credits_enterprise(
         cycle_end: as_string(&data, "cycleEndTime"),
     })
 }
-
 
 #[cfg(test)]
 mod tests {

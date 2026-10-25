@@ -510,6 +510,75 @@ impl AccountPool {
         self.accounts.get_mut(index)
     }
 
+    /// account_by_uid（Python `AccountPool.get` :2659-2663）：跨区域首个 uid
+    /// 命中。
+    pub fn account_by_uid(&self, uid: &str) -> Option<&AccountState> {
+        self.accounts.iter().find(|a| a.uid == uid)
+    }
+
+    /// account_by_uid_mut：同上，可变版本（路由要改 AccountState 时用）。
+    pub fn account_by_uid_mut(&mut self, uid: &str) -> Option<&mut AccountState> {
+        self.accounts.iter_mut().find(|a| a.uid == uid)
+    }
+
+    /// set_account_enabled（Python `set_enabled` :2774-2782）：置 enabled；
+    /// 重新启用时顺带 clear_error（Python `account.clear_error()` 默认
+    /// keep_caps=False）。返回账号是否找到并更新。**不落盘**。
+    pub fn set_account_enabled(&mut self, uid: &str, enabled: bool) -> bool {
+        let Some(account) = self.accounts.iter_mut().find(|a| a.uid == uid) else {
+            return false;
+        };
+        account.enabled = enabled;
+        if enabled {
+            crate::notes::clear_error(account, None, false, 0.0);
+        }
+        true
+    }
+
+    /// set_account_weight（Python `set_weight` :2784-2793）：手动权重夹到
+    /// [1,100]（0/负数 → 1）。返回账号是否找到并更新。**不落盘**。
+    pub fn set_account_weight(&mut self, uid: &str, weight: i64) -> bool {
+        let Some(account) = self.accounts.iter_mut().find(|a| a.uid == uid) else {
+            return false;
+        };
+        account.weight = weight.clamp(1, 100);
+        true
+    }
+
+    /// account_product（Python `_route_accounts_product` :17144-17190 的逐账号
+    /// `account.set_product(target)`）：返回本次是否真的切换（False = 同值/无号）。
+    /// **不落盘**——面板操作要立即存档由调用方决定。
+    pub fn account_product(&mut self, uid: &str, product: &str, now: f64) -> bool {
+        match self.accounts.iter_mut().find(|a| a.uid == uid) {
+            Some(account) => account.set_product(product, now),
+            None => false,
+        }
+    }
+
+    /// remove_account（Python `AccountPool.remove` :2690-2696 的记忆体半）：从
+    /// 池中移除账号并返回。**不删凭据文件**——真实删除由调用方（api/tasks 层）
+    /// 在用户批准后执行，本层只动内存。
+    pub fn remove_account(&mut self, uid: &str) -> Option<AccountState> {
+        let index = self.accounts.iter().position(|a| a.uid == uid)?;
+        Some(self.accounts.remove(index))
+    }
+
+    /// upsert_account（Python `AccountPool.add` :2665-2688 的记忆体半）：uid 已
+    /// 存在 → 原地替换；否则追加。返回 `true` = 更新了既有账号，`false` = 新增。
+    /// **不落盘**——写盘由调用方（import 路径）负责。
+    pub fn upsert_account(&mut self, state: AccountState) -> bool {
+        match self.accounts.iter().position(|a| a.uid == state.uid) {
+            Some(index) => {
+                self.accounts[index] = state;
+                true
+            }
+            None => {
+                self.accounts.push(state);
+                false
+            }
+        }
+    }
+
     /// 池级 demote（retry 循环降级热号用）：转发到 affinity.demote。
     pub fn demote(&mut self, session_key: &str, uid: Option<&str>) {
         self.state.lock().unwrap().affinity.demote(session_key, uid);
@@ -1455,5 +1524,89 @@ mod tests {
         assert_eq!(accounts[1].uid, "u-b");
         assert_eq!(accounts[1].weight, 100); // clamp 上限
         assert!(!accounts[1].enabled);
+    }
+
+    // ---- 关卡 4.24（线 A）：登录注册表 + 账号状态操作 ----
+
+    #[test]
+    fn account_lookup_by_uid_across_realms() {
+        let pool = AccountPool::new(
+            vec![intl(1), AccountState::new("c1", "cn")],
+            PoolOptions::default(),
+        );
+        assert_eq!(pool.account_by_uid("u1").unwrap().realm, "intl");
+        assert_eq!(pool.account_by_uid("c1").unwrap().realm, "cn");
+        assert!(pool.account_by_uid("missing").is_none());
+    }
+
+    #[test]
+    fn set_enabled_clears_error_when_reenabling() {
+        let mut pool = AccountPool::new(vec![intl(1)], PoolOptions::default());
+        assert!(pool.set_account_enabled("u1", false));
+        assert!(!pool.account_by_uid("u1").unwrap().enabled);
+        // 重新启用顺带清限流（Python `clear_error()` 默认 keep_caps=False）
+        {
+            let account = pool.account_by_uid_mut("u1").unwrap();
+            account.cooldown_until = NOW + 50.0;
+            account.last_error = "old".into();
+        }
+        assert!(pool.set_account_enabled("u1", true));
+        let account = pool.account_by_uid("u1").unwrap();
+        assert!(account.enabled);
+        assert_eq!(account.cooldown_until, 0.0);
+        assert_eq!(account.last_error, "");
+        // 未知 uid → false
+        assert!(!pool.set_account_enabled("nope", true));
+    }
+
+    #[test]
+    fn set_weight_clamps_to_1_100() {
+        let mut pool = AccountPool::new(vec![intl(1)], PoolOptions::default());
+        assert!(pool.set_account_weight("u1", 0));
+        assert_eq!(pool.account_by_uid("u1").unwrap().weight, 1);
+        assert!(pool.set_account_weight("u1", 999));
+        assert_eq!(pool.account_by_uid("u1").unwrap().weight, 100);
+        assert!(pool.set_account_weight("u1", 42));
+        assert_eq!(pool.account_by_uid("u1").unwrap().weight, 42);
+        assert!(!pool.set_account_weight("nope", 5));
+    }
+
+    #[test]
+    fn account_product_switches_and_reports_change() {
+        let mut pool = AccountPool::new(vec![intl(1)], PoolOptions::default());
+        // 相同值 → false（desktop 与 workbuddy 同值）
+        assert!(!pool.account_product("u1", "workbuddy", NOW));
+        assert!(pool.account_product("u1", "cli", NOW));
+        assert_eq!(
+            pool.account_by_uid("u1").unwrap().product,
+            crate::endpoints::PRODUCT_CLI
+        );
+        assert!(!pool.account_product("nope", "cli", NOW));
+    }
+
+    #[test]
+    fn remove_account_only_drops_from_pool() {
+        let mut pool = AccountPool::new(vec![intl(1), intl(2)], PoolOptions::default());
+        let removed = pool.remove_account("u1").expect("u1 应在池中");
+        assert_eq!(removed.uid, "u1");
+        assert_eq!(pool.len(), 1);
+        assert!(pool.remove_account("u1").is_none());
+    }
+
+    #[test]
+    fn upsert_replaces_existing_and_appends_new() {
+        let mut pool = AccountPool::new(vec![intl(1)], PoolOptions::default());
+        let mut replacement = intl(1);
+        replacement.weight = 77;
+        replacement.realm = "cn".into();
+        // 更新既有 → true
+        assert!(pool.upsert_account(replacement));
+        assert_eq!(pool.len(), 1);
+        let account = pool.account_by_uid("u1").unwrap();
+        assert_eq!(account.realm, "cn");
+        assert_eq!(account.weight, 77);
+        // 新增 → false
+        assert!(!pool.upsert_account(intl(2)));
+        assert_eq!(pool.len(), 2);
     }
 }

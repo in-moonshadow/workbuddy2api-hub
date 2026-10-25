@@ -700,7 +700,10 @@ pub fn current_assignment() -> (f64, std::collections::HashMap<String, String>) 
         return (0.0, std::collections::HashMap::new());
     }
     let last = &timeline[timeline.len() - 1];
-    let at = last.get("at").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+    let at = last
+        .get("at")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
     let mut assignment = std::collections::HashMap::new();
     if let Some(pol) = last.get("policies").and_then(serde_json::Value::as_object) {
         for (k, v) in pol {
@@ -747,7 +750,8 @@ pub fn ensure_policy(
         return None;
     }
     let by_norm = crate::price::index_openrouter(or_models);
-    let inherited = crate::price::inherited_from(&mid, or_models, &by_norm, &std::collections::HashMap::new());
+    let inherited =
+        crate::price::inherited_from(&mid, or_models, &by_norm, &std::collections::HashMap::new());
     let (reference, via_override) = crate::price::resolve(
         &mid,
         or_models,
@@ -768,8 +772,13 @@ pub fn ensure_policy(
         "models": { mid.clone(): entry }
     });
     // 落盘（merge=True）。
-    if crate::price_refresher::write_snapshot_files(usage_dir, &doc, crate::activity::now_epoch(), true)
-        .is_err()
+    if crate::price_refresher::write_snapshot_files(
+        usage_dir,
+        &doc,
+        crate::activity::now_epoch(),
+        true,
+    )
+    .is_err()
     {
         return None;
     }
@@ -853,10 +862,7 @@ pub fn prune_policies(usage_dir: &Path, protect: &[String]) -> Vec<String> {
         let mut newest: Option<String> = None;
         let mut newest_ts: f64 = f64::MIN;
         for pid in ids {
-            let ts = policies
-                .get(pid)
-                .and_then(|p| p.first_seen)
-                .unwrap_or(0.0);
+            let ts = policies.get(pid).and_then(|p| p.first_seen).unwrap_or(0.0);
             if ts >= newest_ts {
                 newest_ts = ts;
                 newest = Some(pid.clone());
@@ -874,8 +880,7 @@ pub fn prune_policies(usage_dir: &Path, protect: &[String]) -> Vec<String> {
     };
 
     let mut removed: Vec<String> = Vec::new();
-    let mut seen_removed: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut seen_removed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {

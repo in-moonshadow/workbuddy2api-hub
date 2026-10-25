@@ -731,7 +731,12 @@ impl Drop for RunLockGuard<'_> {
 /// ⚠️ 与 Python 的行粒度不同（见模块文档的差异 2）：Python 的策略表是
 /// **一个价格一行**、时间线只在指派变了时才追加。这里按关卡 4.19 的接口
 /// 约定，每轮各追加一行。
-pub fn write_snapshot_files(usage_dir: &Path, doc: &Value, at: f64, merge: bool) -> Result<(), String> {
+pub fn write_snapshot_files(
+    usage_dir: &Path,
+    doc: &Value,
+    at: f64,
+    merge: bool,
+) -> Result<(), String> {
     let policies_path = usage_dir.join(POLICIES_FILE);
     let timeline_path = usage_dir.join(TIMELINE_FILE);
 

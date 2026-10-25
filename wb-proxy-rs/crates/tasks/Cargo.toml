@@ -15,6 +15,8 @@ chrono.workspace = true
 regex.workspace = true
 # 账号池与出站头（chat_request_headers / load_account_pool / UpstreamClient）
 wb-gateway = { path = "../gateway" }
+# 关卡 4.24（线 B）：账号导入/导出归一化（identity::import/export）。
+wb-identity = { path = "../identity" }
 # 幂等字段读写（闸门 0 产出的 read/write_idempotent_fields）
 wb-storage = { path = "../storage" }
 # 关卡 4.5：RealSleeper 的节流等待（tokio::time::sleep）；关卡 4.7 的
