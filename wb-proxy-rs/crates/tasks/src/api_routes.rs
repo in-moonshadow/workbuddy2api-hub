@@ -3266,3 +3266,105 @@ fn parse_u64(query: &HashMap<String, String>, key: &str) -> Option<u64> {
 fn parse_int(query: &HashMap<String, String>, key: &str) -> Option<i64> {
     query.get(key).and_then(|v| v.parse::<i64>().ok())
 }
+use serde_json::Map;
+
+// ---------------------------------------------------------------------------
+// 关卡 4.26：proxy slots / agents / remaining 接线层
+// ---------------------------------------------------------------------------
+
+/// `/proxy/slots`：面板代理槽视图（Python `_handle_proxy_slots` :16725-16753）。
+pub fn route_proxy_slots_view(task: &TaskRuntime, _payload: &Value) -> Value {
+    let view = crate::proxy::proxy_slots_view(&task.accounts_dir);
+    let slots = view.get("slots").and_then(Value::as_array).cloned().unwrap_or_default();
+    // bound：每个 slot 绑定的账号数
+    let bound: Vec<Value> = slots.iter().map(|slot| {
+        let sid = slot.get("id").and_then(Value::as_str).unwrap_or("");
+        let n = task.ready.iter().filter(|r| r.state.uid == sid).count();
+        json!(n)
+    }).collect();
+    json!({"slots": slots, "bound": bound})
+}
+
+/// `/proxy/slots/save`：保存代理槽（Python `_handle_proxy_slots` save 分支 :16753-16771）。
+pub async fn route_proxy_slots_save(task: &TaskRuntime, payload: &Value) -> Value {
+    let raw = payload.get("slots").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut cleaned: Vec<Value> = vec![];
+    for item in &raw {
+        if let Some(entry) = crate::proxy::clean_slot_entry(item) {
+            cleaned.push(entry);
+        }
+    }
+    if let Err(err) = crate::proxy::set_proxy_slots(&task.accounts_dir, &cleaned) {
+        return json!({"ok": false, "error": err, "status": 500});
+    }
+    crate::logs::append(
+        &format!("[代理] 代理槽已保存 {} 条", cleaned.len()),
+        None,
+        Some("proxy"),
+    );
+    route_proxy_slots_view(task, payload)
+}
+
+/// `/proxy/slots/test`：探测代理槽（Python `_handle_proxy_slots` test 分支 :16771-16781）。
+pub async fn route_proxy_slots_test(task: &TaskRuntime, payload: &Value) -> Value {
+    let slot_id = payload.get("id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if slot_id.is_empty() {
+        return json!({"ok": false, "error": "slot id is required", "status": 400});
+    }
+    let slot = crate::proxy::find_proxy_slot(&task.accounts_dir, &slot_id);
+    let Some(slot) = slot else {
+        return json!({"ok": false, "error": "no such proxy slot", "status": 404});
+    };
+    let url = slot.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+    // 简化探测：返回结构化占位（真实网络探测由上层替换 probe_fn）
+    let probe = crate::proxy::probe_proxy(&url, |_| {
+        json!({"ok": false, "error": "探测函数尚未接入（需上层替换 probe_fn）"})
+    });
+    json!({"ok": probe.get("ok").and_then(Value::as_bool).unwrap_or(false), "probe": probe, "slot": slot})
+}
+
+/// `/proxy/discover`：代理候选发现（Python `_handle_proxy_slots` discover 分支）。
+pub fn route_proxy_discover(_task: &TaskRuntime, _payload: &Value) -> Value {
+    // Python `discover_proxy_slots()`：本地网络扫描，Rust 侧未实现本地扫描（需上层接线）。
+    json!({"candidates": Value::Array(vec![])})
+}
+
+/// `/agents`：智能体全量视图（Python `_get_agents` :16906-16935）。
+pub fn route_agents_view(task: &TaskRuntime, _query: &HashMap<String, String>) -> Value {
+    crate::agents::agents_view(&task.accounts_dir)
+}
+
+/// `/agents/available`：部署形态判定（Python `_get_agents_available`）。
+pub fn route_agents_available(task: &TaskRuntime, _query: &HashMap<String, String>) -> Value {
+    crate::agents::agents_available(&task.accounts_dir)
+}
+
+/// `/agents/cli`：CLI 智能体信息（Python `_get_agents_cli` :16880-16905）。
+pub fn route_agents_cli(task: &TaskRuntime, _query: &HashMap<String, String>) -> Value {
+    crate::agents::agents_cli_view(&task.accounts_dir)
+}
+
+/// `/agents/apply`：一键配置校验（Python `_handle_agents_apply` 前半）。
+pub async fn route_agents_apply(task: &TaskRuntime, payload: &Value) -> Value {
+    match crate::agents::agents_apply_validate(payload, &task.accounts_dir) {
+        Ok(view) => view,
+        Err((status, message)) => {
+            let mut out = Value::Object(Map::new());
+            out["ok"] = json!(false);
+            out["error"] = json!(message);
+            out["status"] = json!(status);
+            out
+        }
+    }
+}
+
+/// `/agents/restore`：移除指定客户端集成（Python `_handle_agents_restore`）。
+pub fn route_agents_restore(_task: &TaskRuntime, payload: &Value) -> Value {
+    crate::agents::agents_restore_plan(payload)
+}
+
+/// `/usage/remaining`：按账号/模型剩余额度（Python `remaining_usage`）。
+pub async fn route_usage_remaining(task: &TaskRuntime, _query: &HashMap<String, String>) -> Value {
+    let accounts: Vec<AccountState> = task.ready.iter().map(|r| r.state.clone()).collect();
+    crate::remaining::remaining_payload(&task.accounts_dir, &task.usage_dir, &accounts).await
+}

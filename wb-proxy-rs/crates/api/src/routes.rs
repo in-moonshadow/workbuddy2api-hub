@@ -366,6 +366,17 @@ pub fn app_with_config(
     for path in ANTHROPIC_COUNT_PATHS {
         router = router.route(path, post(count_tokens_entry).options(preflight));
     }
+    router = router
+        .route("/proxy/slots", get(proxy_slots_get).options(preflight))
+        .route("/proxy/slots/save", post(proxy_slots_save).options(preflight))
+        .route("/proxy/slots/test", post(proxy_slots_test).options(preflight))
+        .route("/proxy/discover", post(proxy_discover).options(preflight))
+        .route("/agents", get(agents_get).options(preflight))
+        .route("/agents/available", get(agents_available).options(preflight))
+        .route("/agents/cli", get(agents_cli).options(preflight))
+        .route("/agents/apply", post(agents_apply).options(preflight))
+        .route("/agents/restore", post(agents_restore).options(preflight))
+        .route("/usage/remaining", get(usage_remaining_get).options(preflight));
     // 404 兜底：未匹配路径统一回 Python `_error(404, "not found")` 信封。
     let path_echo = axum::middleware::from_fn(inject_path);
     router
@@ -2465,4 +2476,138 @@ async fn update_check(State(state): State<AppState>, headers: HeaderMap, body: B
         Err(response) => return *response,
     };
     Json(task_routes::route_update_check(&state.task, &payload).await).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// 关卡 4.26：proxy slots / agents / remaining 接线层
+// ---------------------------------------------------------------------------
+
+async fn proxy_slots_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/proxy/slots", &headers, &params, &state) {
+        return response;
+    }
+    Json(task_routes::route_proxy_slots_view(&state.task, &json!({}))).into_response()
+}
+
+async fn proxy_slots_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = panel_gate("/proxy/slots/save", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    Json(task_routes::route_proxy_slots_save(&state.task, &payload).await).into_response()
+}
+
+async fn proxy_slots_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = panel_gate("/proxy/slots/test", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    Json(task_routes::route_proxy_slots_test(&state.task, &payload).await).into_response()
+}
+
+async fn proxy_discover(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = panel_gate("/proxy/discover", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    Json(task_routes::route_proxy_discover(&state.task, &payload)).into_response()
+}
+
+async fn agents_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/agents", &headers, &params, &state) {
+        return response;
+    }
+    Json(task_routes::route_agents_view(&state.task, &params)).into_response()
+}
+
+async fn agents_available(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/agents/available", &headers, &params, &state) {
+        return response;
+    }
+    Json(task_routes::route_agents_available(&state.task, &params)).into_response()
+}
+
+async fn agents_cli(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/agents/cli", &headers, &params, &state) {
+        return response;
+    }
+    Json(task_routes::route_agents_cli(&state.task, &params)).into_response()
+}
+
+async fn agents_apply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = panel_gate("/agents/apply", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    Json(task_routes::route_agents_apply(&state.task, &payload).await).into_response()
+}
+
+async fn agents_restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = panel_gate("/agents/restore", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let payload = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    Json(task_routes::route_agents_restore(&state.task, &payload)).into_response()
+}
+
+async fn usage_remaining_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/usage/remaining", &headers, &params, &state) {
+        return response;
+    }
+    Json(task_routes::route_usage_remaining(&state.task, &params).await).into_response()
 }

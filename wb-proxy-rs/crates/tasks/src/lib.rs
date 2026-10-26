@@ -79,6 +79,10 @@ pub mod settings;
 // `wb_proxy.py`；本模块只负责落盘 + 校验 + 算出生效值，后台线程的副作用由
 // 调用方按返回值里的增量键触发。
 pub mod settings_view;
+// 关卡 4.26：proxy slots 能力层（Python `wb_proxy._handle_proxy_slots` /
+// `proxy_slots_view` / `wb_settings._clean_slot_entry` 等）。只读写
+// settings.json 的 `proxy_slots` 数组并做纯数据清洗；POOL 绑定归接线层。
+pub mod proxy;
 // 关卡 4.19：另外两个后台线程 + 用量聚合。`price_refresher` 是 Python
 // `wb_pricing.PriceRefresher` 的移植，`update_checker` 是 Python
 // `wb_updates.UpdateChecker` 的移植，`usage` 是用量落盘与聚合
@@ -99,6 +103,10 @@ pub mod pricing_store;
 pub mod price_source;
 pub mod update_checker;
 pub mod usage;
+// 关卡 4.22（D72）：`/usage/remaining` 的剩余额度引擎（能力层）——Python
+// `wb_proxy.py` 的 `_remaining_*` 系列 + `remaining_usage()` 移植。冷扫版：
+// 每次调用重新 fold usage.jsonl + limit-events.jsonl，跨天归档 estimate-daily.json。
+pub mod remaining;
 // 关卡 4.18（线 C）：积分刷新的**生产数据源**——把 `wb_gateway::credits`
 // （HTTP 那一半）与 `crate::credits`（塑形那一半）接起来，并把快照原子
 // 写回账号文件。权威源是 Python `wb_accounts.Account.fetch_credits()`。
@@ -106,6 +114,10 @@ pub mod credits_source;
 // 关卡 4.20（线 A）：hub 侧**静态模型目录**——Python `wb_catalog.py` 的
 // `STATIC_INTL_MODELS` / `STATIC_CN_MODELS` 的 id 清单移植（只搬 id）。
 pub mod catalog;
+// 关卡 4.26（线 C）：agents 面板能力层——纯视图/校验，不发外部写。
+// 权威源是 Python `wb_proxy.py` 的 agents 段与 `wb_agents.py`；写客户端
+// config 的 integrate/restore 属集成引擎，留接线层/后续。
+pub mod agents;
 
 // ---------------------------------------------------------------------------
 // 契约 2：growth task 的 12 字段归一化
