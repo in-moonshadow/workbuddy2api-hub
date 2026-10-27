@@ -296,7 +296,13 @@ pub fn probe_proxy(proxy_url: &str, probe_fn: impl Fn(&str) -> Value) -> Value {
     };
     // 只有探测到出口 IP 才算有可查的情报（Python :5942）。
     let (country, country_code, ip_type, isp, asn) = if exit_ip.is_empty() {
-        (String::new(), String::new(), String::new(), String::new(), String::new())
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
     } else {
         (
             clean_str(raw.get("country")),
@@ -522,7 +528,10 @@ mod tests {
 
         // 只有布尔 false 算关（Python `... is not False`）。
         for v in [json!(null), json!(0), json!("x"), json!(true)] {
-            assert_eq!(clean_slot_entry(&json!({"url": "http://a:1", "enabled": v})).unwrap()["enabled"], json!(true));
+            assert_eq!(
+                clean_slot_entry(&json!({"url": "http://a:1", "enabled": v})).unwrap()["enabled"],
+                json!(true)
+            );
         }
 
         // url 缺失/空 → 整条丢弃；非对象 → 丢弃。
@@ -534,11 +543,31 @@ mod tests {
 
     #[test]
     fn clean_slot_entry_probed_at_loose_parse() {
-        assert_eq!(clean_slot_entry(&json!({"url": "http://a:1", "probed_at": 5})) .unwrap()["probed_at"], json!(5));
-        assert_eq!(clean_slot_entry(&json!({"url": "http://a:1", "probed_at": 1.9})).unwrap()["probed_at"], json!(1), "int(1.9) == 1");
-        assert_eq!(clean_slot_entry(&json!({"url": "http://a:1", "probed_at": true})).unwrap()["probed_at"], json!(1), "int(True) == 1");
-        assert_eq!(clean_slot_entry(&json!({"url": "http://a:1", "probed_at": "abc"})).unwrap()["probed_at"], json!(0));
-        assert_eq!(clean_slot_entry(&json!({"url": "http://a:1", "probed_at": false})).unwrap()["probed_at"], json!(0));
+        assert_eq!(
+            clean_slot_entry(&json!({"url": "http://a:1", "probed_at": 5})).unwrap()["probed_at"],
+            json!(5)
+        );
+        assert_eq!(
+            clean_slot_entry(&json!({"url": "http://a:1", "probed_at": 1.9})).unwrap()["probed_at"],
+            json!(1),
+            "int(1.9) == 1"
+        );
+        assert_eq!(
+            clean_slot_entry(&json!({"url": "http://a:1", "probed_at": true})).unwrap()
+                ["probed_at"],
+            json!(1),
+            "int(True) == 1"
+        );
+        assert_eq!(
+            clean_slot_entry(&json!({"url": "http://a:1", "probed_at": "abc"})).unwrap()
+                ["probed_at"],
+            json!(0)
+        );
+        assert_eq!(
+            clean_slot_entry(&json!({"url": "http://a:1", "probed_at": false})).unwrap()
+                ["probed_at"],
+            json!(0)
+        );
     }
 
     #[test]
@@ -568,10 +597,18 @@ mod tests {
     #[test]
     fn set_preserves_unrelated_settings_keys() {
         let dir = tempdir().unwrap();
-        replace_settings(dir.path(), &json!({"pricing_enabled": false, "other": "keep"})).unwrap();
+        replace_settings(
+            dir.path(),
+            &json!({"pricing_enabled": false, "other": "keep"}),
+        )
+        .unwrap();
         set_proxy_slots(dir.path(), &[json!({"url": "http://a:1"})]).unwrap();
         let data = read_settings(dir.path()).unwrap();
-        assert_eq!(data["pricing_enabled"], json!(false), "浅合并之外的键原样保留");
+        assert_eq!(
+            data["pricing_enabled"],
+            json!(false),
+            "浅合并之外的键原样保留"
+        );
         assert_eq!(data["other"], json!("keep"));
         assert_eq!(data["proxy_slots"].as_array().unwrap().len(), 1);
     }
@@ -585,7 +622,10 @@ mod tests {
             json!({"id": "", "url": "http://c:3"}),       // 空 id → 分配
         ];
         set_proxy_slots(dir.path(), &slots).unwrap();
-        let arr = proxy_slots_view(dir.path())["slots"].as_array().unwrap().clone();
+        let arr = proxy_slots_view(dir.path())["slots"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["id"], json!("slot-5"));
         assert_eq!(arr[1]["id"], json!("slot-6"));
@@ -603,7 +643,10 @@ mod tests {
             ]}),
         )
         .unwrap();
-        let arr = proxy_slots_view(dir.path())["slots"].as_array().unwrap().clone();
+        let arr = proxy_slots_view(dir.path())["slots"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["id"], json!("slot-1"));
         assert_eq!(arr[1]["id"], json!("slot-2"));
@@ -620,7 +663,10 @@ mod tests {
             ]}),
         )
         .unwrap();
-        let arr = proxy_slots_view(dir.path())["slots"].as_array().unwrap().clone();
+        let arr = proxy_slots_view(dir.path())["slots"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], json!("slot-1"));
     }
@@ -628,9 +674,20 @@ mod tests {
     #[test]
     fn find_proxy_slot_by_id() {
         let dir = tempdir().unwrap();
-        set_proxy_slots(dir.path(), &[json!({"id": "slot-3", "name": "A", "url": "http://a:1"})]).unwrap();
-        assert_eq!(find_proxy_slot(dir.path(), "slot-3").unwrap()["name"], json!("A"));
-        assert_eq!(find_proxy_slot(dir.path(), " slot-3 ").unwrap()["name"], json!("A"), "id 去空白");
+        set_proxy_slots(
+            dir.path(),
+            &[json!({"id": "slot-3", "name": "A", "url": "http://a:1"})],
+        )
+        .unwrap();
+        assert_eq!(
+            find_proxy_slot(dir.path(), "slot-3").unwrap()["name"],
+            json!("A")
+        );
+        assert_eq!(
+            find_proxy_slot(dir.path(), " slot-3 ").unwrap()["name"],
+            json!("A"),
+            "id 去空白"
+        );
         assert!(find_proxy_slot(dir.path(), "slot-9").is_none());
         assert!(find_proxy_slot(dir.path(), "  ").is_none());
     }
@@ -640,9 +697,10 @@ mod tests {
         let dir = tempdir().unwrap();
         set_proxy_slots(dir.path(), &[json!({"id": "slot-1", "url": "http://a:1"})]).unwrap();
 
-        let merged = update_proxy_slot(dir.path(), "slot-1", &json!({"ip": "1.2.3.4", "name": "x"}))
-            .unwrap()
-            .unwrap();
+        let merged =
+            update_proxy_slot(dir.path(), "slot-1", &json!({"ip": "1.2.3.4", "name": "x"}))
+                .unwrap()
+                .unwrap();
         assert_eq!(merged["ip"], json!("1.2.3.4"));
         assert_eq!(merged["name"], json!("x"));
 
@@ -651,9 +709,11 @@ mod tests {
         assert_eq!(view["slots"][0]["ip"], json!("1.2.3.4"));
 
         // 不存在 → Ok(None)，且不写盘。
-        assert!(update_proxy_slot(dir.path(), "slot-99", &json!({"ip": "x"}))
-            .unwrap()
-            .is_none());
+        assert!(
+            update_proxy_slot(dir.path(), "slot-99", &json!({"ip": "x"}))
+                .unwrap()
+                .is_none()
+        );
         let view = proxy_slots_view(dir.path());
         assert_eq!(view["slots"][0]["ip"], json!("1.2.3.4"));
     }
@@ -687,12 +747,14 @@ mod tests {
 
     #[test]
     fn probe_proxy_error_no_intel() {
-        let probe = probe_proxy("http://p:1", |_| json!({
-            "exit_ip": "",
-            "error": "connect refused",
-            "latency_ms": 120,
-            "country": "不该出现", // 无 exit_ip → intel 全清（Python :5942）
-        }));
+        let probe = probe_proxy("http://p:1", |_| {
+            json!({
+                "exit_ip": "",
+                "error": "connect refused",
+                "latency_ms": 120,
+                "country": "不该出现", // 无 exit_ip → intel 全清（Python :5942）
+            })
+        });
         assert_eq!(probe["ok"], json!(false));
         assert_eq!(probe["exit_ip"], json!(""));
         assert_eq!(probe["latency_ms"], json!(120));
@@ -711,9 +773,10 @@ mod tests {
 
     #[test]
     fn probe_proxy_intel_ok_requires_any_field_nonempty() {
-        let probe = probe_proxy("http://p:1", |_| {
-            json!({"exit_ip": "9.9.9.9", "country_code": "ZZ"})
-        });
+        let probe = probe_proxy(
+            "http://p:1",
+            |_| json!({"exit_ip": "9.9.9.9", "country_code": "ZZ"}),
+        );
         assert_eq!(probe["intel_ok"], json!(true), "任一 intel 字段非空即真");
     }
 

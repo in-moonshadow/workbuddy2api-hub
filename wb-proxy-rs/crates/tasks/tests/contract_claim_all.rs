@@ -79,6 +79,7 @@ fn account(uid: &str, realm: &str) -> AccountView {
         last_activity_report: None,
         last_daily_chat: None,
         daily_chat_granted_today: false,
+        trigger: "unknown".to_string(),
     }
 }
 
@@ -182,6 +183,7 @@ impl CycleExecutor for FakeExecutor {
     fn refresh<'a>(
         &'a self,
         _acc: &'a AccountView,
+        _trigger: &str,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async { false })
     }

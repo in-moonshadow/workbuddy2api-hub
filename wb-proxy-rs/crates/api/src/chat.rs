@@ -195,6 +195,10 @@ pub struct UsageContext<'a> {
     pub message: Option<&'a str>,
     /// 请求开始时刻（epoch 秒），用来算墙钟耗时。
     pub started: f64,
+    /// 流式首字延迟（毫秒）；非流式分支拿不到 ⇒ `None`（落盘为 null）。
+    pub ttft_ms: Option<i64>,
+    /// 流式生成耗时（毫秒）；非流式分支拿不到 ⇒ `None`（落盘为 null）。
+    pub gen_ms: Option<i64>,
     /// OpenRouter 模型索引（供 ensure_policy / current_policy_id 使用）。
     ///
     /// `None` 表示尚未取价或取价失败；调用方（`record_chat_usage`）会在落盘前
@@ -251,10 +255,29 @@ pub fn build_usage_row(ctx: &UsageContext<'_>) -> Value {
         }
     }
     row.insert("elapsed_ms".into(), Value::from(elapsed_ms));
-    // Python 的流式/首字延迟在 Rust 的非流式分支里拿不到，写 null
-    // （Python 这两个字段在拿不到时也是 None）。
-    row.insert("ttft_ms".into(), Value::Null);
-    row.insert("gen_ms".into(), Value::Null);
+    // 流式分支会传入 ttft_ms / gen_ms；非流式分支为 None ⇒ 落盘 null
+    // （Python 这两个字段在拿不到时也是 None）。gen_ms 若未显式给出但
+    // ttft_ms 已知，则用 elapsed_ms - ttft_ms 推出（Python 同款）。
+    let ttft_val = ctx.ttft_ms;
+    let gen_val = ctx
+        .gen_ms
+        .or_else(|| ttft_val.map(|t| (elapsed_ms - t).max(0)));
+    match ttft_val {
+        Some(v) => {
+            row.insert("ttft_ms".into(), Value::from(v));
+        }
+        None => {
+            row.insert("ttft_ms".into(), Value::Null);
+        }
+    };
+    match gen_val {
+        Some(v) => {
+            row.insert("gen_ms".into(), Value::from(v));
+        }
+        None => {
+            row.insert("gen_ms".into(), Value::Null);
+        }
+    };
 
     // token 字段：规范要求「缺失则 0」，所以 5 个字段恒写；Python 在
     // usage 缺失时干脆不写这几个键（`row.update(fields)` 的 fields 为空），

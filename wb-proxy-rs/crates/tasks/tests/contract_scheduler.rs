@@ -124,6 +124,7 @@ impl CycleExecutor for FakeExecutor {
     fn refresh<'a>(
         &'a self,
         acc: &'a AccountView,
+        _trigger: &str,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         let ok = self.refresh_ok;
         self.record("refresh", &acc.uid, ok);
@@ -206,6 +207,7 @@ fn cn_account(uid: &str) -> AccountView {
         last_activity_report: None,
         last_daily_chat: None,
         daily_chat_granted_today: false,
+        trigger: "unknown".to_string(),
     }
 }
 
@@ -451,8 +453,9 @@ impl CycleExecutor for GateExecutor {
     fn refresh<'a>(
         &'a self,
         acc: &'a AccountView,
+        trigger: &str,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        self.inner.refresh(acc)
+        self.inner.refresh(acc, trigger)
     }
 
     fn checkin<'a>(&'a self, acc: &'a AccountView) -> StepFut<'a> {

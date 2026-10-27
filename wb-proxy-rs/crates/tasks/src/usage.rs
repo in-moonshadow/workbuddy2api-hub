@@ -1565,6 +1565,79 @@ pub fn build_usage_perf(
     Value::Object(out)
 }
 
+// ---------------------------------------------------------------------------
+// 关卡 D73：checkpoint / 行偏移索引 / ETag（加速层，读写失败静默降级）
+// ---------------------------------------------------------------------------
+//
+// Python 侧的 checkpoint 只是加速：读到缓存则短路，读写失败静默降级，
+// 丢的是加速不是服务。Rust 侧提供同样语义的辅助函数，聚合函数本身仍
+// 保持全量重算；调用方按需采纳 checkpoint。
+
+/// 5 份聚合 checkpoint 的文件名（Python `usage-aggregate-cache-*.json`）。
+pub const CHECKPOINT_SNAPSHOT: &str = "usage-aggregate-cache-snapshot.json";
+pub const CHECKPOINT_RECENT: &str = "usage-aggregate-cache-recent.json";
+pub const CHECKPOINT_PERF: &str = "usage-aggregate-cache-perf.json";
+pub const CHECKPOINT_ANALYTICS: &str = "usage-aggregate-cache-analytics.json";
+pub const CHECKPOINT_BY_ACCOUNT: &str = "usage-aggregate-cache-by_account.json";
+
+/// 行偏移索引文件名（Python `usage-recent-index.json`）。
+pub const RECENT_INDEX_FILE: &str = "usage-recent-index.json";
+
+/// checkpoint 文件路径。
+pub fn checkpoint_path(usage_dir: &Path, name: &str) -> PathBuf {
+    usage_dir.join(name)
+}
+
+/// 行偏移索引文件路径。
+pub fn recent_index_path(usage_dir: &Path) -> PathBuf {
+    usage_dir.join(RECENT_INDEX_FILE)
+}
+
+/// 静默读 checkpoint：任何 IO/解析失败返回 `None`（降级为全量重算）。
+pub fn load_checkpoint(usage_dir: &Path, name: &str) -> Option<Value> {
+    let path = checkpoint_path(usage_dir, name);
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<Value>(&text).ok()
+}
+
+/// 静默写 checkpoint：任何失败忽略（不 panic、不影响服务）。
+pub fn save_checkpoint(usage_dir: &Path, name: &str, value: &Value) {
+    let path = checkpoint_path(usage_dir, name);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, value.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// 静默读行偏移索引：失败返回 `None`。
+pub fn load_recent_index(usage_dir: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(recent_index_path(usage_dir)).ok()?;
+    serde_json::from_str::<Value>(&text).ok()
+}
+
+/// 静默写行偏移索引：失败忽略。
+pub fn save_recent_index(usage_dir: &Path, value: &Value) {
+    let path = recent_index_path(usage_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, value.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// 基于聚合结果生成 ETag（弱哈希，失败不 panic）。
+pub fn usage_etag(value: &Value) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.to_string().hash(&mut hasher);
+    format!("\"{:x}\"", hasher.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -500,6 +500,7 @@ impl CycleExecutor for ProductionExecutor {
     fn refresh<'a>(
         &'a self,
         _acc: &'a AccountView,
+        _trigger: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move { false })
     }
@@ -3275,19 +3276,30 @@ use serde_json::Map;
 /// `/proxy/slots`：面板代理槽视图（Python `_handle_proxy_slots` :16725-16753）。
 pub fn route_proxy_slots_view(task: &TaskRuntime, _payload: &Value) -> Value {
     let view = crate::proxy::proxy_slots_view(&task.accounts_dir);
-    let slots = view.get("slots").and_then(Value::as_array).cloned().unwrap_or_default();
+    let slots = view
+        .get("slots")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     // bound：每个 slot 绑定的账号数
-    let bound: Vec<Value> = slots.iter().map(|slot| {
-        let sid = slot.get("id").and_then(Value::as_str).unwrap_or("");
-        let n = task.ready.iter().filter(|r| r.state.uid == sid).count();
-        json!(n)
-    }).collect();
+    let bound: Vec<Value> = slots
+        .iter()
+        .map(|slot| {
+            let sid = slot.get("id").and_then(Value::as_str).unwrap_or("");
+            let n = task.ready.iter().filter(|r| r.state.uid == sid).count();
+            json!(n)
+        })
+        .collect();
     json!({"slots": slots, "bound": bound})
 }
 
 /// `/proxy/slots/save`：保存代理槽（Python `_handle_proxy_slots` save 分支 :16753-16771）。
 pub async fn route_proxy_slots_save(task: &TaskRuntime, payload: &Value) -> Value {
-    let raw = payload.get("slots").and_then(Value::as_array).cloned().unwrap_or_default();
+    let raw = payload
+        .get("slots")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let mut cleaned: Vec<Value> = vec![];
     for item in &raw {
         if let Some(entry) = crate::proxy::clean_slot_entry(item) {
@@ -3307,7 +3319,12 @@ pub async fn route_proxy_slots_save(task: &TaskRuntime, payload: &Value) -> Valu
 
 /// `/proxy/slots/test`：探测代理槽（Python `_handle_proxy_slots` test 分支 :16771-16781）。
 pub async fn route_proxy_slots_test(task: &TaskRuntime, payload: &Value) -> Value {
-    let slot_id = payload.get("id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let slot_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if slot_id.is_empty() {
         return json!({"ok": false, "error": "slot id is required", "status": 400});
     }
@@ -3315,11 +3332,16 @@ pub async fn route_proxy_slots_test(task: &TaskRuntime, payload: &Value) -> Valu
     let Some(slot) = slot else {
         return json!({"ok": false, "error": "no such proxy slot", "status": 404});
     };
-    let url = slot.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+    let url = slot
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // 简化探测：返回结构化占位（真实网络探测由上层替换 probe_fn）
-    let probe = crate::proxy::probe_proxy(&url, |_| {
-        json!({"ok": false, "error": "探测函数尚未接入（需上层替换 probe_fn）"})
-    });
+    let probe = crate::proxy::probe_proxy(
+        &url,
+        |_| json!({"ok": false, "error": "探测函数尚未接入（需上层替换 probe_fn）"}),
+    );
     json!({"ok": probe.get("ok").and_then(Value::as_bool).unwrap_or(false), "probe": probe, "slot": slot})
 }
 

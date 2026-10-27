@@ -99,6 +99,10 @@ pub struct AccountState {
     pub last_error: String,
     /// 最近一次错误详情（note_* 写，日志/诊断用）。
     pub last_error_detail: String,
+    /// 账号的活动触发来源（scheduler/manual/account_add/account_import）。
+    ///
+    /// 对齐 Python `trigger`：活动历史写入时使用该值；拿不到时默认 `unknown`。
+    pub trigger: String,
 }
 
 impl AccountState {
@@ -128,6 +132,7 @@ impl AccountState {
             free_models: HashSet::new(),
             last_error: String::new(),
             last_error_detail: String::new(),
+            trigger: "unknown".to_string(),
         }
     }
 

@@ -128,6 +128,7 @@ impl CycleExecutor for FakeExecutor {
     fn refresh<'a>(
         &'a self,
         acc: &'a AccountView,
+        _trigger: &str,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         self.record("refresh", &acc.uid);
         Box::pin(async { true })
@@ -185,6 +186,7 @@ fn cn_account(uid: &str) -> AccountView {
         last_activity_report: None,
         last_daily_chat: None,
         daily_chat_granted_today: false,
+        trigger: "unknown".to_string(),
     }
 }
 

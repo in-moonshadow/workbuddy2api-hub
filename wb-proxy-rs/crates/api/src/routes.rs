@@ -368,15 +368,27 @@ pub fn app_with_config(
     }
     router = router
         .route("/proxy/slots", get(proxy_slots_get).options(preflight))
-        .route("/proxy/slots/save", post(proxy_slots_save).options(preflight))
-        .route("/proxy/slots/test", post(proxy_slots_test).options(preflight))
+        .route(
+            "/proxy/slots/save",
+            post(proxy_slots_save).options(preflight),
+        )
+        .route(
+            "/proxy/slots/test",
+            post(proxy_slots_test).options(preflight),
+        )
         .route("/proxy/discover", post(proxy_discover).options(preflight))
         .route("/agents", get(agents_get).options(preflight))
-        .route("/agents/available", get(agents_available).options(preflight))
+        .route(
+            "/agents/available",
+            get(agents_available).options(preflight),
+        )
         .route("/agents/cli", get(agents_cli).options(preflight))
         .route("/agents/apply", post(agents_apply).options(preflight))
         .route("/agents/restore", post(agents_restore).options(preflight))
-        .route("/usage/remaining", get(usage_remaining_get).options(preflight));
+        .route(
+            "/usage/remaining",
+            get(usage_remaining_get).options(preflight),
+        );
     // 404 兜底：未匹配路径统一回 Python `_error(404, "not found")` 信封。
     let path_echo = axum::middleware::from_fn(inject_path);
     router
@@ -776,6 +788,8 @@ async fn chat_openai_entry(
                         message: reply.message.as_deref(),
                         started: now,
                         or_models: None,
+                        ttft_ms: None,
+                        gen_ms: None,
                     },
                 );
                 reply.response
@@ -801,6 +815,8 @@ async fn chat_openai_entry(
             message: reply.message.as_deref(),
             started: now,
             or_models: None,
+            ttft_ms: None,
+            gen_ms: None,
         },
     );
     let response = reply.response;
@@ -908,6 +924,7 @@ fn responses_sse_response(
             ResponsesStreamTranslator::new(&stream_model, &request_meta, &custom_names, created);
         let mut buf = String::new();
         let mut failure: Option<String> = None;
+        let mut first_ms: Option<i64> = None;
         loop {
             match resp.chunk().await {
                 Ok(Some(bytes)) => {
@@ -938,6 +955,10 @@ fn responses_sse_response(
             // 末尾没有换行符的残留行
             if !buf.trim().is_empty() {
                 for event in translator.feed(buf.trim()) {
+                    if first_ms.is_none() {
+                        first_ms = Some(((now_secs() - now) * 1000.0).round().max(0.0) as i64);
+                    }
+
                     if tx
                         .send(Ok(Bytes::from(responses_sse_frame(&event))))
                         .await
@@ -948,6 +969,10 @@ fn responses_sse_response(
                 }
             }
             for event in translator.finish() {
+                if first_ms.is_none() {
+                    first_ms = Some(((now_secs() - now) * 1000.0).round().max(0.0) as i64);
+                }
+
                 if tx
                     .send(Ok(Bytes::from(responses_sse_frame(&event))))
                     .await
@@ -975,6 +1000,8 @@ fn responses_sse_response(
                 message: failure.as_deref(),
                 started: now,
                 or_models: None,
+                ttft_ms: first_ms,
+                gen_ms: None,
             },
         );
     });
@@ -1122,6 +1149,8 @@ async fn chat_anthropic_entry(
             message: reply.message.as_deref(),
             started: now,
             or_models: None,
+            ttft_ms: None,
+            gen_ms: None,
         },
     );
     reply.response
@@ -2030,6 +2059,22 @@ fn read_usage_rows(state: &AppState) -> Vec<Value> {
     }
 }
 
+/// 把聚合结果包装成带 ETag 的响应：命中 `If-None-Match` ⇒ 304 空体，
+/// 否则附上 `ETag` 头返回 JSON。
+fn usage_etag_response(headers: &HeaderMap, value: serde_json::Value) -> Response {
+    let etag = wb_tasks::usage::usage_etag(&value);
+    if let Some(supplied) = headers.get(header::IF_NONE_MATCH) {
+        if supplied.to_str().ok() == Some(etag.as_str()) {
+            return StatusCode::NOT_MODIFIED.into_response();
+        }
+    }
+    let mut response = Json(value).into_response();
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, v);
+    }
+    response
+}
+
 /// `GET /usage` 与 `GET /v1/usage`：用量快照（Python `_get_v1_usage`）。
 ///
 /// **两条路径同一份实现**（Python `wb_proxy.py:15719`：
@@ -2063,14 +2108,16 @@ async fn usage_get(
     let policies = wb_tasks::pricing_store::load_policies(&state.task.usage_dir);
     let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
     wb_tasks::pricing_store::set_usage_dir(&state.task.usage_dir);
-    Json(wb_tasks::usage::build_usage_snapshot_with_priced(
-        &rows,
-        &decor,
-        &policies,
-        pricing.as_ref(),
-        true,
-    ))
-    .into_response()
+    usage_etag_response(
+        &headers,
+        wb_tasks::usage::build_usage_snapshot_with_priced(
+            &rows,
+            &decor,
+            &policies,
+            pricing.as_ref(),
+            true,
+        ),
+    )
 }
 
 /// 快照的装饰键（Python `_usage_snapshot_uncached` 追加的那一组）。
@@ -2186,16 +2233,18 @@ async fn usage_recent_get(
     let policies = wb_tasks::pricing_store::load_policies(&state.task.usage_dir);
     let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
     wb_tasks::pricing_store::set_usage_dir(&state.task.usage_dir);
-    Json(wb_tasks::usage::build_usage_recent_priced(
-        &rows,
-        &realm,
-        page,
-        limit,
-        &policies,
-        pricing.as_ref(),
-        true,
-    ))
-    .into_response()
+    usage_etag_response(
+        &headers,
+        wb_tasks::usage::build_usage_recent_priced(
+            &rows,
+            &realm,
+            page,
+            limit,
+            &policies,
+            pricing.as_ref(),
+            true,
+        ),
+    )
 }
 
 /// `GET /usage/timeseries`：分桶的用量序列（Python `_get_usage_timeseries`）。
@@ -2244,10 +2293,10 @@ async fn usage_perf_get(
     let now = wb_tasks::activity::now_epoch();
     let (since, until) = resolve_window(&params, now);
     let rows = read_usage_rows(&state);
-    Json(wb_tasks::usage::build_usage_perf(
-        &rows, &realm, sample, since, until,
-    ))
-    .into_response()
+    usage_etag_response(
+        &headers,
+        wb_tasks::usage::build_usage_perf(&rows, &realm, sample, since, until),
+    )
 }
 
 /// `GET /activity/history`：账号每日活动的结构化历史（Python
@@ -2293,7 +2342,7 @@ async fn usage_by_account(
         return response;
     }
     let rows = read_usage_rows(&state);
-    Json(wb_tasks::usage::build_usage_by_account(&rows)).into_response()
+    usage_etag_response(&headers, wb_tasks::usage::build_usage_by_account(&rows))
 }
 
 /// `GET /usage/analytics`：按日期分组的分析（Python `_get_usage_analytics`）。
@@ -2317,13 +2366,10 @@ async fn usage_analytics(
     let policies = wb_tasks::pricing_store::load_policies(&state.task.usage_dir);
     let pricing = wb_tasks::pricing_store::load_pricing(&state.task.usage_dir);
     wb_tasks::pricing_store::set_usage_dir(&state.task.usage_dir);
-    Json(wb_tasks::usage::build_usage_analytics_priced(
-        &rows,
-        &policies,
-        pricing.as_ref(),
-        true,
-    ))
-    .into_response()
+    usage_etag_response(
+        &headers,
+        wb_tasks::usage::build_usage_analytics_priced(&rows, &policies, pricing.as_ref(), true),
+    )
 }
 
 /// 解析 realm 过滤条件（Python 的 `realm_scope` 语义）。
@@ -2571,11 +2617,7 @@ async fn agents_cli(
     Json(task_routes::route_agents_cli(&state.task, &params)).into_response()
 }
 
-async fn agents_apply(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn agents_apply(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Some(response) = panel_gate("/agents/apply", &headers, &HashMap::new(), &state) {
         return response;
     }

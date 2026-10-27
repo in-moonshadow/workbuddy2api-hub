@@ -325,6 +325,8 @@ pub struct AccountView {
     /// 本字段应由调用方按本地证据（`last_daily_chat` / 活动历史）填；若将来要
     /// 从 credits 快照填，必须走 D+1 口径（查**明天**日期的包）。
     pub daily_chat_granted_today: bool,
+    /// 账号的活动触发来源（scheduler/manual/account_add/account_import）。
+    pub trigger: String,
 }
 
 impl AccountView {
@@ -341,6 +343,7 @@ impl AccountView {
             last_activity_report: None,
             last_daily_chat: None,
             daily_chat_granted_today: false,
+            trigger: acc.trigger.clone(),
         }
     }
 
@@ -403,7 +406,7 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// （M4 计划硬约束）。
 pub trait CycleExecutor: Send + Sync {
     /// `acc.refresh()`：Token 保活刷新。
-    fn refresh<'a>(&'a self, acc: &'a AccountView) -> BoxFut<'a, bool>;
+    fn refresh<'a>(&'a self, acc: &'a AccountView, trigger: &str) -> BoxFut<'a, bool>;
 
     /// `acc.checkin(trigger="scheduler")`：`{ok, code?, msg?, data?, error?}`。
     fn checkin<'a>(&'a self, acc: &'a AccountView) -> BoxFut<'a, StepResult>;
@@ -431,7 +434,7 @@ pub trait CycleExecutor: Send + Sync {
 pub struct NullExecutor;
 
 impl CycleExecutor for NullExecutor {
-    fn refresh<'a>(&'a self, _acc: &'a AccountView) -> BoxFut<'a, bool> {
+    fn refresh<'a>(&'a self, _acc: &'a AccountView, _trigger: &str) -> BoxFut<'a, bool> {
         Box::pin(async { false })
     }
 
@@ -905,7 +908,7 @@ impl<'a> Scheduler<'a> {
             // 1. 保活
             if needs_keepalive(acc.expires_at, self.clock.epoch_secs()) {
                 self.log(&format!("账号 [{id}] Token 即将到期，执行主动保活刷新..."));
-                if self.executor.refresh(acc).await {
+                if self.executor.refresh(acc, "scheduler").await {
                     counts.refreshed += 1;
                     self.log(&format!("✓ 账号 [{id}] Token 自动保活刷新成功"));
                 } else {

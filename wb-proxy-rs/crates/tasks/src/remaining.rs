@@ -106,7 +106,11 @@ struct FoldState {
 
 fn local_day_key(ts: f64) -> String {
     chrono::DateTime::from_timestamp(ts as i64, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -144,7 +148,11 @@ fn day_key_start(key: &str) -> f64 {
 
 fn iso_at(ts: f64) -> String {
     chrono::DateTime::from_timestamp(ts as i64, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -183,8 +191,16 @@ fn parse_rate_limit_reset(detail: &str) -> Option<f64> {
     let mut offset: i64 = 0;
     if let Some(tz) = tz_re.captures(detail) {
         let hours: i64 = tz.get(1).unwrap().as_str().parse().unwrap_or(0);
-        let minutes: i64 = tz.get(2).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
-        offset = hours * 3600 + if hours >= 0 { minutes * 60 } else { -minutes * 60 };
+        let minutes: i64 = tz
+            .get(2)
+            .map(|m| m.as_str().parse().unwrap_or(0))
+            .unwrap_or(0);
+        offset = hours * 3600
+            + if hours >= 0 {
+                minutes * 60
+            } else {
+                -minutes * 60
+            };
     }
     let naive = chrono::NaiveDateTime::parse_from_str(&stamp, "%Y-%m-%d %H:%M:%S").ok()?;
     Some(naive.and_utc().timestamp() as f64 - offset as f64)
@@ -226,7 +242,11 @@ fn pair_append(buf: &mut PairBuffer, at: f64, tokens: i64) {
     }
     let index = bisect_right(&buf.at, at, 0);
     buf.at.insert(index, at);
-    let prev_cum = if index == 0 { buf.base } else { buf.cum[index - 1] };
+    let prev_cum = if index == 0 {
+        buf.base
+    } else {
+        buf.cum[index - 1]
+    };
     buf.cum.insert(index, prev_cum + tokens as f64);
     for i in (index + 1)..buf.cum.len() {
         buf.cum[i] += tokens as f64;
@@ -341,7 +361,11 @@ fn merge_event(state: &mut FoldState, event: CapEvent) {
     if event.account.is_empty() || event.model.is_empty() || event.reset <= 0.0 {
         return;
     }
-    let key = (event.account.clone(), event.model.clone(), reset_key(event.reset));
+    let key = (
+        event.account.clone(),
+        event.model.clone(),
+        reset_key(event.reset),
+    );
     if state.keys.contains(&key) {
         return;
     }
@@ -352,7 +376,9 @@ fn merge_event(state: &mut FoldState, event: CapEvent) {
         let drop_n = state.events.len() - REMAINING_MAX_EVENTS;
         let dropped: Vec<CapEvent> = state.events.drain(..drop_n).collect();
         for old in dropped {
-            state.keys.remove(&(old.account, old.model, reset_key(old.reset)));
+            state
+                .keys
+                .remove(&(old.account, old.model, reset_key(old.reset)));
         }
     }
 }
@@ -371,7 +397,9 @@ fn drop_events(state: &mut FoldState, source: &str) {
         .collect();
     for e in &state.events {
         if e.src == source {
-            state.keys.remove(&(e.account.clone(), e.model.clone(), reset_key(e.reset)));
+            state
+                .keys
+                .remove(&(e.account.clone(), e.model.clone(), reset_key(e.reset)));
         }
     }
     state.events = kept;
@@ -382,8 +410,16 @@ fn drop_events(state: &mut FoldState, source: &str) {
 // ---------------------------------------------------------------------------
 
 fn fold_remaining_row(row: &Value, state: &mut FoldState) {
-    let uid = row.get("account").and_then(Value::as_str).unwrap_or("").to_string();
-    let model = row.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    let uid = row
+        .get("account")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let model = row
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if uid.is_empty() || model.is_empty() {
         return;
     }
@@ -393,12 +429,20 @@ fn fold_remaining_row(row: &Value, state: &mut FoldState) {
     }
     // 撞线行（status 429）：解析恢复时刻，样本按段截断。
     if row.get("status").and_then(Value::as_i64).unwrap_or(0) == 429 {
-        let Some(reset) = parse_rate_limit_reset(row.get("message").and_then(Value::as_str).unwrap_or(""))
+        let Some(reset) =
+            parse_rate_limit_reset(row.get("message").and_then(Value::as_str).unwrap_or(""))
         else {
             return;
         };
         let anchors = cap_anchors(&state.events, &uid, &model);
-        let sample = window_sample(&state.usage, &uid, &model, reset, at, Some(cap_window_start(&anchors, reset)));
+        let sample = window_sample(
+            &state.usage,
+            &uid,
+            &model,
+            reset,
+            at,
+            Some(cap_window_start(&anchors, reset)),
+        );
         merge_event(
             state,
             CapEvent {
@@ -406,7 +450,11 @@ fn fold_remaining_row(row: &Value, state: &mut FoldState) {
                 reset,
                 account: uid,
                 model,
-                realm: row.get("realm").and_then(Value::as_str).unwrap_or("").to_string(),
+                realm: row
+                    .get("realm")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 sample,
                 src: "log".to_string(),
             },
@@ -420,7 +468,10 @@ fn fold_remaining_row(row: &Value, state: &mut FoldState) {
         return;
     }
     let total_tokens = row.get("total_tokens").and_then(Value::as_i64).unwrap_or(0);
-    let buf = state.usage.entry((uid, model)).or_insert_with(PairBuffer::new);
+    let buf = state
+        .usage
+        .entry((uid, model))
+        .or_insert_with(PairBuffer::new);
     pair_append(buf, at, total_tokens);
     pair_trim(buf, at - REMAINING_KEEP_SECONDS);
 }
@@ -454,7 +505,8 @@ fn estimate_daily_write(usage_dir: &Path, days: &Map<String, Value>) {
     let _ = std::fs::create_dir_all(usage_dir);
     let path = usage_dir.join("estimate-daily.json");
     let tmp = usage_dir.join("estimate-daily.json.tmp");
-    let text = serde_json::to_string(&json!({"schema": ESTIMATE_SCHEMA, "days": days})).unwrap_or_default();
+    let text = serde_json::to_string(&json!({"schema": ESTIMATE_SCHEMA, "days": days}))
+        .unwrap_or_default();
     if std::fs::write(&tmp, text).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
@@ -470,7 +522,11 @@ fn estimate_budget_entry_ok(entry: &Value) -> bool {
         return false;
     }
     ["avg", "min", "max"].iter().all(|field| {
-        entry.get(*field).and_then(Value::as_f64).map(|v| v.is_finite()).unwrap_or(false)
+        entry
+            .get(*field)
+            .and_then(Value::as_f64)
+            .map(|v| v.is_finite())
+            .unwrap_or(false)
     })
 }
 
@@ -504,16 +560,26 @@ fn budget_means(per_account: &HashMap<String, Vec<i64>>) -> Option<Value> {
 // `_remaining_archive_segments`）
 // ---------------------------------------------------------------------------
 
-fn remaining_archive_segments(state: &FoldState, events: &[&CapEvent], start: f64, end: f64) -> Map<String, Value> {
+fn remaining_archive_segments(
+    state: &FoldState,
+    events: &[&CapEvent],
+    start: f64,
+    end: f64,
+) -> Map<String, Value> {
     // (账号, 模型) → [(at, reset)]：仅当天的事件。
     let mut caps: HashMap<(String, String), Vec<(f64, f64)>> = HashMap::new();
     for e in events {
-        caps.entry((e.account.clone(), e.model.clone())).or_default().push((e.at, e.reset));
+        caps.entry((e.account.clone(), e.model.clone()))
+            .or_default()
+            .push((e.at, e.reset));
     }
     let mut segments: Map<String, Value> = Map::new();
     for ((uid, model), buf) in &state.usage {
         let total = range_sum_open(buf, start, end);
-        let pair_caps = caps.get(&(uid.clone(), model.clone())).cloned().unwrap_or_default();
+        let pair_caps = caps
+            .get(&(uid.clone(), model.clone()))
+            .cloned()
+            .unwrap_or_default();
         if total <= 0 && pair_caps.is_empty() {
             continue;
         }
@@ -533,7 +599,10 @@ fn remaining_archive_segments(state: &FoldState, events: &[&CapEvent], start: f6
         if total <= 0 && post <= 0 {
             continue;
         }
-        segments.insert(format!("{uid}\x1f{model}"), json!({"pre": total - post, "post": post}));
+        segments.insert(
+            format!("{uid}\x1f{model}"),
+            json!({"pre": total - post, "post": post}),
+        );
     }
     segments
 }
@@ -546,7 +615,11 @@ fn remaining_archive_day(
 ) -> Option<Value> {
     let start = day_key_start(day);
     let end = start + 86400.0;
-    let day_events: Vec<&CapEvent> = state.events.iter().filter(|e| local_day_key(e.at) == day).collect();
+    let day_events: Vec<&CapEvent> = state
+        .events
+        .iter()
+        .filter(|e| local_day_key(e.at) == day)
+        .collect();
 
     let mut samples: HashMap<(String, String), HashMap<String, Vec<i64>>> = HashMap::new();
     for e in &day_events {
@@ -558,7 +631,12 @@ fn remaining_archive_day(
         } else {
             e.realm.clone()
         };
-        samples.entry((realm, e.model.clone())).or_default().entry(e.account.clone()).or_default().push(e.sample);
+        samples
+            .entry((realm, e.model.clone()))
+            .or_default()
+            .entry(e.account.clone())
+            .or_default()
+            .push(e.sample);
     }
     let mut budgets: Map<String, Value> = Map::new();
     for (key, per_account) in &samples {
@@ -599,17 +677,29 @@ fn remaining_budgets(
         } else {
             e.realm.clone()
         };
-        samples.entry((realm, e.model.clone())).or_default().entry(e.account.clone()).or_default().push(e.sample);
+        samples
+            .entry((realm, e.model.clone()))
+            .or_default()
+            .entry(e.account.clone())
+            .or_default()
+            .push(e.sample);
     }
     for (key, per_account) in &samples {
         if let Some(entry) = budget_means(per_account) {
-            per_day.entry(key.clone()).or_default().insert(keys[0].clone(), entry);
+            per_day
+                .entry(key.clone())
+                .or_default()
+                .insert(keys[0].clone(), entry);
         }
     }
     // 昨天/前天：直接读归档文件里当天的口径。
     for day in &keys[1..] {
-        let Some(record) = daily.get(day) else { continue };
-        let Some(budgets_obj) = record.get("budgets").and_then(Value::as_object) else { continue };
+        let Some(record) = daily.get(day) else {
+            continue;
+        };
+        let Some(budgets_obj) = record.get("budgets").and_then(Value::as_object) else {
+            continue;
+        };
         for (pair_key, entry) in budgets_obj {
             if !estimate_budget_entry_ok(entry) {
                 continue;
@@ -620,7 +710,10 @@ fn remaining_budgets(
             if model.is_empty() {
                 continue;
             }
-            per_day.entry((realm, model)).or_default().insert(day.clone(), entry.clone());
+            per_day
+                .entry((realm, model))
+                .or_default()
+                .insert(day.clone(), entry.clone());
         }
     }
 
@@ -628,7 +721,9 @@ fn remaining_budgets(
     for (key, days_map) in &per_day {
         let mut rows: Vec<(String, Value)> = Vec::new();
         for (index, day) in keys.iter().enumerate() {
-            let Some(entry) = days_map.get(day) else { continue };
+            let Some(entry) = days_map.get(day) else {
+                continue;
+            };
             if entry.get("n").and_then(Value::as_i64).unwrap_or(0) <= 0 {
                 continue;
             }
@@ -645,7 +740,10 @@ fn remaining_budgets(
         if rows.is_empty() {
             continue;
         }
-        let weight: i64 = rows.iter().map(|r| r.1.get("w").and_then(Value::as_i64).unwrap_or(0)).sum();
+        let weight: i64 = rows
+            .iter()
+            .map(|r| r.1.get("w").and_then(Value::as_i64).unwrap_or(0))
+            .sum();
         if weight == 0 {
             continue;
         }
@@ -658,8 +756,16 @@ fn remaining_budgets(
             weighted_avg += w as f64 * row.get("avg").and_then(Value::as_i64).unwrap_or(0) as f64;
             total_n += row.get("n").and_then(Value::as_i64).unwrap_or(0);
             if let Some(entry) = days_map.get(day) {
-                let mn = entry.get("min").and_then(Value::as_f64).unwrap_or(0.0).round() as i64;
-                let mx = entry.get("max").and_then(Value::as_f64).unwrap_or(0.0).round() as i64;
+                let mn = entry
+                    .get("min")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .round() as i64;
+                let mx = entry
+                    .get("max")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .round() as i64;
                 min_val = min_val.min(mn);
                 max_val = max_val.max(mx);
             }
@@ -690,7 +796,9 @@ fn collect_anchors(
 ) -> HashMap<(String, String), HashMap<i64, (f64, f64)>> {
     let mut anchors: HashMap<(String, String), HashMap<i64, (f64, f64)>> = HashMap::new();
     for e in &state.events {
-        let entry = anchors.entry((e.account.clone(), e.model.clone())).or_default();
+        let entry = anchors
+            .entry((e.account.clone(), e.model.clone()))
+            .or_default();
         match entry.get(&reset_key(e.reset)) {
             None => {
                 entry.insert(reset_key(e.reset), (e.at, e.reset));
@@ -727,7 +835,9 @@ fn active_set(
 ) -> HashSet<(String, String)> {
     let mut active: HashSet<(String, String)> = HashSet::new();
     for ((uid, model), buf) in &state.usage {
-        let Some(realm) = realm_of.get(uid) else { continue };
+        let Some(realm) = realm_of.get(uid) else {
+            continue;
+        };
         if buf.at.is_empty() {
             continue;
         }
@@ -736,7 +846,9 @@ fn active_set(
         }
     }
     for ((uid, model), entries) in anchors {
-        let Some(realm) = realm_of.get(uid) else { continue };
+        let Some(realm) = realm_of.get(uid) else {
+            continue;
+        };
         if entries.values().any(|e| e.0.max(e.1) >= floor) {
             active.insert((realm.clone(), model.clone()));
         }
@@ -790,7 +902,10 @@ fn payload_build(
         sorted_models.sort();
 
         for model in sorted_models {
-            let entries = anchors.get(&(uid.clone(), model.clone())).cloned().unwrap_or_default();
+            let entries = anchors
+                .get(&(uid.clone(), model.clone()))
+                .cloned()
+                .unwrap_or_default();
             let buf = state.usage.get(&(uid.clone(), model.clone()));
             let mut past: Vec<(f64, f64)> = Vec::new();
             let mut future: Vec<(f64, f64)> = Vec::new();
@@ -801,8 +916,14 @@ fn payload_build(
                     future.push((e.0, e.1));
                 }
             }
-            let last = past.iter().max_by(|x, y| x.1.partial_cmp(&y.1).unwrap()).copied();
-            let upcoming = future.iter().min_by(|x, y| x.1.partial_cmp(&y.1).unwrap()).copied();
+            let last = past
+                .iter()
+                .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
+                .copied();
+            let upcoming = future
+                .iter()
+                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
+                .copied();
 
             let mut segments: Vec<Value> = Vec::new();
             let mut cooling = false;
@@ -833,7 +954,8 @@ fn payload_build(
                     if la.0 > 0.0 {
                         let prev_end = la.0.min(reset_at);
                         let prev_start = cap_window_start(&entries, reset_at);
-                        let prev_used = buf.map(|b| range_sum(b, prev_start, prev_end)).unwrap_or(0);
+                        let prev_used =
+                            buf.map(|b| range_sum(b, prev_start, prev_end)).unwrap_or(0);
                         segments.push(json!({
                             "start": prev_start,
                             "end": prev_end,
@@ -864,7 +986,10 @@ fn payload_build(
             };
 
             let budget = budgets.get(&(realm.clone(), model.clone()));
-            let avg = budget.and_then(|b| b.get("avg")).and_then(Value::as_i64).unwrap_or(0);
+            let avg = budget
+                .and_then(|b| b.get("avg"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
             let mut remaining: Option<i64> = None;
             let mut pct: Option<f64> = None;
             if cooling {
@@ -900,38 +1025,69 @@ fn payload_build(
                 "segments": segments,
             }));
 
-            let total_entry = totals.entry((realm.clone(), model.clone())).or_insert_with(|| {
-                let mut m = Map::new();
-                m.insert("realm".to_string(), Value::String(realm.clone()));
-                m.insert("model".to_string(), Value::String(model.clone()));
-                m.insert("total_remaining".to_string(), Value::Null);
-                m.insert("budget".to_string(), budget.and_then(|b| b.get("avg")).cloned().unwrap_or(Value::Null));
-                m.insert("pairs".to_string(), Value::from(0i64));
-                m.insert("available".to_string(), Value::from(0i64));
-                m.insert("cooling".to_string(), Value::from(0i64));
-                m.insert("unknown".to_string(), Value::from(0i64));
-                m.insert("estimated".to_string(), Value::from(0i64));
-                m
-            });
-            let pairs = total_entry.get("pairs").and_then(Value::as_i64).unwrap_or(0) + 1;
+            let total_entry = totals
+                .entry((realm.clone(), model.clone()))
+                .or_insert_with(|| {
+                    let mut m = Map::new();
+                    m.insert("realm".to_string(), Value::String(realm.clone()));
+                    m.insert("model".to_string(), Value::String(model.clone()));
+                    m.insert("total_remaining".to_string(), Value::Null);
+                    m.insert(
+                        "budget".to_string(),
+                        budget
+                            .and_then(|b| b.get("avg"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                    m.insert("pairs".to_string(), Value::from(0i64));
+                    m.insert("available".to_string(), Value::from(0i64));
+                    m.insert("cooling".to_string(), Value::from(0i64));
+                    m.insert("unknown".to_string(), Value::from(0i64));
+                    m.insert("estimated".to_string(), Value::from(0i64));
+                    m
+                });
+            let pairs = total_entry
+                .get("pairs")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                + 1;
             total_entry.insert("pairs".to_string(), Value::from(pairs));
             if cooling {
-                let c = total_entry.get("cooling").and_then(Value::as_i64).unwrap_or(0) + 1;
+                let c = total_entry
+                    .get("cooling")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    + 1;
                 total_entry.insert("cooling".to_string(), Value::from(c));
             }
             if estimated {
-                let e = total_entry.get("estimated").and_then(Value::as_i64).unwrap_or(0) + 1;
+                let e = total_entry
+                    .get("estimated")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    + 1;
                 total_entry.insert("estimated".to_string(), Value::from(e));
             }
             if let Some(r) = remaining {
-                let cur = total_entry.get("total_remaining").and_then(Value::as_i64).unwrap_or(0);
+                let cur = total_entry
+                    .get("total_remaining")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
                 total_entry.insert("total_remaining".to_string(), Value::from(cur + r));
                 if !cooling {
-                    let av = total_entry.get("available").and_then(Value::as_i64).unwrap_or(0) + 1;
+                    let av = total_entry
+                        .get("available")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        + 1;
                     total_entry.insert("available".to_string(), Value::from(av));
                 }
             } else {
-                let u = total_entry.get("unknown").and_then(Value::as_i64).unwrap_or(0) + 1;
+                let u = total_entry
+                    .get("unknown")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    + 1;
                 total_entry.insert("unknown".to_string(), Value::from(u));
             }
         }
@@ -941,17 +1097,31 @@ fn payload_build(
     rows.sort_by(|a, b| {
         let a_none = a.get("remaining").map(|v| v.is_null()).unwrap_or(true);
         let b_none = b.get("remaining").map(|v| v.is_null()).unwrap_or(true);
-        a_none.cmp(&b_none).then_with(|| {
-            let a_val = a.get("remaining").and_then(Value::as_i64).unwrap_or(0);
-            let b_val = b.get("remaining").and_then(Value::as_i64).unwrap_or(0);
-            a_val.cmp(&b_val)
-        }).then_with(|| {
-            a.get("realm").and_then(Value::as_str).unwrap_or("").cmp(b.get("realm").and_then(Value::as_str).unwrap_or(""))
-        }).then_with(|| {
-            a.get("nickname").and_then(Value::as_str).unwrap_or("").cmp(b.get("nickname").and_then(Value::as_str).unwrap_or(""))
-        }).then_with(|| {
-            a.get("model").and_then(Value::as_str).unwrap_or("").cmp(b.get("model").and_then(Value::as_str).unwrap_or(""))
-        })
+        a_none
+            .cmp(&b_none)
+            .then_with(|| {
+                let a_val = a.get("remaining").and_then(Value::as_i64).unwrap_or(0);
+                let b_val = b.get("remaining").and_then(Value::as_i64).unwrap_or(0);
+                a_val.cmp(&b_val)
+            })
+            .then_with(|| {
+                a.get("realm")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("realm").and_then(Value::as_str).unwrap_or(""))
+            })
+            .then_with(|| {
+                a.get("nickname")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("nickname").and_then(Value::as_str).unwrap_or(""))
+            })
+            .then_with(|| {
+                a.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("model").and_then(Value::as_str).unwrap_or(""))
+            })
     });
 
     let mut budgets_arr: Vec<Value> = budgets
@@ -961,16 +1131,23 @@ fn payload_build(
             if let Some(obj) = bb.as_object_mut() {
                 obj.insert("realm".to_string(), Value::String(realm.clone()));
                 obj.insert("model".to_string(), Value::String(model.clone()));
-                obj.insert("active".to_string(), Value::Bool(active.contains(&(realm.clone(), model.clone()))));
+                obj.insert(
+                    "active".to_string(),
+                    Value::Bool(active.contains(&(realm.clone(), model.clone()))),
+                );
             }
             bb
         })
         .collect();
     budgets_arr.sort_by(|a, b| {
-        a.get("realm").and_then(Value::as_str).unwrap_or("")
+        a.get("realm")
+            .and_then(Value::as_str)
+            .unwrap_or("")
             .cmp(b.get("realm").and_then(Value::as_str).unwrap_or(""))
             .then_with(|| {
-                a.get("model").and_then(Value::as_str).unwrap_or("")
+                a.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
                     .cmp(b.get("model").and_then(Value::as_str).unwrap_or(""))
             })
     });
@@ -978,17 +1155,39 @@ fn payload_build(
     // models：Python key `(total_remaining is None, -(total_remaining or 0), realm, model)`。
     let mut models_arr: Vec<Value> = totals.values().cloned().map(Value::Object).collect();
     models_arr.sort_by(|a, b| {
-        let a_none = a.get("total_remaining").map(|v| v.is_null()).unwrap_or(true);
-        let b_none = b.get("total_remaining").map(|v| v.is_null()).unwrap_or(true);
-        a_none.cmp(&b_none).then_with(|| {
-            let a_val = a.get("total_remaining").and_then(Value::as_i64).unwrap_or(0);
-            let b_val = b.get("total_remaining").and_then(Value::as_i64).unwrap_or(0);
-            b_val.cmp(&a_val)
-        }).then_with(|| {
-            a.get("realm").and_then(Value::as_str).unwrap_or("").cmp(b.get("realm").and_then(Value::as_str).unwrap_or(""))
-        }).then_with(|| {
-            a.get("model").and_then(Value::as_str).unwrap_or("").cmp(b.get("model").and_then(Value::as_str).unwrap_or(""))
-        })
+        let a_none = a
+            .get("total_remaining")
+            .map(|v| v.is_null())
+            .unwrap_or(true);
+        let b_none = b
+            .get("total_remaining")
+            .map(|v| v.is_null())
+            .unwrap_or(true);
+        a_none
+            .cmp(&b_none)
+            .then_with(|| {
+                let a_val = a
+                    .get("total_remaining")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let b_val = b
+                    .get("total_remaining")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                b_val.cmp(&a_val)
+            })
+            .then_with(|| {
+                a.get("realm")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("realm").and_then(Value::as_str).unwrap_or(""))
+            })
+            .then_with(|| {
+                a.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("model").and_then(Value::as_str).unwrap_or(""))
+            })
     });
 
     json!({
@@ -1012,7 +1211,11 @@ fn payload_build(
 /// 每次调用做全量冷扫：fold `usage.jsonl` + `limit-events.jsonl`、读
 /// `estimate-daily.json`、必要时做跨天归档（原子写盘）、构建 per-account
 /// per-model 剩余额度载荷。
-pub async fn remaining_payload(accounts_dir: &Path, usage_dir: &Path, pool: &[AccountState]) -> Value {
+pub async fn remaining_payload(
+    accounts_dir: &Path,
+    usage_dir: &Path,
+    pool: &[AccountState],
+) -> Value {
     let _ = accounts_dir; // 约定签名，接线侧后续按需使用
     let now = crate::activity::now_epoch();
 
@@ -1025,7 +1228,8 @@ pub async fn remaining_payload(accounts_dir: &Path, usage_dir: &Path, pool: &[Ac
         fold_remaining_row(row, &mut state);
     }
     // limit-events.jsonl（只读；缺失按空）。
-    let events_text = std::fs::read_to_string(usage_dir.join("limit-events.jsonl")).unwrap_or_default();
+    let events_text =
+        std::fs::read_to_string(usage_dir.join("limit-events.jsonl")).unwrap_or_default();
     for line in events_text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -1039,7 +1243,10 @@ pub async fn remaining_payload(accounts_dir: &Path, usage_dir: &Path, pool: &[Ac
     }
 
     // 启用账号 → realm 映射。
-    let accounts: Vec<&AccountState> = pool.iter().filter(|a| a.enabled && !a.uid.is_empty()).collect();
+    let accounts: Vec<&AccountState> = pool
+        .iter()
+        .filter(|a| a.enabled && !a.uid.is_empty())
+        .collect();
     let mut realm_of: HashMap<String, String> = HashMap::new();
     for a in &accounts {
         realm_of.insert(a.uid.clone(), a.realm.clone());
@@ -1095,7 +1302,8 @@ pub async fn remaining_payload(accounts_dir: &Path, usage_dir: &Path, pool: &[Ac
             days.entry(day.clone()).or_insert(rec.clone());
         }
         let keep = estimate_day_keys(now);
-        let segment_days: HashSet<String> = keep.iter().take(ESTIMATE_SEGMENT_DAYS).cloned().collect();
+        let segment_days: HashSet<String> =
+            keep.iter().take(ESTIMATE_SEGMENT_DAYS).cloned().collect();
         let mut pruned: Map<String, Value> = Map::new();
         for (day, rec) in &days {
             if !keep.contains(day) {
@@ -1112,7 +1320,8 @@ pub async fn remaining_payload(accounts_dir: &Path, usage_dir: &Path, pool: &[Ac
         // 幂等：与盘上内容一致的写盘是纯写放大——先比对再写。
         let path = usage_dir.join("estimate-daily.json");
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let text = serde_json::to_string(&json!({"schema": ESTIMATE_SCHEMA, "days": pruned})).unwrap_or_default();
+        let text = serde_json::to_string(&json!({"schema": ESTIMATE_SCHEMA, "days": pruned}))
+            .unwrap_or_default();
         if !existing.trim_end_matches('\n').is_empty() && existing.trim() == text.trim() {
             // 内容不变，跳过写盘。
         } else if existing.is_empty() || existing.trim() != text.trim() {
@@ -1128,9 +1337,21 @@ fn event_from_file_row(v: &Value) -> CapEvent {
     CapEvent {
         at: v.get("at").and_then(Value::as_f64).unwrap_or(0.0),
         reset: v.get("reset").and_then(Value::as_f64).unwrap_or(0.0),
-        account: v.get("account").and_then(Value::as_str).unwrap_or("").to_string(),
-        model: v.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
-        realm: v.get("realm").and_then(Value::as_str).unwrap_or("").to_string(),
+        account: v
+            .get("account")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        model: v
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        realm: v
+            .get("realm")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         sample: v.get("sample").and_then(Value::as_i64).unwrap_or(0),
         src: "file".to_string(),
     }
@@ -1212,8 +1433,22 @@ mod tests {
         let a = parse_rate_limit_reset(intl).unwrap();
         let b = parse_rate_limit_reset(cn).unwrap();
         // 与 Python 同口径：UTC 墙上时钟 − 声明偏移。
-        assert_eq!(a, chrono::NaiveDateTime::parse_from_str("2026-09-19 18:29:03", "%Y-%m-%d %H:%M:%S").unwrap().and_utc().timestamp() as f64 - 8.0 * 3600.0);
-        assert_eq!(b, chrono::NaiveDateTime::parse_from_str("2026-10-09 14:44:59", "%Y-%m-%d %H:%M:%S").unwrap().and_utc().timestamp() as f64 - 8.0 * 3600.0);
+        assert_eq!(
+            a,
+            chrono::NaiveDateTime::parse_from_str("2026-09-19 18:29:03", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc()
+                .timestamp() as f64
+                - 8.0 * 3600.0
+        );
+        assert_eq!(
+            b,
+            chrono::NaiveDateTime::parse_from_str("2026-10-09 14:44:59", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc()
+                .timestamp() as f64
+                - 8.0 * 3600.0
+        );
         assert!(parse_rate_limit_reset("upstream is tired").is_none());
         assert!(parse_rate_limit_reset("").is_none());
     }
@@ -1228,7 +1463,10 @@ mod tests {
         // 链式撞线：窗口起点是上一个重置时刻，而不是 reset-24h。
         assert_eq!(cap_window_start(&entries, curr), prev);
         entries.remove(&reset_key(prev));
-        assert_eq!(cap_window_start(&entries, curr), curr - LIMIT_WINDOW_SECONDS);
+        assert_eq!(
+            cap_window_start(&entries, curr),
+            curr - LIMIT_WINDOW_SECONDS
+        );
     }
 
     #[test]
@@ -1256,7 +1494,10 @@ mod tests {
         // 组合 (a1, m1) 已经撞线：upcoming 锚点 reset > now。
         mk_event(&mut state, now - 100.0, now + 3600.0, "a1", "m1");
         // 用量：撞线前 100 token。
-        state.usage.insert(("a1".into(), "m1".into()), buf_from(&[(now - 200.0, 60), (now - 50.0, 40)]));
+        state.usage.insert(
+            ("a1".into(), "m1".into()),
+            buf_from(&[(now - 200.0, 60), (now - 50.0, 40)]),
+        );
         let mut realm_of = HashMap::new();
         realm_of.insert("a1".into(), "cn".into());
         let acct = AccountState::new("a1", "cn");
@@ -1267,8 +1508,21 @@ mod tests {
             json!({"avg": 100, "min": 80, "max": 120, "n": 2, "days": []}),
         );
         let floor = crate::activity::local_midnight(now) - LIMIT_WINDOW_SECONDS;
-        let active = active_set(&state, &realm_of, &collect_anchors(&state, &account_refs), floor);
-        let payload = payload_build(&state, now, &realm_of, &account_refs, &budgets, &active, floor);
+        let active = active_set(
+            &state,
+            &realm_of,
+            &collect_anchors(&state, &account_refs),
+            floor,
+        );
+        let payload = payload_build(
+            &state,
+            now,
+            &realm_of,
+            &account_refs,
+            &budgets,
+            &active,
+            floor,
+        );
         let rows = payload["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["uid"], "a1");
@@ -1285,7 +1539,9 @@ mod tests {
     fn payload_build_estimated_row_without_budget_keeps_unknown() {
         let now = 1_800_000_000.0;
         let mut state = FoldState::default();
-        state.usage.insert(("a1".into(), "m1".into()), buf_from(&[(now - 100.0, 30)]));
+        state
+            .usage
+            .insert(("a1".into(), "m1".into()), buf_from(&[(now - 100.0, 30)]));
         let mut realm_of = HashMap::new();
         realm_of.insert("a1".into(), "cn".into());
         let acct = AccountState::new("a1", "cn");
@@ -1293,8 +1549,21 @@ mod tests {
         let budgets = HashMap::new(); // 没有预算（never hit a cap）
         let floor = crate::activity::local_midnight(now) - LIMIT_WINDOW_SECONDS;
         // 活跃集：只有用量行（or anchors 都为空）
-        let active = active_set(&state, &realm_of, &collect_anchors(&state, &account_refs), floor);
-        let payload = payload_build(&state, now, &realm_of, &account_refs, &budgets, &active, floor);
+        let active = active_set(
+            &state,
+            &realm_of,
+            &collect_anchors(&state, &account_refs),
+            floor,
+        );
+        let payload = payload_build(
+            &state,
+            now,
+            &realm_of,
+            &account_refs,
+            &budgets,
+            &active,
+            floor,
+        );
         let rows = payload["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["remaining"], Value::Null);

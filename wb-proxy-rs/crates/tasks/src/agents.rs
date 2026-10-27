@@ -231,7 +231,8 @@ fn command_on_path(name: &str) -> bool {
     let Ok(path) = std::env::var("PATH") else {
         return false;
     };
-    path.split(':').any(|dir| Path::new(dir).join(name).is_file())
+    path.split(':')
+        .any(|dir| Path::new(dir).join(name).is_file())
 }
 
 /// 客户端「是否已安装」的探测（`wb_agents.CLIENTS[*]["probe"]`）。
@@ -412,9 +413,7 @@ pub fn agents_models() -> Vec<Value> {
 pub fn agents_cli_view(_accounts_dir: &Path) -> Value {
     let path = std::env::var("WB_AGENTS_SCRIPT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../wb_agents.py")
-        });
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../wb_agents.py"));
     match std::fs::read(&path) {
         Ok(bytes) => {
             let len = bytes.len();
@@ -457,7 +456,10 @@ pub fn agents_view(accounts_dir: &Path) -> Value {
 
     let mut clients = Map::new();
     for client in CLIENTS.iter() {
-        clients.insert(client.id.to_string(), client_overview(client, &state, &home));
+        clients.insert(
+            client.id.to_string(),
+            client_overview(client, &state, &home),
+        );
     }
 
     let api_key_env = std::env::var("API_KEY").ok();
@@ -492,10 +494,7 @@ pub fn agents_view(accounts_dir: &Path) -> Value {
 /// （`key_status` 只给来源标记），避免本函数返回值被直接当响应体转发而泄密。
 ///
 /// 错误返回 `(400, 消息)`，消息与 Python `_error(400, ...)` 逐字一致。
-pub fn agents_apply_validate(
-    payload: &Value,
-    accounts_dir: &Path,
-) -> Result<Value, (u16, String)> {
+pub fn agents_apply_validate(payload: &Value, accounts_dir: &Path) -> Result<Value, (u16, String)> {
     // ---- client 必填（Python `payload.get("client") or payload.get("client_id") or ""`）----
     let client_val = [payload.get("client"), payload.get("client_id")]
         .into_iter()
@@ -598,7 +597,10 @@ pub fn agents_apply_validate(
     } else {
         // 无可用 key：认证开启 → 400；关闭 → 占位 + warning（Python 逐字）。
         if wb_storage::auth_required(accounts_dir, api_key_env.as_deref(), lan) {
-            return Err((400, "no gateway key available - 请先配置 API Key".to_string()));
+            return Err((
+                400,
+                "no gateway key available - 请先配置 API Key".to_string(),
+            ));
         }
         warnings.push(
             "gateway has no key configured; wrote placeholder 'wb-local' \
@@ -705,10 +707,7 @@ mod tests {
     fn models_flat_list_matches_static_catalog() {
         let models = agents_models();
         assert_eq!(models.len(), crate::catalog::HUB_MODEL_IDS.len());
-        for (id, entry) in crate::catalog::HUB_MODEL_IDS
-            .iter()
-            .zip(models.iter())
-        {
+        for (id, entry) in crate::catalog::HUB_MODEL_IDS.iter().zip(models.iter()) {
             assert_eq!(*entry, json!({ "id": id }));
         }
     }
@@ -728,7 +727,10 @@ mod tests {
         assert!(v["available"].as_bool().unwrap());
         assert_eq!(v["filename"], WB_AGENTS_SCRIPT);
         assert_eq!(v["content_type"], "text/plain; charset=utf-8");
-        assert_eq!(v["content_disposition"], "inline; filename=\"wb_agents.py\"");
+        assert_eq!(
+            v["content_disposition"],
+            "inline; filename=\"wb_agents.py\""
+        );
         assert_eq!(v["bytes"].as_u64().unwrap() as usize, body.len());
         assert_eq!(v["content"], body);
         drop(guard);
@@ -741,7 +743,10 @@ mod tests {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../wb_agents.py");
         let v = agents_cli_view(Path::new("."));
         if repo.exists() {
-            assert!(v["available"].as_bool().unwrap(), "默认路径应能找到 wb_agents.py");
+            assert!(
+                v["available"].as_bool().unwrap(),
+                "默认路径应能找到 wb_agents.py"
+            );
             assert!(v["content"].as_str().unwrap().contains("def overview"));
         } else {
             assert_eq!(v["available"], false);
@@ -754,7 +759,10 @@ mod tests {
         let guard = EnvGuard::set(&[("WB_AGENTS_SCRIPT", "/definitely/not/here.py")]);
         let v = agents_cli_view(Path::new("."));
         assert!(!v["available"].as_bool().unwrap());
-        assert!(v["error"].as_str().unwrap().starts_with("wb_agents.py unavailable:"));
+        assert!(v["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("wb_agents.py unavailable:"));
         drop(guard);
     }
 
@@ -764,7 +772,10 @@ mod tests {
     fn available_obeys_deployment_env_override() {
         let _lock = ENV_LOCK.lock().unwrap();
         let g1 = EnvGuard::set(&[("WB_SERVER_DEPLOYMENT", "1")]);
-        assert_eq!(agents_available(Path::new(".")), json!({ "enabled": false }));
+        assert_eq!(
+            agents_available(Path::new(".")),
+            json!({ "enabled": false })
+        );
         drop(g1);
         let g2 = EnvGuard::set(&[("WB_SERVER_DEPLOYMENT", "0")]);
         assert_eq!(agents_available(Path::new(".")), json!({ "enabled": true }));
@@ -794,7 +805,10 @@ mod tests {
         // 客户端概览：六条、升序、键齐。
         let clients = v["clients"].as_object().unwrap();
         let ids: Vec<&str> = clients.keys().map(String::as_str).collect();
-        assert_eq!(ids, vec!["claude-code", "codex", "crush", "dsh", "opencode", "zcode"]);
+        assert_eq!(
+            ids,
+            vec!["claude-code", "codex", "crush", "dsh", "opencode", "zcode"]
+        );
         for (id, spec) in CLIENTS.iter().enumerate() {
             assert_eq!(clients[spec.id]["id"], spec.id);
             assert_eq!(clients[spec.id]["label"], spec.label);
@@ -886,13 +900,7 @@ mod tests {
     #[test]
     fn apply_falls_back_to_static_catalog_when_models_falsy() {
         let dir = tempfile::tempdir().unwrap();
-        for models in [
-            Value::Null,
-            json!([]),
-            json!({}),
-            json!(false),
-            json!(0),
-        ] {
+        for models in [Value::Null, json!([]), json!({}), json!(false), json!(0)] {
             let mut payload = json!({"client": "codex", "base_url": "https://gw"});
             if !models.is_null() {
                 payload["models"] = models.clone();
@@ -983,12 +991,10 @@ mod tests {
         assert_eq!(v["integrated"], false);
         let warnings = v["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
-        assert!(
-            warnings[0]
-                .as_str()
-                .unwrap()
-                .contains("wrote placeholder 'wb-local'")
-        );
+        assert!(warnings[0]
+            .as_str()
+            .unwrap()
+            .contains("wrote placeholder 'wb-local'"));
         drop(guard);
     }
 
@@ -1006,7 +1012,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            (400, "no gateway key available - 请先配置 API Key".to_string())
+            (
+                400,
+                "no gateway key available - 请先配置 API Key".to_string()
+            )
         );
         drop(guard);
     }
