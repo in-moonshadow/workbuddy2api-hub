@@ -253,6 +253,7 @@ pub fn app_with_config(
         .route("/panel/password", post(panel_password).options(preflight))
         .route("/settings", get(settings_get).options(preflight))
         .route("/settings/save", post(settings_save).options(preflight))
+        .route("/accounts", get(accounts_list).options(preflight))
         .route(
             "/accounts/checkin",
             post(accounts_checkin).options(preflight),
@@ -1964,6 +1965,22 @@ async fn scheduler_get(State(state): State<AppState>, headers: HeaderMap) -> Res
         return response;
     }
     let res = task_routes::route_scheduler_get(&state.task);
+    Json(res).into_response()
+}
+
+/// `GET /accounts`：账号列表（Python `wb_proxy.py:15943 _get_accounts`）。
+///
+/// 双层门禁：面板会话 + API key。`?realm=` 过滤（`all` 或具体 realm）。
+async fn accounts_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = panel_gate("/accounts", &headers, &HashMap::new(), &state) {
+        return response;
+    }
+    let realm = params.get("realm").map(|s| s.as_str());
+    let res = task_routes::route_accounts_list(&state.task, realm);
     Json(res).into_response()
 }
 

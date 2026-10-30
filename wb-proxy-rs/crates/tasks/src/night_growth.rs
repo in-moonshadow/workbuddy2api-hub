@@ -96,7 +96,7 @@ pub async fn run_night_growth(
     acc: &RunnerAccount<'_>,
     ep: &TaskEndpoints<'_>,
     ctx: &RunnerCtx<'_>,
-    credits_refresh: &mut (dyn FnMut() -> Option<Value> + Send),
+    credits_refresh: &mut (dyn FnMut(&str) -> Option<Value> + Send),
 ) -> NightGrowthOutcome {
     // ① 国际版：国内成长任务中心不适用。
     if acc.realm != "cn" {
@@ -193,7 +193,7 @@ pub async fn run_night_growth(
     if cur >= tgt {
         let res = claim_task(client, &acc.api, NIGHT_TASK_CODE, ep).await;
         let cr = if res.ok { res.credit } else { 0 };
-        let _ = credits_refresh();
+        let _ = credits_refresh(acc.api.uid);
         logs.push(format!(
             "[{name}] 夜猫子任务达标, 领奖 {}",
             claim_log_suffix(res.ok, res.credit, res.msg.as_deref())
@@ -248,7 +248,7 @@ pub async fn run_night_growth(
         ));
     }
 
-    let _ = credits_refresh();
+    let _ = credits_refresh(acc.api.uid);
     let earned = earned_from_logs(&logs);
     NightGrowthOutcome {
         ok: true,

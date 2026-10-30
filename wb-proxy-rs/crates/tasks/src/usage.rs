@@ -47,6 +47,7 @@
 //! 「没有价表」与「价表说这条不要钱」是两回事，面板必须能分开看。
 //! 未定价的**行**同理：整组 `cost_*` 键省略。
 
+#![allow(clippy::items_after_test_module)]
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -1064,6 +1065,7 @@ pub fn build_usage_recent_priced(
 /// 给一行补上成本明细键（Python `recent_usage` 里的那一组）。
 ///
 /// **未定价 ⇒ 原样返回**（不写半截明细、不写假的 0）。
+#[allow(dead_code)]
 fn decorate_cost_row(row: &Value, pricing: &Pricing) -> Value {
     let Some(detail) = price::compute_row_detail(row, pricing) else {
         return row.clone();

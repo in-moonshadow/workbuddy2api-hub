@@ -179,13 +179,14 @@ pub struct RunnerEnv<'a> {
 }
 
 /// 一轮运行所需的可注入依赖集合。
+#[allow(clippy::type_complexity)]
 pub struct RunnerDeps<'a> {
     /// 睡。
     pub sleeper: &'a dyn Sleeper,
     /// 现在几点。
     pub clock: &'a dyn Clock,
     /// 刷新积分余额。`None` = 刷新失败（**不改**旧值），对齐 `fetch_credits()` 失败分支。
-    pub credits_refresh: Box<dyn FnOnce() -> Option<Value> + Send + 'a>,
+    pub credits_refresh: Box<dyn Fn(&str) -> Option<Value> + Send + 'a>,
     /// 猫猫旅行。
     pub cat_travel: CatTravel<'a>,
     /// 任务间隔秒（Python 默认 `gap=1.0`）。
@@ -198,7 +199,7 @@ impl<'a> RunnerDeps<'a> {
         Self {
             sleeper,
             clock,
-            credits_refresh: Box::new(|| None),
+            credits_refresh: Box::new(|_: &str| None),
             cat_travel: CatTravel::Disabled,
             gap: 1.0,
         }
@@ -936,7 +937,7 @@ pub async fn run_growth_tasks(
     }
 
     // 4. 刷新积分（失败 → 不改 credits，对齐 Python `fetch_credits` 失败分支）
-    let credits = (deps.credits_refresh)();
+    let credits = (deps.credits_refresh)(acc.api.uid);
     let remain = credits
         .as_ref()
         .and_then(|c| c.get("remain"))
@@ -1073,7 +1074,7 @@ mod tests {
         RunnerDeps {
             sleeper,
             clock,
-            credits_refresh: Box::new(move || credits),
+            credits_refresh: Box::new(move |_| credits.clone()),
             cat_travel: cat,
             gap: 1.0,
         }

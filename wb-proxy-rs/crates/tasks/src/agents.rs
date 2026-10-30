@@ -18,6 +18,7 @@
 //!
 //! 1. **写盘侧全部标注未做**：`wb_agents.integrate`（apply 后半）与
 //!    `wb_agents.restore`（真正删文件 / 清 state）都属「集成引擎」，留接线层 /
+//!
 //!   后续关卡；本模块只产出「已清洗的 models + 校验结果」与 restore 的计划
 //!   形状。`integrate` 里用 sha256 判断「外部改动」的检测因此也**未实现**，
 //!   概览里的 `applied.external_change` 恒为 `false` 并标注。

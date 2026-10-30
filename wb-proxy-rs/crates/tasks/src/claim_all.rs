@@ -319,7 +319,7 @@ pub type GrowthTasksFn<'a> = Arc<
 >;
 
 /// 积分刷新接缝（`acc.credit_refresh()`）。返回 `None` = 刷新失败。
-pub type CreditRefreshFn<'a> = Arc<dyn Fn() -> Option<Value> + Send + Sync + 'a>;
+pub type CreditRefreshFn<'a> = Arc<dyn Fn(&str) -> Option<Value> + Send + Sync + 'a>;
 
 /// 编排依赖。
 pub struct ClaimAllDeps<'a> {
@@ -364,7 +364,7 @@ impl<'a> ClaimAllDeps<'a> {
             exec,
             clock,
             sleeper,
-            credits_refresh: Arc::new(|| None),
+            credits_refresh: Arc::new(|_: &str| None),
             growth_tasks: None,
             client: UpstreamClient::new(),
             credentials: HashMap::new(),
@@ -579,7 +579,7 @@ async fn run_cn(
             text_or_none_str(msg_or_error(&res))
         ));
         // `acc.credit_refresh()`：Python 的异常被吞掉；这里只取值不使用。
-        let _ = (deps.credits_refresh)();
+        let _ = (deps.credits_refresh)(acc.uid.as_str());
         sleeper.sleep(SLEEP_AFTER_CHECKIN_SECS).await;
     } else {
         steps.push(ClaimStep::new(
@@ -630,6 +630,11 @@ async fn run_cn(
 
     // ⑤ 猫猫旅行（`ok` 恒 True）
     let tr = exec.cat_travel(acc).await;
+    // `exec.cat_travel` 返回 `{ok, credit}`；猫猫积分需计入总 credit
+    // （Python 把 `do_cat_travel` 放在 `run_growth_tasks` 内部，积分自动计入
+    // `earned_credit`；Rust 侧 `run_growth_tasks` 设了 `CatTravel::Disabled`，
+    // 猫猫在 `run_cn` 单独调，所以必须手动加回）。
+    let cat_credit = tr.get("credit").and_then(Value::as_i64).unwrap_or(0);
     steps.push(ClaimStep::new("cat_travel", true, msg_or_error(&tr)));
     logs.push(format!(
         "  [{}] 猫猫日常 {}",
@@ -643,7 +648,7 @@ async fn run_cn(
         steps_line: steps_line(&steps),
         steps,
         logs,
-        credit: growth.earned,
+        credit: growth.earned + cat_credit,
     }
 }
 
@@ -669,7 +674,10 @@ async fn run_growth_step(acc: &AccountView, deps: &ClaimAllDeps<'_>) -> GrowthSt
             let rdeps = RunnerDeps {
                 sleeper: deps.sleeper,
                 clock: deps.clock,
-                credits_refresh: Box::new(|| None),
+                credits_refresh: Box::new({
+                    let cr = deps.credits_refresh.clone();
+                    move |uid: &str| cr(uid)
+                }),
                 cat_travel: CatTravel::Disabled,
                 gap: GROWTH_GAP_SECS,
             };

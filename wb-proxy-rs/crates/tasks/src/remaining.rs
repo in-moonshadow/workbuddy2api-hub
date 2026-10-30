@@ -827,6 +827,7 @@ fn collect_anchors(
 }
 
 /// 按需过滤之后的活跃 (realm, model) 集合（昨天 00:00 后有消耗/撞线）。
+#[allow(clippy::type_complexity)]
 fn active_set(
     state: &FoldState,
     realm_of: &HashMap<String, String>,
@@ -857,6 +858,7 @@ fn active_set(
 }
 
 /// `_remaining_payload_locked` 的纯函数版：调用方持有折叠好的状态与预算表。
+#[allow(clippy::redundant_closure)]
 fn payload_build(
     state: &FoldState,
     now: f64,
@@ -885,11 +887,13 @@ fn payload_build(
         let uid = a.uid.clone();
         let realm = realm_of.get(&uid).cloned().unwrap_or_default();
         let mut models: HashSet<String> = HashSet::new();
+        #[allow(clippy::for_kv_map)]
         for ((r, m), _) in budgets {
             if *r == realm && active.contains(&(r.clone(), m.clone())) {
                 models.insert(m.clone());
             }
         }
+        #[allow(clippy::for_kv_map)]
         for ((u, m), _) in &state.usage {
             if *u == uid {
                 let key = (realm.clone(), m.clone());

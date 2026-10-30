@@ -170,7 +170,7 @@ async fn run(
     let clock = FixedClock(hour);
     let c = ctx(&sleeper, &clock);
     let mut refresh_count = 0usize;
-    let mut refresh = || {
+    let mut refresh = |_: &str| {
         refresh_count += 1;
         Some(json!({"remain": 42}))
     };
@@ -460,7 +460,7 @@ async fn polling_runs_at_most_four_rounds_with_four_second_gaps() {
     let sleeper = NoopSleeper::default();
     let clock = FixedClock(2);
     let c = ctx(&sleeper, &clock);
-    let mut refresh = || None;
+    let mut refresh = |_: &str| None;
     let acc = Acc::cn();
     let out = run_night_growth(
         &UpstreamClient::new(),

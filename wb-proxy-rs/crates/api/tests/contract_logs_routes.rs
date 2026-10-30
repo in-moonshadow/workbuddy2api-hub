@@ -15,7 +15,7 @@ static LOG_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wb_api::routes::ApiPanelSink;
@@ -81,6 +81,7 @@ async fn logs_requires_panel_session() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn logs_returns_the_python_shape() {
     let _g = LOG_TEST_LOCK.lock().unwrap();
@@ -95,6 +96,7 @@ async fn logs_returns_the_python_shape() {
     assert!(body["max_id"].as_u64().unwrap() >= 1);
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn logs_clear_empties_the_buffer() {
     let _g = LOG_TEST_LOCK.lock().unwrap();
@@ -108,6 +110,7 @@ async fn logs_clear_empties_the_buffer() {
     assert_eq!(body["total"], 0);
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn logs_export_serves_text_with_attachment() {
     let _g = LOG_TEST_LOCK.lock().unwrap();
@@ -140,6 +143,7 @@ async fn logs_export_serves_text_with_attachment() {
     assert!(text.contains("hello world"));
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn settings_reveal_unknown_id_is_404() {
     let _g = LOG_TEST_LOCK.lock().unwrap();

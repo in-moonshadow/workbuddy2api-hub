@@ -340,13 +340,8 @@ pub async fn fetch_credits_enterprise(
         match v.get(key) {
             Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
             Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
-            Some(serde_json::Value::Bool(b)) => {
-                if *b {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
+            Some(serde_json::Value::Bool(b)) if *b => 1.0,
+            Some(serde_json::Value::Bool(_)) => 0.0,
             _ => 0.0,
         }
     }

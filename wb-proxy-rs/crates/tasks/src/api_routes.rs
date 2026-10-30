@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use wb_gateway::outbound::UpstreamClient;
 use wb_gateway::pool::{load_account_pool, AccountState};
-use wb_storage::read_idempotent_fields;
+use wb_storage::{read_account_credits, read_idempotent_fields};
 
 use crate::checkin::production_billing_base;
 use crate::claim_all::{self, route_claim_all, uid8, ClaimAllDeps, ClaimAllRequest};
@@ -677,8 +677,10 @@ impl CycleExecutor for ProductionExecutor {
             };
             // 积分刷新注入：Python 在领奖成功后调 `account.fetch_credits()`。
             // 同上，**有意差异（D36-b）**：读本地已存快照，不是即时抓上游。
+            let accounts_dir = task.accounts_dir.clone();
+            let credential_file = ra.state.credential_file.clone();
             let mut credits_refresh =
-                || local_credits_snapshot(&task.accounts_dir, &ra.state.credential_file);
+                move |_uid: &str| local_credits_snapshot(&accounts_dir, &credential_file);
             let outcome: NightGrowthOutcome = run_night_growth(
                 &task.client,
                 &runner_acc,
@@ -783,6 +785,9 @@ pub fn public_view(
     accounts_dir: &std::path::Path,
 ) -> Value {
     let fields = read_idempotent_fields(accounts_dir, &state.credential_file).unwrap_or_default();
+    let credits = read_account_credits(accounts_dir, &state.credential_file)
+        .ok()
+        .flatten();
     let nick = nickname
         .clone()
         .filter(|s| !s.is_empty())
@@ -835,6 +840,32 @@ pub fn public_view(
         "_last_checkin": fields.last_checkin,
         "_last_activity_report": fields.last_activity_report,
         "_last_daily_chat": fields.last_daily_chat,
+        "credits": credits,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GET /accounts 列表（Python `wb_proxy.py:15943 _get_accounts`）
+// ---------------------------------------------------------------------------
+
+/// `GET /accounts` 的纯逻辑（Python `wb_proxy.py:15943 _get_accounts`）。
+///
+/// 返回 `{accounts: [...], storage: <accounts_dir>, usable: <count>}`，
+/// 每个账号通过 [`public_view`] 转 JSON。
+/// `realm` 参数：`None` 或 `"all"` 不过滤；其他值按 realm 过滤。
+pub fn route_accounts_list(task: &TaskRuntime, realm: Option<&str>) -> Value {
+    let filter_realm = realm.filter(|r| !r.is_empty() && *r != "all");
+    let accounts: Vec<Value> = task
+        .ready
+        .iter()
+        .filter(|ra| filter_realm.is_none() || ra.state.realm == filter_realm.unwrap())
+        .map(|ra| public_view(&ra.state, &ra.nickname, &task.accounts_dir))
+        .collect();
+    let usable = accounts.len();
+    json!({
+        "accounts": accounts,
+        "storage": task.accounts_dir.to_string_lossy(),
+        "usable": usable,
     })
 }
 
@@ -1189,7 +1220,7 @@ pub async fn route_tasks_run(task: &TaskRuntime, payload: &Value) -> Value {
             sleeper: &task.sleeper,
             clock: task.clock.as_ref(),
             // 同上，**有意差异（D36-b）**：读本地已存快照，不是即时抓上游。
-            credits_refresh: Box::new(|| {
+            credits_refresh: Box::new(|_| {
                 local_credits_snapshot(&task.accounts_dir, &ra.state.credential_file)
             }),
             cat_travel: CatTravel::Disabled,
@@ -1415,7 +1446,20 @@ pub async fn route_tasks_claim_all(task: &TaskRuntime, payload: &Value) -> Value
         >(&task.sleeper as &dyn crate::growth_runner::Sleeper)
     };
     let mut deps = ClaimAllDeps::new(exec_ref, task.clock.as_ref(), sleeper_ref);
-    deps.credits_refresh = Arc::new(|| None) as crate::claim_all::CreditRefreshFn;
+    deps.credits_refresh = Arc::new({
+        let accounts_dir = task.accounts_dir.clone();
+        let uid_to_file: std::collections::HashMap<String, String> = task
+            .ready
+            .iter()
+            .map(|r| (r.state.uid.clone(), r.state.credential_file.clone()))
+            .collect();
+        move |uid: &str| {
+            let cred_file = uid_to_file.get(uid)?;
+            wb_storage::read_account_credits(&accounts_dir, cred_file)
+                .ok()
+                .flatten()
+        }
+    }) as crate::claim_all::CreditRefreshFn;
     deps.growth_tasks = None;
     deps.client = task.client.clone();
     deps.credentials = task
@@ -2530,7 +2574,7 @@ pub async fn route_accounts_delete(task: &TaskRuntime, payload: &Value) -> Value
         &format!(
             "WARN: deleting account file {} (uid {}), operator confirmed delete",
             ra.state.credential_file,
-            uid8(&uid)
+            uid8(uid)
         ),
         "accounts",
     );
@@ -2539,7 +2583,7 @@ pub async fn route_accounts_delete(task: &TaskRuntime, payload: &Value) -> Value
         match std::fs::remove_file(&path) {
             Ok(_) => {
                 task.panel
-                    .add_log_entry(&format!("account {} deleted", uid8(&uid)), "accounts");
+                    .add_log_entry(&format!("account {} deleted", uid8(uid)), "accounts");
                 true
             }
             Err(e) => {

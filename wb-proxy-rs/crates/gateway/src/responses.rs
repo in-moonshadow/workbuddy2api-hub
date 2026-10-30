@@ -1,3 +1,4 @@
+#![allow(clippy::items_after_test_module)]
 //! Responses API（`/v1/responses`、`/responses`）↔ Chat Completions 的结构翻译层。
 //!
 //! 移植自 wb_proxy.py：
@@ -1207,7 +1208,7 @@ pub fn build_citations(response_text: &str, sources: &[Value]) -> Vec<Value> {
         let raw = m.as_str();
         // rstrip(".,;:!?")
         let url = raw
-            .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
+            .trim_end_matches(['.', ',', ';', ':', '!', '?'])
             .to_string();
 
         let src = by_url
@@ -2744,14 +2745,6 @@ mod tests {
 pub const WEB_SEARCH_NAME: &str = "web_search";
 pub const WEB_FETCH_NAME: &str = "web_fetch";
 pub const MAX_WEB_ROUNDS: usize = 3;
-
-const SEARCH_DECL_TYPES: &[&str] = &[
-    "web_search",
-    "web_search_preview",
-    "web_search_preview_2025_03_11",
-    "web_search",
-    "web_fetch",
-];
 
 /// `client_wants_web`：客户端宣告了哪些网路工具（伺服器端或 function 形状都算）。
 pub fn client_wants_web(tools: &Value) -> Value {
