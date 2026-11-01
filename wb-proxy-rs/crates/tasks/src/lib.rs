@@ -114,6 +114,7 @@ pub mod credits_source;
 // 关卡 4.20（线 A）：hub 侧**静态模型目录**——Python `wb_catalog.py` 的
 // `STATIC_INTL_MODELS` / `STATIC_CN_MODELS` 的 id 清单移植（只搬 id）。
 pub mod catalog;
+pub mod catalog_metadata;
 // 关卡 4.26（线 C）：agents 面板能力层——纯视图/校验，不发外部写。
 // 权威源是 Python `wb_proxy.py` 的 agents 段与 `wb_agents.py`；写客户端
 // config 的 integrate/restore 属集成引擎，留接线层/后续。

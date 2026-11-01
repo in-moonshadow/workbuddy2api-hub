@@ -2005,21 +2005,7 @@ async fn models_get(
         .or_else(|| headers.get("x-realm").and_then(|v| v.to_str().ok()))
         .unwrap_or("cn")
         .to_string();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let data: Vec<serde_json::Value> = wb_tasks::catalog::HUB_MODEL_IDS
-        .iter()
-        .map(|mid| {
-            serde_json::json!({
-                "id": mid,
-                "object": "model",
-                "created": now,
-                "owned_by": "workbuddy",
-            })
-        })
-        .collect();
+    let data = wb_tasks::catalog_metadata::model_catalog_entries();
     Json(serde_json::json!({
         "object": "list",
         "data": data,
