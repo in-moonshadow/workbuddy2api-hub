@@ -361,6 +361,9 @@ pub fn app_with_config(
     for path in OPENAI_PATHS {
         router = router.route(path, post(chat_openai_entry).options(preflight));
     }
+    router = router
+        .route("/v1/models", get(models_get).options(preflight))
+        .route("/models", get(models_get).options(preflight));
     for path in ANTHROPIC_MESSAGE_PATHS {
         router = router.route(path, post(chat_anthropic_entry).options(preflight));
     }
@@ -1982,6 +1985,47 @@ async fn accounts_list(
     let realm = params.get("realm").map(|s| s.as_str());
     let res = task_routes::route_accounts_list(&state.task, realm);
     Json(res).into_response()
+}
+
+/// `GET /v1/models` / `GET /models`：模型清单（Python `wb_proxy.py:15822 _get_v1_models`）。
+///
+/// 只用 API key 就能访问（Python 注释：好让普通 OpenAI 客户端继续发现模型），
+/// 不要求面板会话。响应格式：`{"object": "list", "data": [...], "realm": realm}`。
+async fn models_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if unauthorized(&headers, &params, &state) {
+        return openai_error(401, "invalid api key", "invalid_request_error");
+    }
+    let realm = params
+        .get("realm")
+        .map(|s| s.as_str())
+        .or_else(|| headers.get("x-realm").and_then(|v| v.to_str().ok()))
+        .unwrap_or("cn")
+        .to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let data: Vec<serde_json::Value> = wb_tasks::catalog::HUB_MODEL_IDS
+        .iter()
+        .map(|mid| {
+            serde_json::json!({
+                "id": mid,
+                "object": "model",
+                "created": now,
+                "owned_by": "workbuddy",
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+        "realm": realm,
+    }))
+    .into_response()
 }
 
 /// 后台积分刷新器的状态（关卡 4.18）。
