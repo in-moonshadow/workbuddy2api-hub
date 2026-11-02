@@ -50,6 +50,20 @@ pub fn model_catalog_entries() -> Vec<serde_json::Value> {
             obj.insert("supports_tools".into(), serde_json::json!(tools));
             obj.insert("supports_reasoning".into(), serde_json::json!(thinks));
             obj.insert("multimodal".into(), serde_json::json!(vision));
+            // 消费倍率/优惠
+            if let Some(c) = m.get("credits").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                obj.insert("credits".into(), serde_json::json!(c));
+            }
+            // 上下文窗口
+            if let Some(ctx) = m.get("maxInputTokens").and_then(|v| v.as_i64()) {
+                obj.insert("context_length".into(), serde_json::json!(ctx));
+                obj.insert("max_input_tokens".into(), serde_json::json!(ctx));
+            }
+            // 最大输出
+            if let Some(out) = m.get("maxOutputTokens").and_then(|v| v.as_i64()) {
+                obj.insert("max_output_tokens".into(), serde_json::json!(out));
+                obj.insert("max_completion_tokens".into(), serde_json::json!(out));
+            }
             let mods = serde_json::json!(["text"]);
             obj.insert("modalities".into(), mods);
             if vision {
